@@ -1,0 +1,155 @@
+:host { display: block; }
+
+.page {
+  padding: 32px 36px;
+  max-width: 1120px;
+}
+
+// ── Header ────────────────────────────────────────────────────────────────
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 28px;
+  gap: 16px;
+
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--text-primary);
+    margin: 0 0 5px;
+  }
+
+  .meta {
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+}
+
+.run-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--brand);
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 500;
+  border-radius: 8px;
+  text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.15s, box-shadow 0.15s;
+  box-shadow: 0 1px 3px rgba(91,95,199,.35);
+
+  &:hover {
+    background: var(--brand-hover);
+    box-shadow: 0 2px 8px rgba(91,95,199,.4);
+  }
+}
+
+// ── Pipeline flow ─────────────────────────────────────────────────────────
+.flow-section {
+  background: var(--surface-0);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px 22px;
+
+  &__title {
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-muted);
+    margin-bottom: 20px;
+  }
+}
+
+.flow-track {
+  display: flex;
+  align-items: flex-start;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.flow-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  width: 88px;
+
+  &__badge {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: var(--brand-muted);
+    border: 1.5px solid var(--brand-ring);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--brand);
+  }
+
+  &__name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  &__desc {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    text-align: center;
+    white-space: nowrap;
+  }
+}
+
+.flow-arrow {
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  margin-top: 11px;
+  color: var(--border-md);
+  flex-shrink: 0;
+}
+
+// ── Fortify pipeline — second flow section ────────────────────────────────
+.flow-section--fortify {
+  margin-top: 16px;
+}
+
+// Source-labelled titles (Sonar blue / Fortify green)
+.flow-section__title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+
+  svg { flex-shrink: 0; opacity: 0.75; }
+
+  &--sonar {
+    color: #5b7fcb;
+  }
+
+  &--fortify {
+    color: #1D9E75;
+  }
+}
+
+// Sonar node — existing brand colour (no change needed, inherits --brand vars)
+// Fortify node — green accent
+.flow-node--fortify {
+  .flow-node__badge {
+    &--fortify {
+      background: rgba(29,158,117,.12);
+      border-color: rgba(29,158,117,.35);
+      color: #0F6E56;
+    }
+  }
+}
