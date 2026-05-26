@@ -1,0 +1,74 @@
+{
+  "issues": [
+    {
+      "key": "AYxxxxxxxx0001",
+      "rule": "java:S2259",
+      "severity": "CRITICAL",
+      "component": "my-project:src/main/java/com/example/UserService.java",
+      "line": 42,
+      "message": "A \"NullPointerException\" could be thrown; \"getUserById(id)\" can return null.",
+      "status": "OPEN",
+      "effort": "5min"
+    },
+    {
+      "key": "AYxxxxxxxx0002",
+      "rule": "java:S2095",
+      "severity": "CRITICAL",
+      "component": "my-project:src/main/java/com/example/FileProcessor.java",
+      "line": 78,
+      "message": "Use try-with-resources or close this \"FileInputStream\" in a \"finally\" clause.",
+      "status": "OPEN",
+      "effort": "10min"
+    },
+    {
+      "key": "AYxxxxxxxx0003",
+      "rule": "java:S106",
+      "severity": "MAJOR",
+      "component": "my-project:src/main/java/com/example/OrderProcessor.java",
+      "line": 33,
+      "message": "Replace this use of System.out by a logger.",
+      "status": "OPEN",
+      "effort": "2min"
+    },
+    {
+      "key": "AYxxxxxxxx0004",
+      "rule": "java:S2068",
+      "severity": "BLOCKER",
+      "component": "my-project:src/main/java/com/example/DatabaseConfig.java",
+      "line": 15,
+      "message": "\"password\" detected here, make sure this is not a hardcoded credential.",
+      "status": "OPEN",
+      "effort": "30min"
+    },
+    {
+      "key": "AYxxxxxxxx0005",
+      "rule": "java:S5547",
+      "severity": "CRITICAL",
+      "component": "my-project:src/main/java/com/example/CryptoUtil.java",
+      "line": 22,
+      "message": "Use a strong cipher algorithm.",
+      "status": "OPEN",
+      "effort": "15min"
+    },
+    {
+      "key": "AYxxxxxxxx0006",
+      "rule": "java:S1192",
+      "severity": "MINOR",
+      "component": "my-project:src/main/java/com/example/Constants.java",
+      "line": 10,
+      "message": "Define a constant instead of duplicating this literal \"ERROR_PREFIX\" 4 times.",
+      "status": "WONTFIX",
+      "effort": "2min"
+    },
+    {
+      "key": "AYxxxxxxxx0007",
+      "rule": "java:S3776",
+      "severity": "CRITICAL",
+      "component": "my-project:src/main/java/com/example/ReportGenerator.java",
+      "line": 100,
+      "message": "Refactor this method to reduce its Cognitive Complexity from 18 to the 15 allowed.",
+      "status": "FALSE_POSITIVE",
+      "effort": "1h"
+    }
+  ]
+}

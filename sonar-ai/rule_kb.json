@@ -1,0 +1,281 @@
+{
+  "java:S2259": {
+    "name": "Null Pointer Dereference",
+    "short": "NPE — null dereference",
+    "severity": "CRITICAL",
+    "description": "A reference that may be null is dereferenced without a null check, which can cause a NullPointerException at runtime.",
+    "fix_strategy": "Add a null check (Objects.requireNonNull, Optional, or explicit if-null guard) before the dereference. Where possible return Optional<T> from the method instead of null.",
+    "example_before": "String s = getValue(); int len = s.length(); // s may be null",
+    "example_after": "String s = getValue(); if (s == null) { return; } int len = s.length();"
+  },
+  "java:S2095": {
+    "name": "Resource Leak",
+    "short": "Closeable resource not closed in finally / try-with-resources",
+    "severity": "CRITICAL",
+    "description": "A Closeable resource (stream, connection, reader, etc.) is opened but may not be closed if an exception is thrown, causing a resource leak.",
+    "fix_strategy": "Wrap the resource in a try-with-resources block: try (InputStream in = open()) { ... }. If Java < 7 compatibility is required, use a finally block.",
+    "example_before": "InputStream in = new FileInputStream(file); byte[] data = in.readAllBytes();",
+    "example_after": "try (InputStream in = new FileInputStream(file)) { byte[] data = in.readAllBytes(); }"
+  },
+  "java:S106": {
+    "name": "Standard Outputs Used Directly",
+    "short": "System.out / System.err used instead of a logger",
+    "severity": "MAJOR",
+    "description": "System.out.println and System.err.println are used for logging. These cannot be enabled/disabled at runtime and do not include structured metadata.",
+    "fix_strategy": "Replace with a SLF4J logger: private static final Logger log = LoggerFactory.getLogger(Foo.class); then log.info(...), log.error(...).",
+    "example_before": "System.out.println(\"Processing \" + id);",
+    "example_after": "log.info(\"Processing {}\", id);"
+  },
+  "java:S5547": {
+    "name": "Weak Cipher Algorithm",
+    "short": "Use of broken or risky cryptographic algorithm",
+    "severity": "CRITICAL",
+    "description": "A weak or broken cipher (DES, 3DES, RC2, RC4, Blowfish, etc.) is used. These algorithms are considered cryptographically broken.",
+    "fix_strategy": "Replace with AES-256-GCM: Cipher.getInstance(\"AES/GCM/NoPadding\"). Use SecretKeySpec with a 256-bit key. Prefer Java's javax.crypto.spec.GCMParameterSpec.",
+    "example_before": "Cipher cipher = Cipher.getInstance(\"DES/ECB/PKCS5Padding\");",
+    "example_after": "Cipher cipher = Cipher.getInstance(\"AES/GCM/NoPadding\");"
+  },
+  "java:S2068": {
+    "name": "Hardcoded Credentials",
+    "short": "Password, secret, or API key hardcoded in source",
+    "severity": "BLOCKER",
+    "description": "A password, secret, or credential is hardcoded as a string literal. This exposes secrets in version control and compiled bytecode.",
+    "fix_strategy": "Move credentials to environment variables or a secrets manager. Read at runtime: System.getenv(\"DB_PASSWORD\") or inject via @Value in Spring. Never commit secrets.",
+    "example_before": "String password = \"s3cr3t\";",
+    "example_after": "String password = System.getenv(\"DB_PASSWORD\");"
+  },
+  "java:S1192": {
+    "name": "Duplicated String Literal",
+    "short": "String literal duplicated 3+ times — extract as constant",
+    "severity": "MINOR",
+    "description": "The same string literal appears 3 or more times. Duplicating strings makes refactoring error-prone and inflates the constant pool.",
+    "fix_strategy": "Extract the string into a private static final String constant at the top of the class and reference the constant in all usages.",
+    "example_before": "log.info(\"START\"); ... log.info(\"START\"); ... log.info(\"START\");",
+    "example_after": "private static final String START = \"START\"; ... log.info(START);"
+  },
+  "java:S3776": {
+    "name": "Cognitive Complexity",
+    "short": "Method cognitive complexity too high (> 15)",
+    "severity": "CRITICAL",
+    "description": "The method has a cognitive complexity score above the threshold (default 15). High complexity makes code hard to understand and test.",
+    "fix_strategy": "Extract sub-responsibilities into private helper methods. Replace deeply nested conditionals with early returns (guard clauses). Consider the Strategy or Command pattern for branching logic.",
+    "example_before": "// long method with nested if/for/switch blocks",
+    "example_after": "// split into smaller methods, each with a single responsibility"
+  },
+  "java:S1481": {
+    "name": "Unused Local Variable",
+    "short": "Local variable declared but never used",
+    "severity": "MINOR",
+    "description": "A local variable is declared and assigned but never read. This wastes memory and suggests a logic error (the result of a computation is silently discarded).",
+    "fix_strategy": "Remove the variable declaration. If the assignment has side effects (e.g. a method call), keep the call but drop the assignment.",
+    "example_before": "int result = compute(); doSomethingElse();",
+    "example_after": "doSomethingElse(); // remove result if unused"
+  },
+  "java:S2293": {
+    "name": "Diamond Operator",
+    "short": "Redundant type parameter — use diamond operator <>",
+    "severity": "MINOR",
+    "description": "Explicit type parameters are provided on the right-hand side of a generic constructor call when the compiler can infer them, making the code unnecessarily verbose.",
+    "fix_strategy": "Replace the explicit type arguments with the diamond operator <>.",
+    "example_before": "List<String> list = new ArrayList<String>();",
+    "example_after": "List<String> list = new ArrayList<>();"
+  },
+  "java:S2166": {
+    "name": "Assert Statement Side Effects",
+    "short": "assert keyword used for runtime checking (disabled in production)",
+    "severity": "MAJOR",
+    "description": "assert statements are disabled by default in production JVMs (java -ea is required). Using assert for business-logic validation creates a silent no-op in production.",
+    "fix_strategy": "Replace assert with explicit validation: throw new IllegalArgumentException(\"message\") or use Objects.requireNonNull / Guava Preconditions.",
+    "example_before": "assert value != null : \"value must not be null\";",
+    "example_after": "Objects.requireNonNull(value, \"value must not be null\");"
+  },
+  "java:S1118": {
+    "name": "Utility Class Constructor",
+    "short": "Utility classes should not have public constructors",
+    "severity": "MINOR",
+    "description": "A class with only static members should not be instantiated. A public or default constructor allows accidental instantiation.",
+    "fix_strategy": "Add a private no-argument constructor with a comment or throw an AssertionError to prevent instantiation.",
+    "example_before": "public class Utils { public static String format(String s) { ... } }",
+    "example_after": "public class Utils { private Utils() { throw new AssertionError(\"Utility class\"); } public static String format(String s) { ... } }"
+  },
+  "java:S1135": {
+    "name": "TODO Comment",
+    "short": "TODO tag not tracked in issue tracker",
+    "severity": "INFO",
+    "description": "A TODO or FIXME comment was left in the code. These should be tracked in an issue tracker, not as inline comments.",
+    "fix_strategy": "Either resolve the TODO inline or create a ticket and replace the comment with a reference (e.g. // TODO: PROJ-123 — description).",
+    "example_before": "// TODO: fix this later",
+    "example_after": "// TODO: PROJ-456 — replace with proper validation (tracked)"
+  },
+  "java:S1172": {
+    "name": "Unused Method Parameter",
+    "short": "Method parameter never used in method body",
+    "severity": "MAJOR",
+    "description": "A method parameter is declared but never referenced inside the method body. This suggests a missing implementation or a stale signature.",
+    "fix_strategy": "Either use the parameter in the method body or remove it (if the method is not part of a public API / override). For interface implementations, consider annotating with @SuppressWarnings(\"unused\").",
+    "example_before": "public void process(String input, int unused) { doWork(input); }",
+    "example_after": "public void process(String input) { doWork(input); }"
+  },
+  "java:S1854": {
+    "name": "Dead Store",
+    "short": "Value assigned to a variable is never read before reassignment",
+    "severity": "MAJOR",
+    "description": "A value is assigned to a variable but that variable is overwritten before it is ever read, making the initial assignment dead code.",
+    "fix_strategy": "Remove the dead assignment. If the right-hand side has side effects (method call), keep the call but discard the result.",
+    "example_before": "int x = expensiveOp(); x = 0; use(x);",
+    "example_after": "int x = 0; use(x); // remove dead expensiveOp() assignment"
+  },
+  "java:S2184": {
+    "name": "Integer Overflow in Arithmetic",
+    "short": "Integer arithmetic may overflow before widening cast",
+    "severity": "CRITICAL",
+    "description": "An integer arithmetic expression can overflow silently before it is cast to a wider type (long). This produces incorrect results for large inputs.",
+    "fix_strategy": "Cast at least one operand to long before the operation: (long) a * b instead of (long)(a * b).",
+    "example_before": "long total = count * price; // may overflow if count*price > Integer.MAX_VALUE",
+    "example_after": "long total = (long) count * price;"
+  },
+  "java:S2245": {
+    "name": "Predictable Random Seed",
+    "short": "java.util.Random seeded with a predictable value",
+    "severity": "CRITICAL",
+    "description": "java.util.Random is seeded with a constant or predictable value (e.g. System.currentTimeMillis() used incorrectly), making its output guessable.",
+    "fix_strategy": "For security-sensitive usage, replace with java.security.SecureRandom. For non-security code, use the no-arg constructor new Random() which uses a non-predictable seed.",
+    "example_before": "Random rng = new Random(12345L); // constant seed",
+    "example_after": "SecureRandom rng = new SecureRandom(); // cryptographically strong"
+  },
+  "java:S2647": {
+    "name": "Basic Authentication Over HTTP",
+    "short": "HTTP Basic authentication used without HTTPS",
+    "severity": "CRITICAL",
+    "description": "HTTP Basic authentication sends credentials in Base64 encoding without encryption. Over plain HTTP this exposes credentials in transit.",
+    "fix_strategy": "Ensure the connection uses HTTPS (TLS). Replace http:// URLs with https:// and verify the server certificate.",
+    "example_before": "URL url = new URL(\"http://api.example.com/data\"); // basic auth header attached",
+    "example_after": "URL url = new URL(\"https://api.example.com/data\");"
+  },
+  "java:S2076": {
+    "name": "OS Command Injection",
+    "short": "Unsanitised user input passed to Runtime.exec() or ProcessBuilder",
+    "severity": "BLOCKER",
+    "description": "Unsanitised user-supplied data is passed to a shell command, allowing an attacker to execute arbitrary commands on the host.",
+    "fix_strategy": "Never concatenate user input into shell commands. Use ProcessBuilder with a list of arguments (no shell interpolation). Whitelist and validate all user-supplied values.",
+    "example_before": "Runtime.getRuntime().exec(\"ls \" + userInput);",
+    "example_after": "new ProcessBuilder(\"ls\", validatedPath).start();"
+  },
+  "java:S2083": {
+    "name": "Path Traversal",
+    "short": "File path built from user input without normalisation",
+    "severity": "BLOCKER",
+    "description": "A file path is constructed using user-supplied data without sanitising '../' sequences, allowing an attacker to traverse the filesystem.",
+    "fix_strategy": "Normalise the path with Path.normalize() and verify it starts with the expected base directory using Path.startsWith(baseDir).",
+    "example_before": "File file = new File(baseDir, userInput); file.read();",
+    "example_after": "Path resolved = Path.of(baseDir).resolve(userInput).normalize(); if (!resolved.startsWith(baseDir)) throw new SecurityException(); resolved.toFile().read();"
+  },
+  "java:S2629": {
+    "name": "Logging Arguments Evaluated Eagerly",
+    "short": "String concatenation used in logger call — evaluates even when log level disabled",
+    "severity": "MAJOR",
+    "description": "String concatenation (+ operator) inside a log call evaluates the expression even when the log level is disabled, wasting CPU cycles.",
+    "fix_strategy": "Use parameterised logging: log.debug(\"Value: {}\", value) instead of log.debug(\"Value: \" + value). Check isDebugEnabled() only for complex expressions.",
+    "example_before": "log.debug(\"Processing item: \" + item.toExpensiveString());",
+    "example_after": "log.debug(\"Processing item: {}\", item);"
+  },
+  "java:S3457": {
+    "name": "Printf-style Format String Mismatch",
+    "short": "Wrong number or type of arguments to String.format()",
+    "severity": "BLOCKER",
+    "description": "A printf-style format string has a mismatch between the number of format specifiers and the number of arguments, causing MissingFormatArgumentException at runtime.",
+    "fix_strategy": "Count %s/%d/etc. placeholders in the format string and ensure the argument count matches exactly. Use IDE format string inspections.",
+    "example_before": "String msg = String.format(\"User %s logged in at %s\", username); // missing 2nd arg",
+    "example_after": "String msg = String.format(\"User %s logged in at %s\", username, timestamp);"
+  },
+  "java:S1764": {
+    "name": "Identical Sub-expressions on Both Sides of Operator",
+    "short": "Both sides of a binary operator are the same expression",
+    "severity": "CRITICAL",
+    "description": "Both operands of a binary operator are identical, which is almost always a bug (e.g. a & a, a == a, a - a).",
+    "fix_strategy": "Review the expression and replace one of the identical operands with the correct variable or value.",
+    "example_before": "if (a == a) { // always true — should compare to b",
+    "example_after": "if (a == b) {"
+  },
+  "java:S4834": {
+    "name": "Thread.sleep in a Loop",
+    "short": "Thread.sleep called inside a wait/poll loop",
+    "severity": "MAJOR",
+    "description": "Calling Thread.sleep() in a busy-wait loop wastes CPU and is fragile. Prefer proper synchronisation primitives.",
+    "fix_strategy": "Replace busy-wait with Object.wait/notify, java.util.concurrent primitives (CountDownLatch, Semaphore, CompletableFuture), or a scheduled executor.",
+    "example_before": "while (!done) { Thread.sleep(100); }",
+    "example_after": "latch.await(); // or condition.await();"
+  },
+  "java:S2589": {
+    "name": "Boolean Expression Always True or False",
+    "short": "Condition is trivially true or false",
+    "severity": "MAJOR",
+    "description": "A boolean expression or condition always evaluates to the same value (true or false) due to previous checks or logical tautologies.",
+    "fix_strategy": "Remove the redundant condition. If the condition guards a block, remove the guard entirely (if always true) or the entire block (if always false).",
+    "example_before": "if (x != null && x != null) { // second check is redundant",
+    "example_after": "if (x != null) {"
+  },
+  "java:S3010": {
+    "name": "Static Field Updated in Instance Method",
+    "short": "Instance method writes to a static field — thread-safety issue",
+    "severity": "CRITICAL",
+    "description": "An instance method updates a static (class-level) field without synchronisation, causing a race condition in multi-threaded environments.",
+    "fix_strategy": "Make the field an instance field, or synchronise access with synchronized or an AtomicXxx type (AtomicInteger, AtomicReference, etc.).",
+    "example_before": "static int counter; void increment() { counter++; }",
+    "example_after": "static final AtomicInteger counter = new AtomicInteger(); void increment() { counter.incrementAndGet(); }"
+  },
+  "java:S2274": {
+    "name": "Object.wait Called Without Loop",
+    "short": "Object.wait() not inside a while loop — susceptible to spurious wakeups",
+    "severity": "CRITICAL",
+    "description": "Object.wait() should always be called inside a while loop that re-checks the condition. A spurious wakeup can cause incorrect behaviour if an if statement is used instead.",
+    "fix_strategy": "Replace if (condition) { obj.wait(); } with while (condition) { obj.wait(); }.",
+    "example_before": "synchronized(lock) { if (!ready) lock.wait(); }",
+    "example_after": "synchronized(lock) { while (!ready) lock.wait(); }"
+  },
+  "java:S1206": {
+    "name": "equals Without hashCode",
+    "short": "Class overrides equals() but not hashCode()",
+    "severity": "CRITICAL",
+    "description": "A class that overrides equals() must also override hashCode() to maintain the contract: equal objects must have equal hash codes. Violation causes bugs in HashMap, HashSet, etc.",
+    "fix_strategy": "Override hashCode() using the same fields as equals(). Use Objects.hash(field1, field2) for a concise implementation.",
+    "example_before": "@Override public boolean equals(Object o) { ... } // no hashCode",
+    "example_after": "@Override public boolean equals(Object o) { ... } @Override public int hashCode() { return Objects.hash(id, name); }"
+  },
+  "java:S2387": {
+    "name": "Child Class Field Hides Parent Field",
+    "short": "Field in subclass shadows field with same name in superclass",
+    "severity": "MAJOR",
+    "description": "A field declared in a child class has the same name as a field in the parent class, creating a shadowing that is confusing and error-prone.",
+    "fix_strategy": "Rename the field in the child class to avoid shadowing. If the same field is intended, remove the child declaration and use the parent's field directly (make it protected if needed).",
+    "example_before": "class Parent { int count; } class Child extends Parent { int count; // shadows }",
+    "example_after": "class Parent { protected int count; } class Child extends Parent { /* uses parent count */ }"
+  },
+  "java:S2189": {
+    "name": "Infinite Loop",
+    "short": "Loop condition is never false — infinite loop",
+    "severity": "BLOCKER",
+    "description": "A loop's termination condition is never reached, creating an infinite loop that will hang the thread or process.",
+    "fix_strategy": "Ensure the loop variable is modified inside the loop body, or add a break/return statement for the exit condition.",
+    "example_before": "for (int i = 0; i < 10; ) { process(i); } // i never incremented",
+    "example_after": "for (int i = 0; i < 10; i++) { process(i); }"
+  },
+  "java:S1123": {
+    "name": "Deprecated Code Not Documented",
+    "short": "@Deprecated without @deprecated Javadoc tag",
+    "severity": "MINOR",
+    "description": "A method is annotated with @Deprecated but lacks the @deprecated Javadoc tag explaining why it is deprecated and what the replacement is.",
+    "fix_strategy": "Add a Javadoc comment with @deprecated explaining the reason and pointing to the replacement: /** @deprecated Use {@link #newMethod()} instead. */",
+    "example_before": "@Deprecated public void oldMethod() { ... }",
+    "example_after": "/** @deprecated Use {@link #newMethod()} instead — will be removed in v3.0. */ @Deprecated public void oldMethod() { ... }"
+  },
+  "java:S3252": {
+    "name": "Static Member Accessed via Instance Reference",
+    "short": "Static field or method accessed through an instance variable",
+    "severity": "MAJOR",
+    "description": "A static member (field or method) is accessed via an instance reference. This is misleading and can cause bugs if the variable is null or polymorphic dispatch is expected.",
+    "fix_strategy": "Always access static members through the class name: ClassName.staticMethod() or ClassName.STATIC_FIELD.",
+    "example_before": "MyClass obj = new MyClass(); obj.staticMethod();",
+    "example_after": "MyClass.staticMethod();"
+  }
+}

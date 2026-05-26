@@ -1,0 +1,22 @@
+# SonarAI — requirements
+# Core pipeline
+langgraph>=0.2
+langchain>=0.3
+langchain-google-vertexai>=1.0
+google-cloud-aiplatform>=1.60
+gitpython>=3.1
+javalang>=0.13
+pygithub>=2.3
+pydantic-settings>=2.5
+loguru
+numpy>=1.26           # MMR cosine similarity in rag_store
+
+# Iteration 2 additions
+chromadb>=0.5           # Vector store for RAG prior fix retrieval
+requests>=2.31          # Sonar REST API rescan calls
+langsmith>=0.1          # LangSmith tracing (optional — auto-enabled via env vars)
+
+# Angular UI bridge (api.py)
+fastapi>=0.111
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9  # File upload support for /api/report/upload

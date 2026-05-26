@@ -1,0 +1,360 @@
+<div class="page">
+
+  <!-- ── Header ── -->
+  <div class="page-header">
+    <div>
+      <h1>Pipeline Runs</h1>
+      <p class="meta">9-step agent trace — Ingest → Load Repo → RAG Fetch → Fetch Rule → Planner → Generator → Critic → Validate → Deliver</p>
+    </div>
+    <div class="header-actions">
+      <span class="api-badge" [class.api-badge--live]="!error()">
+        <span class="api-badge__dot"></span>
+        {{ error() ? 'API offline' : 'API connected' }}
+      </span>
+      <button class="stop-btn" *ngIf="canCancel" (click)="cancelRun()">
+        <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+          <rect x="2" y="2" width="7" height="7" rx="1" fill="currentColor"/>
+        </svg>
+        Stop Run
+      </button>
+      <button class="run-btn" (click)="showForm.set(!showForm())" [disabled]="running()">
+        <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+          <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
+        </svg>
+        Run Pipeline
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Run form ── -->
+  <div class="run-form" *ngIf="showForm()">
+    <div class="run-form__grid">
+      <div class="run-form__field run-form__field--wide">
+        <label>Repository URL</label>
+        <input class="run-form__input" [value]="repoUrl()"
+               (input)="repoUrl.set($any($event.target).value)"
+               placeholder="https://github.com/owner/repo.git">
+      </div>
+      <div class="run-form__field">
+        <label>Commit SHA</label>
+        <div class="sha-wrap">
+          <input class="run-form__input" [value]="commitSha()"
+                 (input)="commitSha.set($any($event.target).value)"
+                 placeholder="abc1234">
+          <button type="button" class="sha-head-btn"
+                  [class.sha-head-btn--active]="commitSha() === 'HEAD' || commitSha() === ''"
+                  (click)="commitSha.set('HEAD')">
+            HEAD
+          </button>
+        </div>
+      </div>
+      <div class="run-form__field run-form__field--sm">
+        <label>Max Issues</label>
+        <input class="run-form__input" type="number" [value]="maxIssues()"
+               (input)="maxIssues.set(+$any($event.target).value)"
+               min="1" placeholder="e.g. 5">
+      </div>
+    </div>
+
+    <!-- ── NEW: Severity selector ── -->
+    <div class="run-form__sev-row">
+      <span class="run-form__sev-label">Fix Severities</span>
+      <div class="sev-picker">
+        <button
+          *ngFor="let s of SEV_OPTIONS"
+          type="button"
+          class="sev-pill"
+          [class.sev-pill--on]="isSevSelected(s)"
+          [class.sev-pill--blocker]="s === 'BLOCKER'"
+          [class.sev-pill--critical]="s === 'CRITICAL'"
+          [class.sev-pill--major]="s === 'MAJOR'"
+          [class.sev-pill--minor]="s === 'MINOR'"
+          [class.sev-pill--info]="s === 'INFO'"
+          (click)="toggleSev(s)"
+          [title]="isSevSelected(s) ? 'Click to exclude ' + s : 'Click to include ' + s">
+          {{ s }}
+        </button>
+      </div>
+      <span class="run-form__sev-hint">
+        {{ selectedSevs().size === 5 ? 'All severities' : selectedSevs().size + ' selected' }}
+      </span>
+    </div>
+
+    <div class="run-form__flags">
+      <label class="flag-toggle" [class.flag-toggle--on]="parallel()">
+        <input type="checkbox" [checked]="parallel()"
+               (change)="parallel.set($any($event.target).checked)">
+        Parallel
+      </label>
+      <label class="flag-toggle" [class.flag-toggle--on]="rescan()">
+        <input type="checkbox" [checked]="rescan()"
+               (change)="rescan.set($any($event.target).checked)">
+        Rescan
+      </label>
+      <label class="flag-toggle" [class.flag-toggle--on]="noRag()">
+        <input type="checkbox" [checked]="noRag()"
+               (change)="noRag.set($any($event.target).checked)">
+        No RAG
+      </label>
+      <label class="flag-toggle" [class.flag-toggle--on]="dryRun()">
+        <input type="checkbox" [checked]="dryRun()"
+               (change)="dryRun.set($any($event.target).checked)">
+        Dry Run
+      </label>
+      <button class="run-form__submit" (click)="startRun()" [disabled]="running()">
+        <span *ngIf="!running()">▶ Start</span>
+        <span *ngIf="running()" class="spinner"></span>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Error banner ── -->
+  <div class="error-banner" *ngIf="error()">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+      <circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.4"/>
+      <path d="M7 4.5V7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      <circle cx="7" cy="9.5" r=".6" fill="currentColor"/>
+    </svg>
+    {{ error() }}
+    <button class="error-banner__close" (click)="state.error.set(null)">✕</button>
+  </div>
+
+  <!-- ── Layout ── -->
+  <div class="layout">
+
+    <!-- ── Run list ── -->
+    <div class="run-list">
+      <div *ngFor="let run of allRuns"
+           class="run-card"
+           [class.run-card--active]="selected()?.id === run.id"
+           [class.run-card--live]="run.live && run.status !== 'cancelled'"
+           [class.run-card--cancelled]="run.status === 'cancelled'"
+           (click)="select(run)">
+
+        <div class="run-card__top">
+          <span class="pill {{ $any(run.severity) | sevClass }}"
+                *ngIf="run.status !== 'running' || run.ruleKey !== '—'">
+            {{ run.severity }}
+          </span>
+          <span class="run-card__rule">
+            {{ run.status === 'running' && run.ruleKey === '—' ? 'Pipeline running…' : run.ruleKey }}
+          </span>
+          <span *ngIf="run.live && run.status === 'running'" class="live-badge">LIVE</span>
+          <span *ngIf="run.status === 'cancelled'" class="cancelled-badge">CANCELLED</span>
+          <span *ngIf="run.outcome && run.status !== 'cancelled' && run.status !== 'running'"
+                class="badge {{ $any(run.outcome) | outcomeClass }}">
+            {{ $any(run.outcome) | outcomeLabel }}
+          </span>
+          <!-- Delete button — only shown for finished runs -->
+          <button *ngIf="run.status !== 'running'"
+                  class="run-card__del"
+                  title="Remove"
+                  (click)="deleteRun(run.id); $event.stopPropagation()">
+            <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+              <path d="M1 1L10 10M10 1L1 10" stroke="currentColor" stroke-width="1.5"
+                    stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="run-card__comp">{{ run.component || '—' }}</div>
+
+        <div class="prog-bar">
+          <div *ngFor="let s of run.steps"
+               class="prog-bar__seg prog-bar__seg--{{ s.status }}"
+               [title]="s.label">
+          </div>
+        </div>
+
+        <div class="run-card__foot">
+          <span>{{ doneCnt(run) }} / {{ run.steps.length }} steps</span>
+          <span *ngIf="run.request" class="run-card__repo" [title]="run.request.repo_url">
+            {{ run.request.repo_url | slice:run.request.repo_url.lastIndexOf('/')+1 }}
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Detail pane ── -->
+    <div class="detail" [class.detail--cancelled]="selected()?.status === 'cancelled'">
+
+      <!-- Empty state -->
+      <div class="detail__empty" *ngIf="!selected()">
+        <div class="detail__empty-icon">
+          <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+            <circle cx="16" cy="16" r="14" stroke="currentColor" stroke-width="1.5"
+                    stroke-dasharray="3 3"/>
+            <path d="M11 16L14.5 19.5L21 12.5" stroke="currentColor" stroke-width="1.8"
+                  stroke-linecap="round" stroke-linejoin="round" opacity=".4"/>
+          </svg>
+        </div>
+        <div class="detail__empty-title">Select a run</div>
+        <div class="detail__empty-sub">Click any run card to see the full agent trace</div>
+      </div>
+
+      <ng-container *ngIf="selected() as run">
+
+        <!-- Detail header -->
+        <div class="detail__header">
+          <div class="detail__header-row">
+            <span class="pill {{ $any(run.severity) | sevClass }}">{{ run.severity }}</span>
+            <span class="detail__rule">{{ run.ruleKey }}</span>
+            <span *ngIf="run.live && run.status === 'running'" class="live-badge">LIVE</span>
+            <span *ngIf="run.status === 'cancelled'" class="cancelled-badge">CANCELLED</span>
+            <span *ngIf="run.outcome && run.status !== 'cancelled'"
+                  class="badge {{ $any(run.outcome) | outcomeClass }}">
+              {{ $any(run.outcome) | outcomeLabel }}
+            </span>
+          </div>
+          <div class="detail__comp">
+            <ng-container *ngIf="run.component; else compPlaceholder">{{ run.component }}</ng-container>
+            <ng-template #compPlaceholder>
+              <span *ngIf="run.status === 'running'" class="detail__comp--pulse">
+                Running pipeline…
+              </span>
+              <span *ngIf="run.status !== 'running'">—</span>
+            </ng-template>
+          </div>
+
+          <!-- Action buttons row -->
+          <div class="detail__actions" *ngIf="run.request">
+            <button class="action-btn action-btn--view"
+                    (click)="showInput.set(!showInput())">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <circle cx="6" cy="6" r="4" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M6 4V6.5L7.5 8" stroke="currentColor" stroke-width="1.3"
+                      stroke-linecap="round"/>
+              </svg>
+              {{ showInput() ? 'Hide Input' : 'View Input' }}
+            </button>
+            <button class="action-btn action-btn--restart"
+                    [disabled]="running()"
+                    (click)="restartRun(run.request!)">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M2 6A4 4 0 1 1 6 10" stroke="currentColor" stroke-width="1.4"
+                      stroke-linecap="round"/>
+                <path d="M2 3.5V6.5H5" stroke="currentColor" stroke-width="1.4"
+                      stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Restart Run
+            </button>
+          </div>
+        </div>
+
+        <!-- ── Input viewer panel ── -->
+        <div class="input-panel" *ngIf="showInput() && run.request">
+          <div class="input-panel__title">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <rect x="1" y="1" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.2"/>
+              <path d="M3 4h6M3 6h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+            Run Input
+          </div>
+          <div class="input-fields">
+            <div class="input-field">
+              <span class="input-field__key">repo_url</span>
+              <span class="input-field__val">{{ run.request.repo_url }}</span>
+            </div>
+            <div class="input-field">
+              <span class="input-field__key">commit_sha</span>
+              <span class="input-field__val">{{ run.request.commit_sha || '(HEAD)' }}</span>
+            </div>
+            <div class="input-field">
+              <span class="input-field__key">max_issues</span>
+              <span class="input-field__val">{{ run.request.max_issues || '0 (all)' }}</span>
+            </div>
+            <!-- ── NEW: severities row ── -->
+            <div class="input-field">
+              <span class="input-field__key">severities</span>
+              <span class="input-field__val">{{ sevLabel(run.request) }}</span>
+            </div>
+            <div class="input-field input-field--flags">
+              <span class="input-field__key">flags</span>
+              <div class="flag-chips">
+                <ng-container *ngFor="let f of flagsOf(run.request)">
+                  <span class="flag-chip" [class.flag-chip--on]="f.on">
+                    {{ f.label }}
+                  </span>
+                </ng-container>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stat strip -->
+        <div class="stat-strip">
+          <div class="stat-strip__item">
+            <div class="stat-strip__val">{{ run.ragHits ?? '—' }}</div>
+            <div class="stat-strip__lbl">RAG hits</div>
+          </div>
+          <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item">
+            <div class="stat-strip__val">{{ run.retries ?? '—' }}</div>
+            <div class="stat-strip__lbl">Retries</div>
+          </div>
+          <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item">
+            <div class="stat-strip__val stat-strip__val--conf"
+                 [class]="confClass(run.confidence)">
+              {{ run.confidence ?? '—' }}
+            </div>
+            <div class="stat-strip__lbl">Confidence</div>
+          </div>
+          <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item">
+            <div class="stat-strip__val">{{ doneCnt(run) }}/{{ run.steps.length }}</div>
+            <div class="stat-strip__lbl">Steps done</div>
+          </div>
+        </div>
+
+        <!-- Step trace -->
+        <div class="trace">
+          <div *ngFor="let step of run.steps; let i = index; let last = last"
+               class="trace-step trace-step--{{ step.status }}">
+            <div class="trace-step__track">
+              <div class="trace-step__dot">
+                <span class="trace-step__num" *ngIf="step.status === 'pending'">{{ i + 1 }}</span>
+                <svg *ngIf="step.status === 'done'" width="8" height="8" viewBox="0 0 8 8" fill="none">
+                  <path d="M1.5 4L3.2 5.8L6.5 2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <svg *ngIf="step.status === 'error'" width="8" height="8" viewBox="0 0 8 8" fill="none">
+                  <path d="M2 2L6 6M6 2L2 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                </svg>
+                <svg *ngIf="step.status === 'cancelled'" width="7" height="7" viewBox="0 0 7 7" fill="none">
+                  <rect x="1" y="1" width="5" height="5" rx="1" fill="currentColor"/>
+                </svg>
+              </div>
+              <div class="trace-step__line" *ngIf="!last"></div>
+            </div>
+            <div class="trace-step__body">
+              <div class="trace-step__top">
+                <span class="trace-step__label">{{ step.label }}</span>
+                <span class="trace-step__ms" *ngIf="step.ms">{{ step.ms | number }}ms</span>
+                <span class="trace-step__running-badge" *ngIf="step.status === 'running'">running</span>
+              </div>
+              <div class="trace-step__detail"
+                   *ngIf="step.detail"
+                   style="white-space: pre-wrap; word-break: break-word; overflow: visible;">{{ step.detail }}</div>
+              <div class="trace-step__shimmer" *ngIf="step.status === 'running'"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Outcome banner -->
+        <div class="outcome outcome--{{ $any(run.outcome) | outcomeClass }}"
+             *ngIf="run.outcome">
+          <div class="outcome__badge outcome__badge--{{ $any(run.outcome) | outcomeClass }}">
+            {{ outcomeIcon(run.outcome) }}
+          </div>
+          <div class="outcome__body">
+            <div class="outcome__title">{{ outcomeTitle(run.outcome) }}</div>
+            <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank"
+               class="outcome__link">{{ run.prUrl }}</a>
+          </div>
+        </div>
+
+      </ng-container>
+    </div>
+
+  </div>
+</div>

@@ -1,0 +1,70 @@
+{
+  "items": [
+    {
+      "id": 292240193,
+      "releaseId": 1723380,
+      "severityString": "High",
+      "category": "Open Source",
+      "primaryLocation": "org.springframework:spring-context@5.3.31",
+      "vulnId": "a4105c54-6262-4cbf-9edf-a03d8fe1558d",
+      "checkId": "CVE-2024-38820",
+      "auditorStatus": "Fixable OSS",
+      "isSuppressed": false,
+      "closedStatus": false,
+      "owasp2021": "A06:2021 – Vulnerable and Outdated Components"
+    },
+    {
+      "id": 292240194,
+      "releaseId": 1723380,
+      "severityString": "Low",
+      "category": "Open Source",
+      "primaryLocation": "org.springframework:spring-context@5.3.31",
+      "vulnId": "39a7c4f2-6a18-44d1-a3bc-15eee54c2a60",
+      "checkId": "CVE-2025-22233",
+      "auditorStatus": "Fixable OSS",
+      "isSuppressed": false,
+      "closedStatus": false,
+      "owasp2021": "A06:2021 – Vulnerable and Outdated Components"
+    },
+    {
+      "id": 292240195,
+      "releaseId": 1723380,
+      "severityString": "High",
+      "category": "Open Source",
+      "primaryLocation": "org.springframework:spring-core@5.3.31",
+      "vulnId": "a36a6702-2761-41f1-b40f-eec938166446",
+      "checkId": "CVE-2025-41242",
+      "auditorStatus": "Fixable OSS",
+      "isSuppressed": false,
+      "closedStatus": false,
+      "owasp2021": "A06:2021 – Vulnerable and Outdated Components"
+    },
+    {
+      "id": 292240196,
+      "releaseId": 1723380,
+      "severityString": "High",
+      "category": "Open Source",
+      "primaryLocation": "org.eclipse.jetty:jetty-http@12.0.12",
+      "vulnId": "ce1ed969-a146-4b78-91e8-9d1af7dffa40",
+      "checkId": "CVE-2025-41249",
+      "auditorStatus": "Fixable OSS",
+      "isSuppressed": false,
+      "closedStatus": false,
+      "owasp2021": "A06:2021 – Vulnerable and Outdated Components"
+    },
+    {
+      "id": 292240197,
+      "releaseId": 1723380,
+      "severityString": "Critical",
+      "category": "Open Source",
+      "primaryLocation": "com.example:suppressed-lib@2.0.0",
+      "vulnId": "deadbeef-0000-0000-0000-000000000001",
+      "checkId": "CVE-9999-0001",
+      "auditorStatus": "Fixable OSS",
+      "isSuppressed": true,
+      "closedStatus": false,
+      "owasp2021": "A06:2021 – Vulnerable and Outdated Components"
+    }
+  ],
+  "totalCount": 5
+}
