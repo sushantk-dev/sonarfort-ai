@@ -1,5 +1,5 @@
 // src/app/features/pipeline/pipeline.component.ts
-import { Component, inject, signal } from '@angular/core';
+import { Component, inject, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PipelineStateService, UiRun, RunRequest } from '../../core/pipeline-state.service';
@@ -7,6 +7,16 @@ import { SevClassPipe }    from '../../shared/sev-class.pipe';
 import { OutcomeClassPipe } from '../../shared/outcome-class.pipe';
 import { OutcomeLabelPipe } from '../../shared/outcome-label.pipe';
 import { ActiveStepPipe }  from '../../shared/active-step.pipe';
+
+// ── Fortify pipeline mode → API endpoint mapping ──────────────────────────────
+export type FortifyMode = 'live' | 'offline' | 'app-name' | 'dry-run';
+
+const ENDPOINT_MAP: Record<FortifyMode, string> = {
+  'live':     '/pipeline/live',
+  'offline':  '/pipeline/offline',
+  'app-name': '/pipeline/app-name',
+  'dry-run':  '/pipeline/dry-run',
+};
 
 @Component({
   selector: 'app-pipeline',
@@ -19,7 +29,7 @@ export class PipelineComponent {
   state = inject(PipelineStateService);
 
   // ── Source tab: 'sonar' | 'fortify' | 'both' ─────────────────────────────
-  activeSource = signal<'sonar' | 'fortify' | 'both'>('sonar');
+  activeSource = signal<'sonar' | 'fortify'>('sonar');
 
   // ── Pipeline step labels ──────────────────────────────────────────────────
   readonly FORTIFY_STEPS = [
@@ -31,6 +41,20 @@ export class PipelineComponent {
     'Ingest', 'Load Repo', 'RAG Fetch', 'Fetch Rule',
     'Planner', 'Generator', 'Critic', 'Validate', 'Deliver',
   ];
+
+  // ── Fortify pipeline mode options ─────────────────────────────────────────
+  readonly FORTIFY_MODES: { label: string; value: FortifyMode }[] = [
+    { label: 'Live',      value: 'live'     },
+    { label: 'Offline',   value: 'offline'  },
+    { label: 'App Name',  value: 'app-name' },
+    { label: 'Dry Run',   value: 'dry-run'  },
+  ];
+
+  // ── Active Fortify mode ───────────────────────────────────────────────────
+  fortifyMode = signal<FortifyMode>('live');
+
+  // ── Derived endpoint label ────────────────────────────────────────────────
+  fortifyEndpoint = computed(() => ENDPOINT_MAP[this.fortifyMode()]);
 
   // ── Severity options (in priority order) ─────────────────────────────────
   readonly SEV_OPTIONS = ['BLOCKER', 'CRITICAL', 'MAJOR', 'MINOR', 'INFO'] as const;
@@ -46,10 +70,12 @@ export class PipelineComponent {
   showForm     = signal(false);
 
   // ── Fortify run form signals ──────────────────────────────────────────────
-  fortifyReleaseId  = signal('');
-  fortifyAppName    = signal('');
-  fortifyMaxUpgrades = signal(0);   // 0 = no limit (all)
-  showFortifyForm   = signal(false);
+  fortifyReleaseId   = signal('');
+  fortifyAppName     = signal('');
+  fortifyGithubRepo  = signal('');       // owner/repo override
+  fortifyReportPath  = signal('');       // offline mode: path to JSON report
+  fortifyMaxUpgrades = signal(0);        // 0 = no limit
+  showFortifyForm    = signal(false);
 
   // ── Severity multi-select — all enabled by default ────────────────────────
   selectedSevs = signal<Set<string>>(
@@ -115,15 +141,60 @@ export class PipelineComponent {
     });
   }
 
-  // ── Fortify start (stub — wires to same state service for now) ────────────
+  // ── Fortify start — builds request body per mode and calls correct endpoint ─
   startFortifyRun() {
     this.showFortifyForm.set(false);
-    // TODO: replace with dedicated FortifyStateService call when available
-    // For now logs intent; can be wired to /api/pipeline/live or /api/pipeline/app-name
-    console.log('[Fortify] run requested', {
-      app_name:     this.fortifyAppName(),
-      release_id:   this.fortifyReleaseId(),
-      max_upgrades: this.fortifyMaxUpgrades() || 'all',
+
+    const mode     = this.fortifyMode();
+    const endpoint = this.fortifyEndpoint();
+    const baseUrl  = 'http://localhost:8000'; // resolved from config in production
+
+    let body: Record<string, unknown> = {
+      max_upgrades: this.fortifyMaxUpgrades() || 0,
+      config: {
+        ...(this.fortifyGithubRepo() ? { github_repo: this.fortifyGithubRepo() } : {}),
+      },
+    };
+
+    switch (mode) {
+      case 'live':
+        body = { ...body, release_id: Number(this.fortifyReleaseId()) };
+        break;
+      case 'offline':
+        body = {
+          ...body,
+          report_path: this.fortifyReportPath(),
+          release_id:  Number(this.fortifyReleaseId()) || 0,
+        };
+        break;
+      case 'app-name':
+        body = { ...body, app_name: this.fortifyAppName() };
+        break;
+      case 'dry-run':
+        body = {
+          ...body,
+          release_id:  Number(this.fortifyReleaseId()) || 0,
+          report_path: this.fortifyReportPath() || null,
+          app_name:    null,
+        };
+        break;
+    }
+
+    // Fire-and-forget: POST to Fortify API server, then poll /pipeline/status/{id}
+    fetch(`${baseUrl}${endpoint}`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    })
+    .then(r => r.json())
+    .then(({ pipeline_id }) => {
+      if (pipeline_id) {
+        // Hand off to state service for live polling (same UX as Sonar runs)
+        this.state.trackFortifyRun(pipeline_id, mode, body);
+      }
+    })
+    .catch(err => {
+      this.state.error.set(`Fortify API error: ${err.message}`);
     });
   }
 

@@ -1409,3 +1409,138 @@
     color:       var(--text-primary);
   }
 }
+
+// ── Pipeline mode bar (Fortify form tabs) ─────────────────────────────────
+.pipeline-mode-bar {
+  display:       flex;
+  gap:           4px;
+  margin-bottom: 16px;
+  padding:       3px;
+  background:    var(--surface-0);
+  border:        1px solid var(--border);
+  border-radius: 8px;
+  width:         fit-content;
+}
+
+.pipeline-mode-btn {
+  padding:        6px 14px;
+  font-size:      12px;
+  font-weight:    500;
+  font-family:    var(--font-sans);
+  border:         none;
+  border-radius:  5px;
+  background:     transparent;
+  color:          var(--text-muted);
+  cursor:         pointer;
+  transition:     background 0.12s, color 0.12s;
+  white-space:    nowrap;
+
+  &:hover:not(.pipeline-mode-btn--active) {
+    background: var(--surface-1);
+    color:      var(--text-secondary);
+  }
+
+  &--active {
+    background:  rgba(29,158,117,.12);
+    color:       #0F6E56;
+    box-shadow:  0 1px 3px rgba(29,158,117,.2);
+  }
+}
+
+// ── Endpoint badge shown in form header ───────────────────────────────────
+.run-form__endpoint-badge {
+  margin-left:   auto;
+  font-size:     10px;
+  font-weight:   600;
+  font-family:   var(--font-mono, monospace);
+  padding:       2px 8px;
+  border-radius: 4px;
+  background:    rgba(29,158,117,.1);
+  color:         #0F6E56;
+  border:        1px solid rgba(29,158,117,.25);
+  letter-spacing: 0.02em;
+}
+
+// ── Full-width field inside the form grid ─────────────────────────────────
+.run-form__field--full {
+  grid-column: 1 / -1;
+}
+
+// ── Dry run note ──────────────────────────────────────────────────────────
+.dry-run-note {
+  display:       flex;
+  align-items:   flex-start;
+  gap:           8px;
+  font-size:     12px;
+  color:         var(--text-secondary);
+  background:    var(--surface-1);
+  border:        1px solid var(--border);
+  border-radius: 6px;
+  padding:       10px 12px;
+  line-height:   1.5;
+
+  svg {
+    flex-shrink: 0;
+    margin-top:  1px;
+    color:       var(--text-muted);
+  }
+
+  strong { color: var(--text-primary); }
+}
+// ── Sonar pipeline flow strip (replaces Both dual-flow) ───────────────────
+.sonar-flow {
+  display:       flex;
+  align-items:   center;
+  gap:           0;
+  margin-bottom: 12px;
+  padding:       8px 14px;
+  background:    var(--surface-0);
+  border:        1px solid var(--border);
+  border-left:   3px solid var(--brand);
+  border-radius: 8px;
+  overflow-x:    auto;
+  flex-shrink:   0;
+
+  &__label {
+    display:      flex;
+    align-items:  center;
+    gap:          6px;
+    font-size:    11px;
+    font-weight:  600;
+    color:        var(--brand);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-right: 14px;
+    white-space:  nowrap;
+    flex-shrink:  0;
+
+    svg { flex-shrink: 0; }
+  }
+
+  &__steps {
+    display:     flex;
+    align-items: center;
+    gap:         4px;
+    flex-wrap:   nowrap;
+  }
+
+  &__step {
+    font-size:    11px;
+    font-weight:  500;
+    padding:      3px 9px;
+    border-radius: 5px;
+    white-space:  nowrap;
+    background:   var(--brand-muted);
+    color:        var(--brand);
+    border:       1px solid var(--brand-ring);
+    flex-shrink:  0;
+  }
+
+  &__arr {
+    font-size:   11px;
+    color:       var(--border-md);
+    flex-shrink: 0;
+    line-height: 1;
+    padding:     0 1px;
+  }
+}

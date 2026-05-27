@@ -36,15 +36,7 @@
         </svg>
         Run Fortify
       </button>
-      <button class="run-btn"
-              *ngIf="activeSource() === 'both'"
-              (click)="showForm.set(!showForm())"
-              [disabled]="running()">
-        <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
-          <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
-        </svg>
-        Run Pipeline
-      </button>
+
     </div>
   </div>
 
@@ -69,23 +61,13 @@
       </svg>
       Fortify
     </button>
-    <button class="source-tab"
-            [class.source-tab--active]="activeSource() === 'both'"
-            (click)="activeSource.set('both'); showForm.set(false); showFortifyForm.set(false)">
-      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
-        <rect x="1" y="1" width="5.5" height="5.5" rx="1.2" fill="currentColor" opacity=".7"/>
-        <rect x="7.5" y="1" width="5.5" height="5.5" rx="1.2" fill="currentColor" opacity=".4"/>
-        <rect x="1" y="7.5" width="5.5" height="5.5" rx="1.2" fill="currentColor" opacity=".4"/>
-        <rect x="7.5" y="7.5" width="5.5" height="5.5" rx="1.2" fill="currentColor" opacity=".6"/>
-      </svg>
-      Both
-    </button>
+
   </div>
 
   <!-- ════════════════════════════════════════════
        SONAR — run form
   ════════════════════════════════════════════ -->
-  <div class="run-form run-form--sonar" *ngIf="showForm() && activeSource() !== 'fortify'">
+  <div class="run-form run-form--sonar" *ngIf="showForm() && activeSource() === 'sonar'">
     <div class="run-form__source-label">
       <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
         <circle cx="5" cy="7" r="2.2" stroke="currentColor" stroke-width="1.3"/>
@@ -170,6 +152,24 @@
     </div>
   </div>
 
+  <!-- ── Sonar pipeline flow strip ── -->
+  <div class="sonar-flow" *ngIf="activeSource() === 'sonar' && !showForm()">
+    <div class="sonar-flow__label">
+      <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
+        <circle cx="5" cy="7" r="2.2" stroke="currentColor" stroke-width="1.3"/>
+        <path d="M7.2 7H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+        <circle cx="11" cy="7" r="1.5" stroke="currentColor" stroke-width="1.2"/>
+      </svg>
+      SonarQube pipeline
+    </div>
+    <div class="sonar-flow__steps">
+      <ng-container *ngFor="let s of SONAR_STEPS; let last = last">
+        <span class="sonar-flow__step">{{ s }}</span>
+        <span class="sonar-flow__arr" *ngIf="!last">›</span>
+      </ng-container>
+    </div>
+  </div>
+
   <!-- ════════════════════════════════════════════
        FORTIFY — run form
   ════════════════════════════════════════════ -->
@@ -180,81 +180,127 @@
               stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
       </svg>
       Fortify pipeline
+      <span class="run-form__endpoint-badge">POST {{ fortifyEndpoint() }}</span>
     </div>
+
+    <!-- Pipeline mode selector -->
+    <div class="pipeline-mode-bar">
+      <button *ngFor="let m of FORTIFY_MODES"
+              class="pipeline-mode-btn"
+              [class.pipeline-mode-btn--active]="fortifyMode() === m.value"
+              (click)="fortifyMode.set(m.value)">
+        {{ m.label }}
+      </button>
+    </div>
+
     <div class="run-form__grid">
-      <div class="run-form__field run-form__field--wide">
-        <label>Repository URL</label>
-        <input class="run-form__input" [value]="repoUrl()"
-               (input)="repoUrl.set($any($event.target).value)"
-               placeholder="https://github.com/owner/repo.git">
-      </div>
-      <div class="run-form__field">
-        <label>App Name</label>
-        <input class="run-form__input" [value]="fortifyAppName()"
-               (input)="fortifyAppName.set($any($event.target).value)"
-               placeholder="e.g. helloworld">
-      </div>
-      <div class="run-form__field run-form__field--sm">
-        <label>Release ID <span class="label-opt">(optional)</span></label>
-        <input class="run-form__input" [value]="fortifyReleaseId()"
-               (input)="fortifyReleaseId.set($any($event.target).value)"
-               placeholder="auto">
-      </div>
-      <div class="run-form__field run-form__field--sm">
-        <label>Max Upgrades <span class="label-opt">(optional)</span></label>
-        <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
-               (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
-               min="1" placeholder="all">
-      </div>
+
+      <!-- LIVE: release_id + repo + max_upgrades -->
+      <ng-container *ngIf="fortifyMode() === 'live'">
+        <div class="run-form__field run-form__field--sm">
+          <label>Release ID</label>
+          <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
+                 (input)="fortifyReleaseId.set($any($event.target).value)"
+                 placeholder="e.g. 1723380">
+        </div>
+        <div class="run-form__field">
+          <label>GitHub Repo <span class="label-opt">owner/repo</span></label>
+          <input class="run-form__input" [value]="fortifyGithubRepo()"
+                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+                 placeholder="acme/backend">
+        </div>
+        <div class="run-form__field run-form__field--sm">
+          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
+          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
+                 min="0" placeholder="0">
+        </div>
+      </ng-container>
+
+      <!-- OFFLINE: report_path + release_id + max_upgrades -->
+      <ng-container *ngIf="fortifyMode() === 'offline'">
+        <div class="run-form__field run-form__field--wide">
+          <label>Report Path <span class="label-opt">.json</span></label>
+          <input class="run-form__input" [value]="fortifyReportPath()"
+                 (input)="fortifyReportPath.set($any($event.target).value)"
+                 placeholder="/tmp/report.json">
+        </div>
+        <div class="run-form__field run-form__field--sm">
+          <label>Release ID <span class="label-opt">optional</span></label>
+          <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
+                 (input)="fortifyReleaseId.set($any($event.target).value)"
+                 placeholder="0">
+        </div>
+        <div class="run-form__field run-form__field--sm">
+          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
+          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
+                 min="0" placeholder="0">
+        </div>
+      </ng-container>
+
+      <!-- APP-NAME: app_name + repo + max_upgrades -->
+      <ng-container *ngIf="fortifyMode() === 'app-name'">
+        <div class="run-form__field run-form__field--wide">
+          <label>App Name</label>
+          <input class="run-form__input" [value]="fortifyAppName()"
+                 (input)="fortifyAppName.set($any($event.target).value)"
+                 placeholder="1038_US_MyApp_USIS">
+        </div>
+        <div class="run-form__field">
+          <label>GitHub Repo <span class="label-opt">override</span></label>
+          <input class="run-form__input" [value]="fortifyGithubRepo()"
+                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+                 placeholder="acme/backend">
+        </div>
+        <div class="run-form__field run-form__field--sm">
+          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
+          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
+                 min="0" placeholder="0">
+        </div>
+      </ng-container>
+
+      <!-- DRY-RUN: release_id or report_path, no side effects -->
+      <ng-container *ngIf="fortifyMode() === 'dry-run'">
+        <div class="run-form__field run-form__field--sm">
+          <label>Release ID <span class="label-opt">or use report</span></label>
+          <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
+                 (input)="fortifyReleaseId.set($any($event.target).value)"
+                 placeholder="e.g. 1723380">
+        </div>
+        <div class="run-form__field run-form__field--wide">
+          <label>Report Path <span class="label-opt">optional, overrides release ID</span></label>
+          <input class="run-form__input" [value]="fortifyReportPath()"
+                 (input)="fortifyReportPath.set($any($event.target).value)"
+                 placeholder="/tmp/report.json">
+        </div>
+        <div class="run-form__field run-form__field--sm">
+          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
+          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
+                 min="0" placeholder="0">
+        </div>
+        <div class="run-form__field run-form__field--full">
+          <div class="dry-run-note">
+            <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
+              <circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.3"/>
+              <path d="M7 5V7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+              <circle cx="7" cy="9.5" r=".5" fill="currentColor"/>
+            </svg>
+            ADR fix, PR creation, and Fortify writeback are <strong>skipped</strong>. Safe to preview on any project.
+          </div>
+        </div>
+      </ng-container>
+
     </div>
+
     <div class="run-form__flags">
-      <label class="flag-toggle" [class.flag-toggle--on]="dryRun()">
-        <input type="checkbox" [checked]="dryRun()"
-               (change)="dryRun.set($any($event.target).checked)">
-        Dry Run
-      </label>
       <button class="run-form__submit run-form__submit--fortify"
               (click)="startFortifyRun()" [disabled]="running()">
         <span *ngIf="!running()">▶ Start</span>
         <span *ngIf="running()" class="spinner"></span>
       </button>
-    </div>
-  </div>
-
-  <!-- ════════════════════════════════════════════
-       BOTH — pipeline step reference strip
-  ════════════════════════════════════════════ -->
-  <div class="dual-flow" *ngIf="activeSource() === 'both'">
-    <div class="dual-flow__lane dual-flow__lane--sonar">
-      <div class="dual-flow__lane-label">
-        <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
-          <circle cx="5" cy="7" r="2.2" stroke="currentColor" stroke-width="1.3"/>
-          <path d="M7.2 7H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-          <circle cx="11" cy="7" r="1.5" stroke="currentColor" stroke-width="1.2"/>
-        </svg>
-        SonarQube
-      </div>
-      <div class="dual-flow__steps">
-        <ng-container *ngFor="let s of SONAR_STEPS; let last = last">
-          <span class="dual-flow__step">{{ s }}</span>
-          <span class="dual-flow__arr" *ngIf="!last">›</span>
-        </ng-container>
-      </div>
-    </div>
-    <div class="dual-flow__lane dual-flow__lane--fortify">
-      <div class="dual-flow__lane-label dual-flow__lane-label--fortify">
-        <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
-          <path d="M7 1.5L12 4V8C12 11 7 13 7 13C7 13 2 11 2 8V4L7 1.5Z"
-                stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-        </svg>
-        Fortify
-      </div>
-      <div class="dual-flow__steps">
-        <ng-container *ngFor="let s of FORTIFY_STEPS; let last = last">
-          <span class="dual-flow__step dual-flow__step--fortify">{{ s }}</span>
-          <span class="dual-flow__arr" *ngIf="!last">›</span>
-        </ng-container>
-      </div>
     </div>
   </div>
 
@@ -275,9 +321,9 @@
     <!-- ── Run list ── -->
     <div class="run-list">
 
-      <!-- Fortify step reference card (static) shown when Fortify/Both tab active and no runs -->
+      <!-- Fortify step reference card — shown when no runs exist on Fortify tab -->
       <div class="fortify-steps-card"
-           *ngIf="activeSource() !== 'sonar' && allRuns.length === 0">
+           *ngIf="activeSource() === 'fortify' && allRuns.length === 0">
         <div class="fortify-steps-card__head">
           <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
             <path d="M7 1.5L12 4V8C12 11 7 13 7 13C7 13 2 11 2 8V4L7 1.5Z"

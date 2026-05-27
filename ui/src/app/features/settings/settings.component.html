@@ -256,19 +256,35 @@
 
         <div class="section">
           <div class="section__head">
-            <div class="section__title">Fortify</div>
-            <div class="section__desc">Fortify SAST integration for static analysis results</div>
+            <div class="section__title-row">
+              <div>
+                <div class="section__title">Fortify</div>
+                <div class="section__desc">Fortify SSC credentials and token management</div>
+              </div>
+              <!-- Token status badge -->
+              <div class="fortify-token-status"
+                   [class.fortify-token-status--ok]="tokenStatus.fortifyToken"
+                   [class.fortify-token-status--missing]="!tokenStatus.fortifyToken">
+                <span class="fortify-token-status__dot"></span>
+                {{ tokenStatus.fortifyToken ? 'Token set' : 'Token missing' }}
+              </div>
+            </div>
           </div>
           <div class="fields">
+
+            <!-- ── Fortify API Token (manual) ── -->
             <div class="field">
-              <label class="field__label">Fortify API Token</label>
+              <label class="field__label">
+                Fortify API Token
+                <span class="optional">Authorization: Bearer</span>
+              </label>
               <div class="token-set" *ngIf="tokenStatus.fortifyToken && !isEditing('fortifyToken')">
                 <div class="token-set__mask">
                   <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                     <rect x="1" y="5" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
                     <path d="M3.5 5V3.5a2.5 2.5 0 015 0V5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
                   </svg>
-                  ••••••••••••••••
+                  Bearer ••••••••••••••••
                 </div>
                 <div class="token-set__actions">
                   <button class="token-btn token-btn--change" (click)="startEditing('fortifyToken')">Change</button>
@@ -278,23 +294,125 @@
                 <input class="input" type="password"
                        [value]="cfg.fortifyToken"
                        (input)="patch('fortifyToken', $any($event.target).value)"
-                       [placeholder]="tokenStatus.fortifyToken ? 'Enter new token to replace…' : 'Fortify API token…'"
+                       [placeholder]="tokenStatus.fortifyToken ? 'Enter new token to replace…' : 'Bearer token…'"
                        autocomplete="new-password">
                 <button *ngIf="isEditing('fortifyToken')" class="token-btn token-btn--cancel"
                         (click)="cancelEditing('fortifyToken')">Cancel</button>
               </div>
               <span class="field__hint">
-                Fortify on Demand or SSC API token — requires <code>view-apps</code> scope
+                Paste your Fortify SSC API token. Used as
+                <code>Authorization: Bearer &lt;token&gt;</code> on all SSC API calls.
               </span>
             </div>
+
+            <!-- ── OAuth refresh token ── -->
             <div class="field">
-              <label class="field__label">Host URL</label>
+              <label class="field__label">Refresh Token via OAuth
+                <span class="field__live-tag">POST /auth/token</span>
+              </label>
+
+              <!-- Collapsed: show refresh button when credentials already set -->
+              <div class="oauth-bar" *ngIf="!showOAuthForm()">
+                <div class="oauth-bar__hint">
+                  Use your Fortify username and password to fetch a fresh Bearer token
+                  automatically — written to <code>FORTIFY_API_TOKEN</code> in .env
+                </div>
+                <button class="oauth-btn" (click)="showOAuthForm.set(true)">
+                  <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
+                    <path d="M2 7A5 5 0 1 1 7 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                    <path d="M2 4.5V7.5H5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  Refresh Token
+                </button>
+              </div>
+
+              <!-- Expanded OAuth form -->
+              <div class="oauth-form" *ngIf="showOAuthForm()">
+                <div class="oauth-form__grid">
+                  <div class="oauth-field">
+                    <label>Username</label>
+                    <input class="input" [value]="oauthUsername()"
+                           (input)="oauthUsername.set($any($event.target).value)"
+                           placeholder="your@email.com"
+                           autocomplete="username">
+                  </div>
+                  <div class="oauth-field">
+                    <label>Password</label>
+                    <input class="input" type="password"
+                           [value]="oauthPassword()"
+                           (input)="oauthPassword.set($any($event.target).value)"
+                           placeholder="••••••••"
+                           autocomplete="current-password">
+                  </div>
+                  <div class="oauth-field">
+                    <label>Scope <span class="optional">default: api-tenant</span></label>
+                    <input class="input" [value]="oauthScope()"
+                           (input)="oauthScope.set($any($event.target).value)"
+                           placeholder="api-tenant">
+                  </div>
+                </div>
+
+                <div class="oauth-form__flags">
+                  <label class="oauth-check">
+                    <input type="checkbox"
+                           [checked]="oauthWriteToEnv()"
+                           (change)="oauthWriteToEnv.set($any($event.target).checked)">
+                    Write token to <code>.env</code> automatically
+                  </label>
+                </div>
+
+                <!-- Result / error strip -->
+                <div class="oauth-result oauth-result--ok" *ngIf="oauthResult()">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                    <path d="M2 6L5 9L10 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  Token refreshed · expires in {{ oauthResult()!.expires_in }}s
+                  <span class="oauth-result__scope" *ngIf="oauthResult()!.scope">
+                    · scope: {{ oauthResult()!.scope }}
+                  </span>
+                </div>
+                <div class="oauth-result oauth-result--err" *ngIf="oauthError()">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                    <circle cx="6" cy="6" r="5" stroke="currentColor" stroke-width="1.3"/>
+                    <path d="M6 3.5V6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                    <circle cx="6" cy="8.5" r=".5" fill="currentColor"/>
+                  </svg>
+                  {{ oauthError() }}
+                </div>
+
+                <div class="oauth-form__actions">
+                  <button class="oauth-submit"
+                          [class.oauth-submit--loading]="oauthLoading()"
+                          [disabled]="oauthLoading() || !oauthUsername() || !oauthPassword()"
+                          (click)="refreshFortifyToken()">
+                    <span class="spinner" *ngIf="oauthLoading()"></span>
+                    <svg *ngIf="!oauthLoading()" width="12" height="12" viewBox="0 0 14 14" fill="none">
+                      <path d="M2 7A5 5 0 1 1 7 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                      <path d="M2 4.5V7.5H5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    {{ oauthLoading() ? 'Fetching…' : 'Fetch Token' }}
+                  </button>
+                  <button class="token-btn token-btn--cancel"
+                          (click)="showOAuthForm.set(false); oauthError.set(''); oauthResult.set(null)">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- ── SSC Host URL ── -->
+            <div class="field">
+              <label class="field__label">SSC Host URL</label>
               <input class="input"
                      [value]="cfg.fortifyHostUrl"
                      (input)="patch('fortifyHostUrl', $any($event.target).value)"
-                     placeholder="https://api.ams.fortify.com">
-              <span class="field__hint">Fortify on Demand API base URL or your SSC server address</span>
+                     placeholder="https://your-instance.fortify.com">
+              <span class="field__hint">
+                Fortify SSC base URL — used for all API calls and the
+                <code>Authorization</code> header endpoint
+              </span>
             </div>
+
           </div>
         </div>
 

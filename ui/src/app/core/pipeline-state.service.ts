@@ -1,10 +1,34 @@
 // src/app/core/pipeline-state.service.ts
 import { Injectable, inject, signal } from '@angular/core';
-import { Subscription } from 'rxjs';
+import { Subscription, interval } from 'rxjs';
+import { switchMap, takeWhile, tap } from 'rxjs/operators';
+import { HttpClient } from '@angular/common/http';
 import { ApiService, RunStatus, PipelineStep } from './api.service';
 import { DataService } from './data.service';
 
 export type ConfLabel = 'HIGH' | 'MEDIUM' | 'LOW' | null;
+export type FortifyMode = 'live' | 'offline' | 'app-name' | 'dry-run';
+
+// ── Fortify pipeline stages in execution order ────────────────────────────────
+const FORTIFY_STAGE_LABELS: Record<string, string> = {
+  'triage':             'Triage',
+  'version-resolver':   'Version Resolver',
+  'context':            'Context',
+  'api-diff':           'API Diff',
+  'ai-reasoning':       'AI Reasoning',
+  'adr-fix':            'ADR Fix',
+  'ai-code-fix':        'AI Code Fix',
+  'pr-agent':           'PR Agent',
+  'fortify-writeback':  'Fortify Writeback',
+};
+
+const FORTIFY_STAGE_ORDER = Object.keys(FORTIFY_STAGE_LABELS);
+
+const FORTIFY_API = 'http://localhost:8000';
+const POLL_MS     = 2500;
+
+// ── localStorage key for Fortify runs that survived a page reload ─────────────
+const FORTIFY_ACTIVE_KEY = 'sonarfort_fortify_active_runs';
 
 export interface RunRequest {
   repo_url:   string;
@@ -17,26 +41,44 @@ export interface RunRequest {
   severities: string;
 }
 
+export interface FortifyRunRequest {
+  mode:        FortifyMode;
+  endpoint:    string;
+  body:        Record<string, unknown>;
+  pipeline_id: string;
+}
+
+// Shape persisted to localStorage so a reload can rehydrate
+interface PersistedFortifyRun {
+  pipeline_id: string;
+  mode:        FortifyMode;
+  body:        Record<string, unknown>;
+  started_at:  number;  // epoch ms — used to discard stale entries
+}
+
 export interface UiRun {
-  id:          string;
-  ruleKey:     string;
-  severity:    string;
-  component:   string;
-  steps:       PipelineStep[];
-  outcome?:    string;
-  confidence?: ConfLabel;
-  prUrl?:      string;
-  ragHits?:    number;
-  retries?:    number;
-  live:        boolean;
-  status?:     'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'empty';
-  request?:    RunRequest;
+  id:            string;
+  ruleKey:       string;
+  severity:      string;
+  component:     string;
+  steps:         PipelineStep[];
+  outcome?:      string;
+  confidence?:   ConfLabel;
+  prUrl?:        string;
+  ragHits?:      number;
+  retries?:      number;
+  live:          boolean;
+  status?:       'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'empty';
+  request?:      RunRequest;
+  fortifyRequest?: FortifyRunRequest;
+  source?:       'sonar' | 'fortify';
 }
 
 @Injectable({ providedIn: 'root' })
 export class PipelineStateService {
   private api  = inject(ApiService);
   private data = inject(DataService);
+  private http = inject(HttpClient);
 
   runs     = signal<UiRun[]>([]);
   selected = signal<UiRun | null>(null);
@@ -46,20 +88,34 @@ export class PipelineStateService {
   private _activeRunId: string | null = null;
   private _poll?: Subscription;
 
-  get allRuns() { return this.runs(); }
+  // FIX 1: map of pipelineId → Subscription so multiple Fortify polls
+  // can coexist, and we can attach to one independently of the Sonar poll.
+  private _fortifyPolls = new Map<string, Subscription>();
+
+  // FIX 2: queue of Fortify runs waiting for the current run to finish
+  private _fortifyQueue: Array<{ pipelineId: string; mode: FortifyMode; body: Record<string, unknown> }> = [];
+
+  get allRuns()  { return this.runs(); }
+  get canCancel(){ return this.running() && !!this._activeRunId; }
 
   constructor() {
-    // Rehydrate run history from the backend on every page load.
-    // Falls back to static seed data if the backend is unreachable.
+    this._rehydrate();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // STARTUP — rehydrate both Sonar and Fortify in-progress runs
+  // ══════════════════════════════════════════════════════════════════════════
+  private _rehydrate() {
+    // ── Sonar runs (from backend list) ────────────────────────────────────
     this.api.listRuns().subscribe({
       next: ({ runs }) => {
         const hydrated: UiRun[] = (runs ?? []).map((r: any) => this._backendRunToUiRun(r));
         this.runs.set(hydrated);
         this.selected.set(hydrated[0] ?? null);
 
-        // Re-attach polling for any run still in progress when the page reloaded
+        // Re-attach Sonar polling for any run still in progress
         const inProgress = hydrated.find(
-          r => r.status === 'running' || r.status === 'queued'
+          r => r.source !== 'fortify' && (r.status === 'running' || r.status === 'queued')
         );
         if (inProgress) {
           this.running.set(true);
@@ -73,28 +129,453 @@ export class PipelineStateService {
             },
           });
         }
+
+        // FIX 2: after Sonar hydration, rehydrate any persisted Fortify runs
+        this._rehydrateFortify();
       },
       error: () => {
-        // Backend offline — fall back to static seed so the UI isn't blank
         const seeded = this._seedRuns();
         this.runs.set(seeded);
         this.selected.set(seeded[0] ?? null);
+        this._rehydrateFortify();
       },
     });
   }
 
-  /** Map a raw backend run object to a UiRun card. */
+  // ── FIX 2: Reload Fortify runs from localStorage on page refresh ──────────
+  private _rehydrateFortify() {
+    const raw = localStorage.getItem(FORTIFY_ACTIVE_KEY);
+    if (!raw) return;
+
+    let persisted: PersistedFortifyRun[] = [];
+    try { persisted = JSON.parse(raw); } catch { return; }
+
+    // Discard entries older than 12 hours (pipeline can't still be running)
+    const cutoff = Date.now() - 12 * 60 * 60 * 1000;
+    const alive  = persisted.filter(p => p.started_at > cutoff);
+
+    if (alive.length === 0) {
+      localStorage.removeItem(FORTIFY_ACTIVE_KEY);
+      return;
+    }
+
+    // For each persisted run, check its current status on the backend.
+    // If still running/queued → re-attach polling.
+    // If already completed/failed → render final state and remove from storage.
+    alive.forEach(p => {
+      fetch(`${FORTIFY_API}/pipeline/status/${p.pipeline_id}`)
+        .then(r => r.json())
+        .then(resp => {
+          const isTerminal = resp.status === 'completed' || resp.status === 'failed';
+
+          if (isTerminal) {
+            // Render final state immediately without polling
+            this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'done');
+            this._applyFortifyStatus(p.pipeline_id, resp);
+            this._removePersisted(p.pipeline_id);
+          } else {
+            // Still running — inject card and resume polling
+            this._injectFortifyCard(p.pipeline_id, p.mode, p.body, resp.status ?? 'running');
+            this._applyFortifyStatus(p.pipeline_id, resp);   // apply current state immediately
+            this._startFortifyPoll(p.pipeline_id);
+          }
+        })
+        .catch(() => {
+          // Backend unreachable — show card as unknown state, don't poll
+          this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'queued');
+          this._removePersisted(p.pipeline_id);
+        });
+    });
+  }
+
+  // ── Persist a Fortify run to localStorage ─────────────────────────────────
+  private _persistFortifyRun(pipelineId: string, mode: FortifyMode, body: Record<string, unknown>) {
+    let existing: PersistedFortifyRun[] = [];
+    try {
+      const raw = localStorage.getItem(FORTIFY_ACTIVE_KEY);
+      if (raw) existing = JSON.parse(raw);
+    } catch {}
+
+    const entry: PersistedFortifyRun = { pipeline_id: pipelineId, mode, body, started_at: Date.now() };
+    const updated = [...existing.filter(p => p.pipeline_id !== pipelineId), entry];
+    localStorage.setItem(FORTIFY_ACTIVE_KEY, JSON.stringify(updated));
+  }
+
+  private _removePersisted(pipelineId: string) {
+    try {
+      const raw = localStorage.getItem(FORTIFY_ACTIVE_KEY);
+      if (!raw) return;
+      const existing: PersistedFortifyRun[] = JSON.parse(raw);
+      const updated = existing.filter(p => p.pipeline_id !== pipelineId);
+      if (updated.length === 0) localStorage.removeItem(FORTIFY_ACTIVE_KEY);
+      else localStorage.setItem(FORTIFY_ACTIVE_KEY, JSON.stringify(updated));
+    } catch {}
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // FORTIFY — public entry point (called from component after POST succeeds)
+  // FIX 1: no longer blocks if a Sonar run is active — queues instead
+  // ══════════════════════════════════════════════════════════════════════════
+  trackFortifyRun(pipelineId: string, mode: FortifyMode, body: Record<string, unknown>) {
+    // FIX 1: if a SONAR run is active, queue this Fortify run so it starts
+    // as soon as the Sonar run finishes. Multiple Fortify runs can coexist.
+    if (this._activeRunId && !this._fortifyPolls.has(this._activeRunId)) {
+      // Active run is a Sonar run — queue Fortify
+      this._fortifyQueue.push({ pipelineId, mode, body });
+      this._injectFortifyCard(pipelineId, mode, body, 'queued');
+      this._persistFortifyRun(pipelineId, mode, body);
+      return;
+    }
+
+    this._persistFortifyRun(pipelineId, mode, body);
+    this._injectFortifyCard(pipelineId, mode, body, 'running');
+    this._startFortifyPoll(pipelineId);
+
+    // Mark as running only if nothing else is running
+    if (!this.running()) {
+      this.running.set(true);
+      this._activeRunId = pipelineId;
+    }
+  }
+
+  // ── Inject a Fortify run card into the runs list (idempotent) ────────────
+  private _injectFortifyCard(
+    pipelineId: string,
+    mode: FortifyMode,
+    body: Record<string, unknown>,
+    status: UiRun['status']
+  ) {
+    // Don't duplicate if already present (reload path)
+    if (this.runs().find(r => r.id === pipelineId)) return;
+
+    const fortifyReq: FortifyRunRequest = {
+      mode,
+      endpoint: `/pipeline/${mode}`,
+      body,
+      pipeline_id: pipelineId,
+    };
+
+    const card: UiRun = {
+      id:             pipelineId,
+      ruleKey:        this._fortifyRunLabel(mode, body),
+      severity:       'HIGH',
+      component:      this._fortifyComponentLabel(mode, body),
+      steps:          FORTIFY_STAGE_ORDER.map(key => ({
+        label:  FORTIFY_STAGE_LABELS[key],
+        status: 'pending' as const,
+        detail: '',
+        ms:     0,
+      })),
+      live:           true,
+      status,
+      fortifyRequest: fortifyReq,
+      source:         'fortify',
+    };
+
+    this.runs.update(rs => [card, ...rs]);
+    this.selected.set(card);
+  }
+
+  // ── Start (or resume) polling for one Fortify pipeline_id ─────────────────
+  private _startFortifyPoll(pipelineId: string) {
+    if (this._fortifyPolls.has(pipelineId)) return;   // already polling
+
+    const sub = interval(POLL_MS)
+      .pipe(
+        switchMap(() =>
+          this.http.get<any>(`${FORTIFY_API}/pipeline/status/${pipelineId}`)
+        ),
+        tap(resp => this._applyFortifyStatus(pipelineId, resp)),
+        takeWhile(
+          resp => resp.status !== 'completed' && resp.status !== 'failed',
+          true  // inclusive — emit terminal event before completing
+        )
+      )
+      .subscribe({
+        error: (err: any) => {
+          this.error.set(`Fortify polling error: ${err?.message ?? err}`);
+          this._cleanupFortifyPoll(pipelineId);
+        },
+      });
+
+    this._fortifyPolls.set(pipelineId, sub);
+  }
+
+  // ── Clean up a finished Fortify poll and drain the queue ──────────────────
+  private _cleanupFortifyPoll(pipelineId: string) {
+    this._fortifyPolls.get(pipelineId)?.unsubscribe();
+    this._fortifyPolls.delete(pipelineId);
+    this._removePersisted(pipelineId);
+
+    // FIX 1: drain the queue — start any queued Fortify runs now
+    if (this._fortifyQueue.length > 0) {
+      const next = this._fortifyQueue.shift()!;
+      // Update card status from queued → running
+      this.runs.update(rs => rs.map(r =>
+        r.id === next.pipelineId ? { ...r, status: 'running' } : r
+      ));
+      this._persistFortifyRun(next.pipelineId, next.mode, next.body);
+      this._startFortifyPoll(next.pipelineId);
+    }
+
+    // Only clear the global running flag if no Sonar run is active
+    if (!this._activeRunId && this._fortifyPolls.size === 0) {
+      this.running.set(false);
+    }
+  }
+
+  // ── Map GET /pipeline/status response → UiRun update ─────────────────────
+  private _applyFortifyStatus(pipelineId: string, resp: any) {
+    const terminalStatus = resp.status === 'completed' ? 'done'
+                         : resp.status === 'failed'    ? 'error'
+                         : resp.status === 'running'   ? 'running'
+                         : 'queued';
+
+    const stages: Record<string, any> = resp.stages ?? {};
+    const steps: PipelineStep[] = FORTIFY_STAGE_ORDER.map(key => {
+      const s = stages[key] ?? {};
+      const apiStatus: string = s.status ?? 'pending';
+      const uiStatus =
+        apiStatus === 'completed' ? 'done'
+        : apiStatus === 'failed'  ? 'error'
+        : apiStatus === 'running' ? 'running'
+        : apiStatus === 'skipped' ? 'done'
+        : 'pending';
+
+      const ms = s.elapsed_seconds != null ? Math.round(s.elapsed_seconds * 1000) : 0;
+
+      const summary = s.output_summary;
+      let detail = s.error ?? '';
+      if (!detail && summary) detail = this._summariseStageOutput(key, summary);
+
+      return { label: FORTIFY_STAGE_LABELS[key], status: uiStatus as any, detail, ms };
+    });
+
+    const result = resp.result ?? {};
+    let outcome: string | undefined;
+    let prUrl: string | undefined;
+    let confidence: ConfLabel | undefined;
+
+    if (terminalStatus === 'done') {
+      const prResults: any[] = result.pr_results ?? [];
+      const fixed     = prResults.filter((p: any) => p?.pr_url).length;
+      const escalated = result.total_escalated ?? 0;
+      outcome = fixed > 0 ? 'pr_opened' : escalated > 0 ? 'escalated' : 'empty';
+      prUrl   = prResults[0]?.pr_url ?? undefined;
+    } else if (terminalStatus === 'error') {
+      outcome = 'error';
+    }
+
+    if (result.groups?.length) {
+      const avgConf = result.groups.reduce(
+        (sum: number, g: any) => sum + (g.ai_reasoning?.confidence_score ?? 0), 0
+      ) / result.groups.length;
+      confidence = this.confLabel(avgConf);
+    }
+
+    this.runs.update(rs => rs.map(r => {
+      if (r.id !== pipelineId) return r;
+      const updated: UiRun = {
+        ...r, steps,
+        status:     terminalStatus as any,
+        outcome:    outcome     ?? r.outcome,
+        prUrl:      prUrl       ?? r.prUrl,
+        confidence: confidence  ?? r.confidence,
+      };
+      if (this.selected()?.id === pipelineId) this.selected.set(updated);
+      return updated;
+    }));
+
+    if (terminalStatus === 'done' || terminalStatus === 'error') {
+      if (terminalStatus === 'error' && resp.error) {
+        this.error.set(`Fortify: ${resp.error}`);
+      }
+      this._cleanupFortifyPoll(pipelineId);
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  private _summariseStageOutput(stage: string, summary: any): string {
+    if (!summary) return '';
+    switch (stage) {
+      case 'triage':          return `${summary.total_groups ?? 0} groups, ${summary.total_skipped ?? 0} skipped`;
+      case 'version-resolver': return summary.candidates?.length
+        ? `Candidates: ${summary.candidates.slice(0, 3).join(', ')}`
+        : summary.next_safe ? `Next safe: ${summary.next_safe}` : '';
+      case 'context':         return summary.pom_file ? `pom: ${summary.pom_file}` : '';
+      case 'api-diff':        return summary.has_breaking_changes
+        ? `⚠ ${summary.breaking_count} breaking change(s)`
+        : '✓ No breaking changes';
+      case 'ai-reasoning':    return summary.confidence
+        ? `${summary.safe ? '✓ Safe' : '⚠ Unsafe'} · confidence: ${summary.confidence}` : '';
+      case 'adr-fix':         return summary.branch_name ? `Branch: ${summary.branch_name}` : summary.error_reason ?? '';
+      case 'pr-agent':        return summary.pr_url ? `PR: ${summary.pr_url}` : '';
+      case 'fortify-writeback': return summary.total_fixed != null
+        ? `Fixed: ${summary.total_fixed}, Escalated: ${summary.total_escalated ?? 0}` : '';
+      default:                return '';
+    }
+  }
+
+  private _fortifyRunLabel(mode: FortifyMode, body: Record<string, unknown>): string {
+    switch (mode) {
+      case 'live':     return `Release ${body['release_id'] ?? '—'}`;
+      case 'offline':  return `Offline · ${(body['report_path'] as string)?.split('/').pop() ?? 'report.json'}`;
+      case 'app-name': return `${body['app_name'] ?? '—'}`;
+      case 'dry-run':  return `Dry Run · Release ${body['release_id'] ?? '—'}`;
+    }
+  }
+
+  private _fortifyComponentLabel(mode: FortifyMode, body: Record<string, unknown>): string {
+    const cfg: any = body['config'] ?? {};
+    return cfg.github_repo ?? (body['app_name'] as string) ?? '';
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SONAR — start / poll
+  // ══════════════════════════════════════════════════════════════════════════
+  startRun(req: RunRequest) {
+    if (this.running()) return;
+    this.running.set(true);
+    this.error.set(null);
+
+    this.api.startRun(req).subscribe({
+      next: ({ run_id }) => this._pollRun(run_id, req),
+      error: (err: any) => {
+        const detail = err?.error?.detail ?? err?.message ?? 'Pipeline start failed';
+        this.error.set(detail);
+        this.running.set(false);
+      },
+    });
+  }
+
+  private _pollRun(runId: string, req: RunRequest) {
+    this._activeRunId = runId;
+
+    const liveRun: UiRun = {
+      id:        runId,
+      ruleKey:   '—',
+      severity:  'INFO',
+      component: '',
+      steps: ['Ingest','Load Repo','RAG Fetch','Fetch Rule','Planner','Generator','Critic','Validate','Deliver']
+        .map(label => ({ label, status: 'pending' as const, detail: '', ms: 0 })),
+      live:    true,
+      status:  'running',
+      request: req,
+      source:  'sonar',
+    };
+
+    this.runs.update(rs => [liveRun, ...rs]);
+    this.selected.set(liveRun);
+
+    this._poll = this.api.pollRun(runId).subscribe({
+      next:  (s: RunStatus) => this._applyStatus(runId, s),
+      error: (err: Error) => {
+        this.error.set(err.message);
+        this.running.set(false);
+        this._activeRunId = null;
+        this._drainFortifyQueue();
+      },
+    });
+  }
+
+  // FIX 1: after Sonar completes, drain queued Fortify runs
+  private _drainFortifyQueue() {
+    if (this._fortifyQueue.length === 0) return;
+    const next = this._fortifyQueue.shift()!;
+    this.runs.update(rs => rs.map(r =>
+      r.id === next.pipelineId ? { ...r, status: 'running' } : r
+    ));
+    this._startFortifyPoll(next.pipelineId);
+    // Start remaining ones immediately too (Fortify runs can run in parallel)
+    while (this._fortifyQueue.length > 0) {
+      const n = this._fortifyQueue.shift()!;
+      this.runs.update(rs => rs.map(r =>
+        r.id === n.pipelineId ? { ...r, status: 'running' } : r
+      ));
+      this._startFortifyPoll(n.pipelineId);
+    }
+  }
+
+  private _applyStatus(runId: string, status: RunStatus) {
+    this.runs.update(rs => rs.map(r => {
+      if (r.id !== runId) return r;
+
+      const first     = status.results?.[0];
+      const noResults = status.status === 'done' && (!status.results || status.results.length === 0);
+
+      let mergedSteps = r.steps;
+      if (status.steps?.length) {
+        const hasProgress = status.steps.some((s: any) => s.status !== 'pending');
+        if (hasProgress) {
+          mergedSteps = status.steps.map((bs: any) => {
+            const local = r.steps.find(ls => ls.label === bs.label);
+            return { ...bs, detail: bs.detail || local?.detail || '', ms: bs.ms || local?.ms || 0 };
+          });
+        }
+      }
+
+      const updated: UiRun = {
+        ...r,
+        steps:      mergedSteps,
+        outcome:    noResults ? 'empty' : (first?.outcome ?? r.outcome),
+        confidence: first ? this.confLabel(first.confidence) : r.confidence,
+        prUrl:      first?.pr_url ?? r.prUrl,
+        status:     noResults ? 'empty' as any : status.status,
+        ruleKey:    first?.rule_key  ? first.rule_key  : r.ruleKey,
+        severity:   first?.severity  ? first.severity  : r.severity,
+        component:  first?.file_path ? first.file_path : r.component,
+      };
+
+      if (this.selected()?.id === runId) this.selected.set(updated);
+      return updated;
+    }));
+
+    if (status.status === 'done' || status.status === 'error') {
+      this.running.set(false);
+      this._activeRunId = null;
+
+      if (status.status === 'error' && status.error) this.error.set(status.error);
+
+      const noResults = !status.results || status.results.length === 0;
+      if (noResults && status.status === 'done') {
+        this.error.set('No issues found for the selected severity — run is kept in history.');
+        this._drainFortifyQueue();
+        return;
+      }
+
+      if ((status.results?.length ?? 0) > 1) this._explodeResults(runId, status);
+
+      // FIX 1: drain queued Fortify runs now that Sonar is done
+      this._drainFortifyQueue();
+    }
+  }
+
+  private _explodeResults(runId: string, status: RunStatus) {
+    const parentReq = this.runs().find(r => r.id === runId)?.request;
+    const newCards: UiRun[] = status.results.map((r, i) => ({
+      id:         `${runId}-${i}`,
+      ruleKey:    r.rule_key,
+      severity:   r.severity,
+      component:  r.file_path,
+      outcome:    r.outcome,
+      confidence: this.confLabel(r.confidence),
+      prUrl:      r.pr_url ?? undefined,
+      steps:      status.steps ?? [],
+      live:       true,
+      status:     'done' as const,
+      request:    parentReq,
+      source:     'sonar' as const,
+    }));
+    this.runs.update(rs => [...newCards, ...rs.filter(r => r.id !== runId)]);
+    if (newCards[0]) this.selected.set(newCards[0]);
+  }
+
+  // ── Backend run hydration ─────────────────────────────────────────────────
   private _backendRunToUiRun(r: any): UiRun {
     const first = Array.isArray(r.results) ? r.results[0] : undefined;
-    const confLabel: ConfLabel = first?.confidence != null
-      ? this.confLabel(first.confidence) : null;
+    const confLabel: ConfLabel = first?.confidence != null ? this.confLabel(first.confidence) : null;
     const steps: PipelineStep[] = Array.isArray(r.steps)
-      ? r.steps.map((s: any) => ({
-          label:  s.label  ?? '',
-          status: s.status ?? 'done',
-          detail: s.detail ?? '',
-          ms:     s.ms     ?? 0,
-        }))
+      ? r.steps.map((s: any) => ({ label: s.label ?? '', status: s.status ?? 'done', detail: s.detail ?? '', ms: s.ms ?? 0 }))
       : [];
     return {
       id:         r.id ?? r.run_id,
@@ -108,6 +589,7 @@ export class PipelineStateService {
       live:       false,
       status:     r.status ?? 'done',
       request:    r.request,
+      source:     r.source ?? 'sonar',
     };
   }
 
@@ -117,12 +599,7 @@ export class PipelineStateService {
       ruleKey:    r.ruleKey,
       severity:   r.severity,
       component:  r.component,
-      steps:      r.steps.map(s => ({
-        label:  s.label,
-        status: s.status as any,
-        detail: s.detail ?? '',
-        ms:     s.ms     ?? 0,
-      })),
+      steps:      r.steps.map(s => ({ label: s.label, status: s.status as any, detail: s.detail ?? '', ms: s.ms ?? 0 })),
       outcome:    r.outcome,
       confidence: r.confidence as ConfLabel,
       prUrl:      r.prUrl,
@@ -131,9 +608,11 @@ export class PipelineStateService {
       live:       false,
       status:     'done',
       request:    undefined,
+      source:     'sonar',
     }));
   }
 
+  // ── Shared helpers ────────────────────────────────────────────────────────
   select(run: UiRun)   { this.selected.set(run); }
   doneCnt(run: UiRun)  { return run.steps.filter(s => s.status === 'done').length; }
   confClass(c: ConfLabel | string | undefined) { return (c ?? '').toLowerCase(); }
@@ -159,149 +638,11 @@ export class PipelineStateService {
     return 'LOW';
   }
 
-  // ── Start ─────────────────────────────────────────────────────────────────
-  startRun(req: RunRequest) {
-    if (this.running()) return;
-    this.running.set(true);
-    this.error.set(null);
-
-    this.api.startRun(req).subscribe({
-      next: ({ run_id }) => this._pollRun(run_id, req),
-	error: (err: any) => {
-  	const detail = err?.error?.detail ?? err?.message ?? 'Pipeline start failed';
-  	this.error.set(detail);
-  	this.running.set(false);
-	},
-    });
-  }
-
-  private _pollRun(runId: string, req: RunRequest) {
-    this._activeRunId = runId;
-
-    const liveRun: UiRun = {
-      id:        runId,
-      ruleKey:   '—',           // blank until first result comes in
-      severity:  'INFO',
-      component: '',
-      steps: ['Ingest','Load Repo','RAG Fetch','Fetch Rule','Planner','Generator','Critic','Validate','Deliver']
-        .map(label => ({ label, status: 'pending' as const, detail: '', ms: 0 })),
-      live:    true,
-      status:  'running',
-      request: req,
-    };
-
-    this.runs.update(rs => [liveRun, ...rs]);
-    this.selected.set(liveRun);
-
-    this._poll = this.api.pollRun(runId).subscribe({
-      next:  (s: RunStatus) => this._applyStatus(runId, s),
-      error: (err: Error) => {
-        this.error.set(err.message);
-        this.running.set(false);
-        this._activeRunId = null;
-      },
-    });
-  }
-
-  private _applyStatus(runId: string, status: RunStatus) {
-    this.runs.update(rs => rs.map(r => {
-      if (r.id !== runId) return r;
-
-      const first = status.results?.[0];
-      const noResults = (status.status === 'done') && (!status.results || status.results.length === 0);
-
-      // Smart step merge: backend sends all 9 steps on every poll.
-      // Only replace local steps when the backend shows real progress (any step != pending).
-      let mergedSteps = r.steps;
-      if (status.steps?.length) {
-        const hasProgress = status.steps.some((s: any) => s.status !== 'pending');
-        if (hasProgress) {
-          mergedSteps = status.steps.map((bs: any) => {
-            const local = r.steps.find(ls => ls.label === bs.label);
-            return { ...bs, detail: bs.detail || local?.detail || '', ms: bs.ms || local?.ms || 0 };
-          });
-        }
-      }
-
-      const updated: UiRun = {
-        ...r,
-        steps:      mergedSteps,
-        outcome:    noResults ? 'empty' : (first?.outcome ?? r.outcome),
-        confidence: first ? this.confLabel(first.confidence) : r.confidence,
-        prUrl:      first?.pr_url ?? r.prUrl,
-        status:     noResults ? 'empty' as any : status.status,
-        ruleKey:    first?.rule_key  ? first.rule_key  : r.ruleKey,
-        severity:   first?.severity  ? first.severity  : r.severity,
-        component:  first?.file_path ? first.file_path : r.component,
-      };
-
-      // Sync selected in same signal update tick for instant reactivity
-      if (this.selected()?.id === runId) {
-        this.selected.set(updated);
-      }
-
-      return updated;
-    }));
-
-    if (status.status === 'done' || status.status === 'error') {
-      this.running.set(false);
-      this._activeRunId = null;
-
-      if (status.status === 'error' && status.error) {
-        this.error.set(status.error);
-      }
-
-      // ── REMOVED: auto-delete on no results ───────────────────────────────
-      // Previously this block deleted the run card after 4 s when no issues
-      // were found. Now we keep it in history permanently with outcome='empty'
-      // so users have a full record of every pipeline run.
-      // The error banner still surfaces the message; the card stays in the list.
-      const noResults = !status.results || status.results.length === 0;
-      if (noResults && status.status === 'done') {
-        this.error.set('No issues found for the selected severity — run is kept in history.');
-        // ← no deleteRun() call; card persists with status='empty'
-        return;
-      }
-
-      if ((status.results?.length ?? 0) > 1) {
-        this._explodeResults(runId, status);
-      }
-    }
-  }
-
-  private _explodeResults(runId: string, status: RunStatus) {
-    const parentReq = this.runs().find(r => r.id === runId)?.request;
-
-    const newCards: UiRun[] = status.results.map((r, i) => ({
-      id:         `${runId}-${i}`,
-      ruleKey:    r.rule_key,
-      severity:   r.severity,
-      component:  r.file_path,
-      outcome:    r.outcome,
-      confidence: this.confLabel(r.confidence),
-      prUrl:      r.pr_url ?? undefined,
-      steps:      status.steps ?? [],
-      live:       true,
-      status:     'done' as const,
-      request:    parentReq,
-    }));
-
-    this.runs.update(rs => [...newCards, ...rs.filter(r => r.id !== runId)]);
-    if (newCards[0]) this.selected.set(newCards[0]);
-  }
-
-  // ── Delete a finished run card (manual only) ──────────────────────────────
+  // ── Delete ────────────────────────────────────────────────────────────────
   deleteRun(id: string) {
-    // Don't delete an actively running run
     if (id === this._activeRunId) return;
-
-    // Remove from UI immediately for instant feedback
     this.runs.update(rs => rs.filter(r => r.id !== id));
-    if (this.selected()?.id === id) {
-      this.selected.set(this.runs()[0] ?? null);
-    }
-
-    // Also remove from the backend so it won't reappear after reload
+    if (this.selected()?.id === id) this.selected.set(this.runs()[0] ?? null);
     this.api.deleteRun(id).subscribe({ error: () => {} });
   }
 
@@ -313,10 +654,15 @@ export class PipelineStateService {
     this._poll?.unsubscribe();
     this._poll = undefined;
 
+    // Cancel all active Fortify polls too
+    this._fortifyPolls.forEach(sub => sub.unsubscribe());
+    this._fortifyPolls.clear();
+    this._fortifyQueue.length = 0;
+
     this.api.cancelRun(runId).subscribe({ error: () => {} });
 
     this.runs.update(rs => rs.map(r => {
-      if (r.id !== runId) return r;
+      if (r.id !== runId && !this._fortifyPolls.has(r.id)) return r;
       return {
         ...r,
         status:  'cancelled',
@@ -334,7 +680,8 @@ export class PipelineStateService {
 
     this.running.set(false);
     this._activeRunId = null;
-  }
 
-  get canCancel() { return this.running() && !!this._activeRunId; }
+    // Clear persisted Fortify runs so they don't rehydrate on next reload
+    localStorage.removeItem(FORTIFY_ACTIVE_KEY);
+  }
 }
