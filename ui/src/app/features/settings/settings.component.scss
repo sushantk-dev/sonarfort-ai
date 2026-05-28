@@ -747,3 +747,29 @@ select.input {
     opacity:     0.75;
   }
 }
+// ── API Connection section ────────────────────────────────────────────────
+.section--api {
+  border-left: 3px solid var(--brand);
+}
+
+.port-row {
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+}
+
+.input--port {
+  width:       90px;
+  flex-shrink: 0;
+}
+
+.port-preview {
+  font-size:    12px;
+  font-family:  var(--font-mono, monospace);
+  color:        var(--text-muted);
+  background:   var(--surface-1);
+  border:       1px solid var(--border);
+  border-radius: 6px;
+  padding:      5px 10px;
+  white-space:  nowrap;
+}

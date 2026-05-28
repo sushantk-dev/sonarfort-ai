@@ -1,8 +1,11 @@
 // src/app/core/settings-state.service.ts
 import { Injectable, inject, signal, computed } from '@angular/core';
 import { ApiService } from './api.service';
+import { ApiConfigService } from './api-config.service';
 
 export interface AppConfig {
+  apiHost:        string;
+  apiPort:        number;
   gcpProject:     string;
   gcpLocation:    string;
   model:          string;
@@ -49,9 +52,12 @@ export interface TokenStatus {
 
 @Injectable({ providedIn: 'root' })
 export class SettingsStateService {
-  private apiSvc = inject(ApiService);
+  private apiSvc  = inject(ApiService);
+  private apiCfg  = inject(ApiConfigService);
 
   cfg = signal<AppConfig>({
+    apiHost:        'localhost',
+    apiPort:        8000,
     gcpProject:     '',
     gcpLocation:    'us-central1',
     model:          'gemini-2.5-flash',
@@ -147,6 +153,12 @@ export class SettingsStateService {
           fortifyToken:   '',
                 }));
 
+        // Sync UI fields from live apiCfg (may differ if loaded from localStorage)
+        this.cfg.update(cc => ({
+          ...cc,
+          apiHost: this.apiCfg.apiHost(),
+          apiPort: this.apiCfg.apiPort(),
+        }));
         this.loaded.set(true);
         this.loadErr.set('');
       },
@@ -210,6 +222,9 @@ export class SettingsStateService {
     if (c.fortifyHostUrl) {
       payload['fortify_host_url'] = c.fortifyHostUrl;
     }
+
+    // Apply host+port to ApiConfigService immediately — no backend round-trip needed
+    this.apiCfg.apply(c.apiHost, c.apiPort);
 
     this.apiSvc.saveConfig(payload).subscribe({
       next: () => {

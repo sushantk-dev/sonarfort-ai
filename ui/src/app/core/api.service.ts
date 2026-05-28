@@ -1,5 +1,6 @@
 // src/app/core/api.service.ts
 import { Injectable, inject } from '@angular/core';
+import { ApiConfigService } from './api-config.service';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import {
   Observable, interval, switchMap, takeWhile,
@@ -120,8 +121,11 @@ export interface BackendConfig {
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
-  private http = inject(HttpClient);
-  readonly base = 'http://localhost:8000';
+  private http   = inject(HttpClient);
+  private apiCfg = inject(ApiConfigService);
+
+  /** Always reflects the current host:port from Settings */
+  get base() { return this.apiCfg.baseUrl(); }
 
   // ── Health ────────────────────────────────────────────────────────────────
 

@@ -3,6 +3,7 @@ import { Component, inject, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PipelineStateService, UiRun, RunRequest } from '../../core/pipeline-state.service';
+import { ApiConfigService } from '../../core/api-config.service';
 import { SevClassPipe }    from '../../shared/sev-class.pipe';
 import { OutcomeClassPipe } from '../../shared/outcome-class.pipe';
 import { OutcomeLabelPipe } from '../../shared/outcome-label.pipe';
@@ -26,7 +27,8 @@ const ENDPOINT_MAP: Record<FortifyMode, string> = {
   styleUrl:    './pipeline.component.scss',
 })
 export class PipelineComponent {
-  state = inject(PipelineStateService);
+  state    = inject(PipelineStateService);
+  private apiCfg = inject(ApiConfigService);
 
   // ── Source tab: 'sonar' | 'fortify' | 'both' ─────────────────────────────
   activeSource = signal<'sonar' | 'fortify'>('sonar');
@@ -147,7 +149,7 @@ export class PipelineComponent {
 
     const mode     = this.fortifyMode();
     const endpoint = this.fortifyEndpoint();
-    const baseUrl  = 'http://localhost:8000'; // resolved from config in production
+    const baseUrl  = this.apiCfg.baseUrl();
 
     let body: Record<string, unknown> = {
       max_upgrades: this.fortifyMaxUpgrades() || 0,

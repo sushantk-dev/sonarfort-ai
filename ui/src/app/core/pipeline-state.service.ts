@@ -4,6 +4,7 @@ import { Subscription, interval } from 'rxjs';
 import { switchMap, takeWhile, tap } from 'rxjs/operators';
 import { HttpClient } from '@angular/common/http';
 import { ApiService, RunStatus, PipelineStep } from './api.service';
+import { ApiConfigService } from './api-config.service';
 import { DataService } from './data.service';
 
 export type ConfLabel = 'HIGH' | 'MEDIUM' | 'LOW' | null;
@@ -24,7 +25,6 @@ const FORTIFY_STAGE_LABELS: Record<string, string> = {
 
 const FORTIFY_STAGE_ORDER = Object.keys(FORTIFY_STAGE_LABELS);
 
-const FORTIFY_API = 'http://localhost:8000';
 const POLL_MS     = 2500;
 
 // ── localStorage key for Fortify runs that survived a page reload ─────────────
@@ -76,9 +76,13 @@ export interface UiRun {
 
 @Injectable({ providedIn: 'root' })
 export class PipelineStateService {
-  private api  = inject(ApiService);
-  private data = inject(DataService);
-  private http = inject(HttpClient);
+  private api    = inject(ApiService);
+  private data   = inject(DataService);
+  private http   = inject(HttpClient);
+  private apiCfg = inject(ApiConfigService);
+
+  /** Always reflects the current host:port from Settings */
+  private get fortifyBase() { return this.apiCfg.baseUrl(); }
 
   runs     = signal<UiRun[]>([]);
   selected = signal<UiRun | null>(null);
@@ -163,7 +167,7 @@ export class PipelineStateService {
     // If still running/queued → re-attach polling.
     // If already completed/failed → render final state and remove from storage.
     alive.forEach(p => {
-      fetch(`${FORTIFY_API}/pipeline/status/${p.pipeline_id}`)
+      fetch(`${this.fortifyBase}/pipeline/status/${p.pipeline_id}`)
         .then(r => r.json())
         .then(resp => {
           const isTerminal = resp.status === 'completed' || resp.status === 'failed';
@@ -283,7 +287,7 @@ export class PipelineStateService {
     const sub = interval(POLL_MS)
       .pipe(
         switchMap(() =>
-          this.http.get<any>(`${FORTIFY_API}/pipeline/status/${pipelineId}`)
+          this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`)
         ),
         tap(resp => this._applyFortifyStatus(pipelineId, resp)),
         takeWhile(

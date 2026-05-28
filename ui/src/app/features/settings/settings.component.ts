@@ -2,6 +2,7 @@
 import { Component, inject, signal, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { ApiConfigService } from '../../core/api-config.service';
 import {
   SettingsStateService,
   VERTEX_MODELS,
@@ -18,8 +19,6 @@ interface OAuthTokenResult {
   scope?:       string;
 }
 
-const FORTIFY_API = 'http://localhost:8000';
-
 @Component({
   selector: 'app-settings',
   standalone: true,
@@ -28,7 +27,8 @@ const FORTIFY_API = 'http://localhost:8000';
   styleUrl:    './settings.component.scss',
 })
 export class SettingsComponent implements OnInit {
-  st = inject(SettingsStateService);
+  st     = inject(SettingsStateService);
+  private apiCfg = inject(ApiConfigService);
   active = signal('pipeline');
 
   readonly vertexModels    = VERTEX_MODELS;
@@ -84,7 +84,7 @@ export class SettingsComponent implements OnInit {
     };
 
     try {
-      const resp = await fetch(`${FORTIFY_API}/auth/token`, {
+      const resp = await fetch(`${this.apiCfg.baseUrl()}/auth/token`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(body),
