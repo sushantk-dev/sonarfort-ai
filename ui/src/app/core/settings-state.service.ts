@@ -59,7 +59,7 @@ export class SettingsStateService {
   cfg = signal<AppConfig>({
     apiHost:        'localhost',
     apiPort:        8000,
-    fortifyPort:    null,
+    fortifyPort:    8001,
     gcpProject:     '',
     gcpLocation:    'us-central1',
     model:          'gemini-2.5-flash',

@@ -12,7 +12,7 @@ import { Injectable, signal, computed, effect } from '@angular/core';
 const STORAGE_KEY    = 'sonarfort_api';
 const DEFAULT_HOST   = 'localhost';
 const DEFAULT_PORT   = 8000;  // shared / Sonar port
-const DEFAULT_F_PORT = 8001;  // Fortify port — same by default
+const DEFAULT_F_PORT = 8001;  // Fortify port — separate by default
 
 @Injectable({ providedIn: 'root' })
 export class ApiConfigService {
@@ -57,21 +57,19 @@ export class ApiConfigService {
   apply(host: string, port: number, fortifyPort: number | null) {
     this.apiHost.set(host?.trim() || DEFAULT_HOST);
     this.apiPort.set(port > 0 ? port : DEFAULT_PORT);
-    // null means "use shared port" — store as null so fortifyBaseUrl falls back
+    // Store fortifyPort as-is; null means fall back to shared port
     this.fortifyPort.set(
-      fortifyPort !== null && fortifyPort > 0 && fortifyPort !== port
-        ? fortifyPort
-        : null
+      fortifyPort !== null && fortifyPort > 0 ? fortifyPort : 8001
     );
   }
 
   private _loadFortifyPort(): number | null {
     try {
       const raw = localStorage.getItem(`${STORAGE_KEY}_fortify_port`);
-      if (!raw) return null;
+      if (!raw) return 8001;   // default Fortify port
       const n = Number(raw);
-      return n > 0 ? n : null;
-    } catch { return null; }
+      return n > 0 ? n : 8001;
+    } catch { return 8001; }
   }
 
   private _load(key: string): string | null {
