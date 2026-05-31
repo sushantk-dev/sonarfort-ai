@@ -265,7 +265,7 @@ export class PipelineStateService {
     const card: UiRun = {
       id:             pipelineId,
       ruleKey:        this._fortifyRunLabel(mode, body),
-      severity:       'HIGH',
+      severity:       'FORTIFY',
       component:      this._fortifyComponentLabel(mode, body),
       steps:          FORTIFY_STAGE_ORDER.map(key => ({
         label:  FORTIFY_STAGE_LABELS[key],

@@ -344,6 +344,8 @@
            [class.run-card--active]="selected()?.id === run.id"
            [class.run-card--live]="run.live && run.status !== 'cancelled'"
            [class.run-card--cancelled]="run.status === 'cancelled'"
+           [class.run-card--fortify]="run.source === 'fortify'"
+           [class.run-card--queued]="run.status === 'queued'"
            (click)="select(run)">
 
         <div class="run-card__top">
@@ -355,7 +357,9 @@
             {{ run.status === 'running' && run.ruleKey === '—' ? 'Pipeline running…' : run.ruleKey }}
           </span>
           <span *ngIf="run.live && run.status === 'running'" class="live-badge">LIVE</span>
+          <span *ngIf="run.status === 'queued'" class="queued-badge">QUEUED</span>
           <span *ngIf="run.status === 'cancelled'" class="cancelled-badge">CANCELLED</span>
+          <span *ngIf="run.source === 'fortify'" class="run-card__source-badge run-card__source-badge--fortify">Fortify</span>
           <span *ngIf="run.outcome && run.status !== 'cancelled' && run.status !== 'running'"
                 class="badge {{ $any(run.outcome) | outcomeClass }}">
             {{ $any(run.outcome) | outcomeLabel }}
@@ -488,8 +492,8 @@
           </div>
         </div>
 
-        <!-- Stat strip -->
-        <div class="stat-strip">
+        <!-- Stat strip — Sonar only (RAG/Retries/Confidence are Sonar concepts) -->
+        <div class="stat-strip" *ngIf="run.source !== 'fortify'">
           <div class="stat-strip__item">
             <div class="stat-strip__val">{{ run.ragHits ?? '—' }}</div>
             <div class="stat-strip__lbl">RAG hits</div>
@@ -510,6 +514,27 @@
           <div class="stat-strip__item">
             <div class="stat-strip__val">{{ doneCnt(run) }}/{{ run.steps.length }}</div>
             <div class="stat-strip__lbl">Steps done</div>
+          </div>
+        </div>
+
+        <!-- Fortify stat strip -->
+        <div class="stat-strip stat-strip--fortify" *ngIf="run.source === 'fortify'">
+          <div class="stat-strip__item">
+            <div class="stat-strip__val">{{ doneCnt(run) }}/{{ run.steps.length }}</div>
+            <div class="stat-strip__lbl">Stages done</div>
+          </div>
+          <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item">
+            <div class="stat-strip__val stat-strip__val--mode">{{ run.fortifyRequest?.mode | uppercase }}</div>
+            <div class="stat-strip__lbl">Mode</div>
+          </div>
+          <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item">
+            <div class="stat-strip__val stat-strip__val--conf"
+                 [class]="confClass(run.confidence)">
+              {{ run.confidence ?? '—' }}
+            </div>
+            <div class="stat-strip__lbl">Confidence</div>
           </div>
         </div>
 

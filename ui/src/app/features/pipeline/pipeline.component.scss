@@ -1324,6 +1324,9 @@
   }
 }
 
+
+}
+
 // ── Fortify steps reference card (shown when no runs exist) ───────────────
 .fortify-steps-card {
   background:   var(--surface-0);
@@ -1565,4 +1568,28 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
   flex-shrink:  0;
+}
+
+// ── Fortify stat strip variant ────────────────────────────────────────────
+.stat-strip--fortify {
+  border-top: 2px solid rgba(29,158,117,.2);
+}
+
+.stat-strip__val--mode {
+  font-size:    13px;
+  font-weight:  700;
+  font-family:  var(--font-mono);
+  color:        #0F6E56;
+  letter-spacing: 0.05em;
+}
+
+// ── Fortify pill — overrides global .pill severity colors ─────────────────
+// Applied when severity === 'FORTIFY' via SevClassPipe → .pill--fortify
+.pill--fortify {
+  background:   rgba(29,158,117,.12) !important;
+  color:        #0A5C47 !important;
+  border-color: rgba(29,158,117,.35) !important;
+  font-size:    10px;
+  font-weight:  700;
+  letter-spacing: 0.05em;
 }
