@@ -32,6 +32,7 @@ export class EscalationsComponent implements OnInit {
   private api    = inject(ApiService);
   private apiCfg = inject(ApiConfigService);
   /** Routes to Fortify server — separate port if configured, else shared */
+  /** Fortify pipeline API (port 8001) — now has /escalations endpoint */
   private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
 
   // ── Source tab ────────────────────────────────────────────────────────────

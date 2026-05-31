@@ -61,7 +61,6 @@ from threading import Lock
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -153,15 +152,6 @@ app = FastAPI(
         "automated security dependency remediation pipeline."
     ),
     version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:4200", "http://localhost:4201"],
-    allow_origin_regex=r"http://localhost:\d+",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 
@@ -1596,3 +1586,99 @@ for _stage in STAGE_ORDER:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Escalation file endpoints
+# Fortify writeback writes escalation .txt files to adr_output_dir.
+# These endpoints serve them so the UI can list, view, and delete them.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/escalations", tags=["Escalations"])
+def list_fortify_escalations(output_dir: str = Query(default="/tmp/fortifyai")) -> dict:
+    """List all Fortify escalation .txt files from output_dir."""
+    from pathlib import Path
+    esc_dir = Path(output_dir)
+    if not esc_dir.exists():
+        return {"escalations": [], "total": 0}
+
+    items = []
+    for txt_file in sorted(
+        list(esc_dir.glob("escalation_*.txt")),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True
+    ):
+        stat = txt_file.stat()
+        content = txt_file.read_text(encoding="utf-8", errors="replace")
+
+        # Parse key fields from the flat text report format
+        artifact_id = ""
+        cves: list[str] = []
+        reason = ""
+        tried: list[str] = []
+        severity = "HIGH"
+
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("Artifact:"):
+                artifact_id = line.split(":", 1)[-1].strip()
+            elif line.startswith("CVEs:"):
+                cves = [v.strip() for v in line.split(":", 1)[-1].split(",") if v.strip()]
+            elif line.startswith("Reason:"):
+                reason = line.split(":", 1)[-1].strip()
+            elif line.startswith("Tried:"):
+                tried = [v.strip() for v in line.split(":", 1)[-1].split(",") if v.strip()]
+            elif line.startswith("Severity:"):
+                severity = line.split(":", 1)[-1].strip()
+
+        items.append({
+            "filename":    txt_file.name,
+            "artifact_id": artifact_id or txt_file.stem,
+            "cves":        cves,
+            "reason":      reason,
+            "tried":       tried,
+            "severity":    severity,
+            "size_bytes":  stat.st_size,
+            "modified_at": stat.st_mtime,
+        })
+
+    return {"escalations": items, "total": len(items)}
+
+
+@app.get("/escalations/{filename}", tags=["Escalations"])
+def get_fortify_escalation(
+    filename: str,
+    output_dir: str = Query(default="/tmp/fortifyai")
+) -> dict:
+    """Return the full text content of one Fortify escalation file."""
+    from pathlib import Path
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    esc_path = Path(output_dir) / filename
+    if not esc_path.exists():
+        raise HTTPException(status_code=404, detail=f"Escalation {filename!r} not found in {output_dir!r}")
+
+    stat = esc_path.stat()
+    return {
+        "filename":    filename,
+        "content":     esc_path.read_text(encoding="utf-8", errors="replace"),
+        "modified_at": stat.st_mtime,
+    }
+
+
+@app.delete("/escalations/{filename}", tags=["Escalations"])
+def delete_fortify_escalation(
+    filename: str,
+    output_dir: str = Query(default="/tmp/fortifyai")
+) -> dict:
+    """Delete a Fortify escalation file."""
+    from pathlib import Path
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    esc_path = Path(output_dir) / filename
+    if not esc_path.exists():
+        raise HTTPException(status_code=404, detail=f"Escalation {filename!r} not found")
+
+    esc_path.unlink()
+    return {"message": f"Deleted {filename}", "ok": True}
