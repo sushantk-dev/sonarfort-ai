@@ -149,7 +149,8 @@ export class PipelineComponent {
 
     const mode     = this.fortifyMode();
     const endpoint = this.fortifyEndpoint();
-    const baseUrl  = this.apiCfg.baseUrl();
+    // Uses fortifyBaseUrl — routes to separate Fortify port if configured
+    const baseUrl  = this.apiCfg.fortifyBaseUrl();
 
     let body: Record<string, unknown> = {
       max_upgrades: this.fortifyMaxUpgrades() || 0,

@@ -84,7 +84,7 @@ export class SettingsComponent implements OnInit {
     };
 
     try {
-      const resp = await fetch(`${this.apiCfg.baseUrl()}/auth/token`, {
+      const resp = await fetch(`${this.apiCfg.fortifyBaseUrl()}/auth/token`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(body),

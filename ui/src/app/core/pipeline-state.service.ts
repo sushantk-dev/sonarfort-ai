@@ -82,7 +82,8 @@ export class PipelineStateService {
   private apiCfg = inject(ApiConfigService);
 
   /** Always reflects the current host:port from Settings */
-  private get fortifyBase() { return this.apiCfg.baseUrl(); }
+  /** Routes to Fortify server — separate port if configured, else shared */
+  private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
 
   runs     = signal<UiRun[]>([]);
   selected = signal<UiRun | null>(null);

@@ -6,6 +6,7 @@ import { ApiConfigService } from './api-config.service';
 export interface AppConfig {
   apiHost:        string;
   apiPort:        number;
+  fortifyPort:    number | null;  // null = share Sonar port
   gcpProject:     string;
   gcpLocation:    string;
   model:          string;
@@ -58,6 +59,7 @@ export class SettingsStateService {
   cfg = signal<AppConfig>({
     apiHost:        'localhost',
     apiPort:        8000,
+    fortifyPort:    null,
     gcpProject:     '',
     gcpLocation:    'us-central1',
     model:          'gemini-2.5-flash',
@@ -156,8 +158,9 @@ export class SettingsStateService {
         // Sync UI fields from live apiCfg (may differ if loaded from localStorage)
         this.cfg.update(cc => ({
           ...cc,
-          apiHost: this.apiCfg.apiHost(),
-          apiPort: this.apiCfg.apiPort(),
+          apiHost:     this.apiCfg.apiHost(),
+          apiPort:     this.apiCfg.apiPort(),
+          fortifyPort: this.apiCfg.fortifyPort(),
         }));
         this.loaded.set(true);
         this.loadErr.set('');
@@ -224,7 +227,7 @@ export class SettingsStateService {
     }
 
     // Apply host+port to ApiConfigService immediately — no backend round-trip needed
-    this.apiCfg.apply(c.apiHost, c.apiPort);
+    this.apiCfg.apply(c.apiHost, c.apiPort, c.fortifyPort);
 
     this.apiSvc.saveConfig(payload).subscribe({
       next: () => {

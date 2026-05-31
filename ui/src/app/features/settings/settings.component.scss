@@ -773,3 +773,21 @@ select.input {
   padding:      5px 10px;
   white-space:  nowrap;
 }
+
+// ── Fortify port preview variants ─────────────────────────────────────────
+.port-preview--fortify {
+  background:   rgba(29,158,117,.08);
+  border-color: rgba(29,158,117,.25);
+  color:        #0F6E56;
+}
+
+.port-preview--shared {
+  font-size:   11.5px;
+  color:       var(--text-muted);
+  background:  var(--surface-1);
+  border:      1px dashed var(--border);
+  border-radius: 6px;
+  padding:     5px 10px;
+  font-style:  italic;
+  white-space: nowrap;
+}

@@ -31,7 +31,8 @@ export interface EscalationItem {
 export class EscalationsComponent implements OnInit {
   private api    = inject(ApiService);
   private apiCfg = inject(ApiConfigService);
-  private get fortifyBase() { return this.apiCfg.baseUrl(); }
+  /** Routes to Fortify server — separate port if configured, else shared */
+  private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
 
   // ── Source tab ────────────────────────────────────────────────────────────
   activeSource = signal<'sonar' | 'fortify'>('sonar');
