@@ -400,7 +400,14 @@ export class PipelineStateService {
       if (terminalStatus === 'error' && resp.error) {
         this.error.set(`Fortify: ${resp.error}`);
       }
+      // Always clean up polling and release running flag on any terminal state
+      // (covers 'empty' / 'no issues' outcomes too)
       this._cleanupFortifyPoll(pipelineId);
+
+      // If no other Fortify polls and no Sonar run active, clear running flag
+      if (this._fortifyPolls.size === 0 && !this._activeRunId) {
+        this.running.set(false);
+      }
     }
   }
 
