@@ -287,6 +287,10 @@ export class PipelineStateService {
   private _startFortifyPoll(pipelineId: string) {
     if (this._fortifyPolls.has(pipelineId)) return;   // already polling
 
+    // Pre-register with a placeholder so _cleanupFortifyPoll works even if
+    // tap() fires before the real sub is assigned (RxJS cold observable quirk)
+    this._fortifyPolls.set(pipelineId, null as any);
+
     const sub = interval(POLL_MS)
       .pipe(
         switchMap(() =>
@@ -302,18 +306,16 @@ export class PipelineStateService {
         error: (err: any) => {
           this.error.set(`Fortify polling error: ${err?.message ?? err}`);
           this._cleanupFortifyPoll(pipelineId);
+          this.running.set(false);
         },
-        // complete fires when takeWhile closes the stream (terminal state reached)
-        // _applyFortifyStatus already called cleanup via tap, but running()
-        // may still be true if the poll map hasn't cleared yet — force it here.
+        // complete fires after takeWhile closes the stream on terminal state
         complete: () => {
           this._cleanupFortifyPoll(pipelineId);
-          if (!this._activeRunId && this._fortifyPolls.size === 0) {
-            this.running.set(false);
-          }
+          this.running.set(false);
         },
       });
 
+    // Update the placeholder with the real subscription
     this._fortifyPolls.set(pipelineId, sub);
   }
 
@@ -405,19 +407,12 @@ export class PipelineStateService {
       return updated;
     }));
 
-    if (terminalStatus === 'done' || terminalStatus === 'error') {
-      if (terminalStatus === 'error' && resp.error) {
-        this.error.set(`Fortify: ${resp.error}`);
-      }
-      // Always clean up polling and release running flag on any terminal state
-      // (covers 'empty' / 'no issues' outcomes too)
-      this._cleanupFortifyPoll(pipelineId);
-
-      // If no other Fortify polls and no Sonar run active, clear running flag
-      if (this._fortifyPolls.size === 0 && !this._activeRunId) {
-        this.running.set(false);
-      }
+    if (terminalStatus === 'error' && resp.error) {
+      this.error.set(`Fortify: ${resp.error}`);
     }
+    // Note: cleanup and running.set(false) are handled by the subscribe
+    // complete/error callbacks — NOT here — because this method runs via tap()
+    // before the subscription object is stored in _fortifyPolls.
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
