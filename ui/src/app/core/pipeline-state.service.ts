@@ -171,7 +171,9 @@ export class PipelineStateService {
       fetch(`${this.fortifyBase}/pipeline/status/${p.pipeline_id}`)
         .then(r => r.json())
         .then(resp => {
-          const isTerminal = resp.status === 'completed' || resp.status === 'failed';
+          // Unwrap { ok, data } envelope from backend
+          const job = resp?.data ?? resp;
+          const isTerminal = job.status === 'completed' || job.status === 'failed';
 
           if (isTerminal) {
             // Render final state immediately without polling
@@ -180,7 +182,7 @@ export class PipelineStateService {
             this._removePersisted(p.pipeline_id);
           } else {
             // Still running — inject card and resume polling
-            this._injectFortifyCard(p.pipeline_id, p.mode, p.body, resp.status ?? 'running');
+            this._injectFortifyCard(p.pipeline_id, p.mode, p.body, job.status ?? 'running');
             this._applyFortifyStatus(p.pipeline_id, resp);   // apply current state immediately
             this._startFortifyPoll(p.pipeline_id);
           }
@@ -292,7 +294,7 @@ export class PipelineStateService {
         ),
         tap(resp => this._applyFortifyStatus(pipelineId, resp)),
         takeWhile(
-          resp => resp.status !== 'completed' && resp.status !== 'failed',
+          resp => (resp?.data ?? resp).status !== 'completed' && (resp?.data ?? resp).status !== 'failed',
           true  // inclusive — emit terminal event before completing
         )
       )
@@ -330,7 +332,10 @@ export class PipelineStateService {
   }
 
   // ── Map GET /pipeline/status response → UiRun update ─────────────────────
-  private _applyFortifyStatus(pipelineId: string, resp: any) {
+  private _applyFortifyStatus(pipelineId: string, raw: any) {
+    // Backend wraps all responses: { ok: true, data: { ... } }
+    const resp = raw?.data ?? raw;
+
     const terminalStatus = resp.status === 'completed' ? 'done'
                          : resp.status === 'failed'    ? 'error'
                          : resp.status === 'running'   ? 'running'

@@ -200,10 +200,13 @@ export class PipelineComponent {
       body:    JSON.stringify(body),
     })
     .then(r => r.json())
-    .then(({ pipeline_id }) => {
+    .then(resp => {
+      // Backend wraps responses: { ok: true, data: { pipeline_id, status } }
+      const pipeline_id = resp?.data?.pipeline_id ?? resp?.pipeline_id;
       if (pipeline_id) {
-        // Hand off to state service for live polling (same UX as Sonar runs)
         this.state.trackFortifyRun(pipeline_id, mode, body);
+      } else {
+        this.state.error.set(`Fortify API: no pipeline_id in response — ${JSON.stringify(resp)}`);
       }
     })
     .catch(err => {
