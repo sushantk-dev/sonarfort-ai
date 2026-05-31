@@ -95,6 +95,16 @@ export class PipelineComponent {
   get allRuns()  { return this.state.allRuns; }
   get canCancel(){ return this.state.canCancel; }
 
+  /** Runs filtered to the active source tab — Sonar or Fortify */
+  filteredRuns(): UiRun[] {
+    const src = this.activeSource();
+    return this.state.allRuns.filter(r =>
+      src === 'sonar'
+        ? (r.source === 'sonar' || !r.source)   // legacy runs without source field = Sonar
+        : r.source === 'fortify'
+    );
+  }
+
   select(run: UiRun) {
     this.state.select(run);
     this.showInput.set(false);

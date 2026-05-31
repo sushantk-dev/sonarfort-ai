@@ -323,7 +323,7 @@
 
       <!-- Fortify step reference card — shown when no runs exist on Fortify tab -->
       <div class="fortify-steps-card"
-           *ngIf="activeSource() === 'fortify' && allRuns.length === 0">
+           *ngIf="activeSource() === 'fortify' && filteredRuns().length === 0">
         <div class="fortify-steps-card__head">
           <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
             <path d="M7 1.5L12 4V8C12 11 7 13 7 13C7 13 2 11 2 8V4L7 1.5Z"
@@ -339,7 +339,7 @@
         </div>
       </div>
 
-      <div *ngFor="let run of allRuns"
+      <div *ngFor="let run of filteredRuns()"
            class="run-card"
            [class.run-card--active]="selected()?.id === run.id"
            [class.run-card--live]="run.live && run.status !== 'cancelled'"
