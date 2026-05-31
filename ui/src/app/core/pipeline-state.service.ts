@@ -303,6 +303,15 @@ export class PipelineStateService {
           this.error.set(`Fortify polling error: ${err?.message ?? err}`);
           this._cleanupFortifyPoll(pipelineId);
         },
+        // complete fires when takeWhile closes the stream (terminal state reached)
+        // _applyFortifyStatus already called cleanup via tap, but running()
+        // may still be true if the poll map hasn't cleared yet — force it here.
+        complete: () => {
+          this._cleanupFortifyPoll(pipelineId);
+          if (!this._activeRunId && this._fortifyPolls.size === 0) {
+            this.running.set(false);
+          }
+        },
       });
 
     this._fortifyPolls.set(pipelineId, sub);
