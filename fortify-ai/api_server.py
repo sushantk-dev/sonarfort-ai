@@ -1140,11 +1140,15 @@ def pipeline_status(pipeline_id: str):
     - `output_summary` — lightweight excerpt (counts, verdicts), not full payload
     - `error` — set only when status is `failed`
     """
+    import copy
     with _JOBS_LOCK:
         job = _JOBS.get(pipeline_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-    return ok(job)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+        # Deep-copy while holding the lock so the snapshot is consistent —
+        # the worker thread mutates stages dicts in-place via _update_stage.
+        snapshot = copy.deepcopy(job)
+    return ok(snapshot)
 
 
 @app.get("/pipeline/status/{pipeline_id}/{stage_name}", tags=["Pipeline Status"])
@@ -1159,19 +1163,21 @@ def pipeline_stage_status(pipeline_id: str, stage_name: str):
     Returns the same stage object as the full `/pipeline/status/{pipeline_id}` response
     but scoped to the requested stage only.
     """
+    import copy
     with _JOBS_LOCK:
         job = _JOBS.get(pipeline_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-    stage = job["stages"].get(stage_name)
-    if stage is None:
-        valid = ", ".join(job["stages"].keys())
-        raise HTTPException(
-            status_code=404,
-            detail=f"Stage '{stage_name}' not found in pipeline '{pipeline_id}'. "
-                   f"Valid stages: {valid}",
-        )
-    return ok({"pipeline_id": pipeline_id, "stage": stage_name, **stage})
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+        stage = job["stages"].get(stage_name)
+        if stage is None:
+            valid = ", ".join(job["stages"].keys())
+            raise HTTPException(
+                status_code=404,
+                detail=f"Stage '{stage_name}' not found in pipeline '{pipeline_id}'. "
+                       f"Valid stages: {valid}",
+            )
+        snapshot = copy.deepcopy(stage)
+    return ok({"pipeline_id": pipeline_id, "stage": stage_name, **snapshot})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
