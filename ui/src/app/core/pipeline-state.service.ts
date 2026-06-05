@@ -1,6 +1,6 @@
 // src/app/core/pipeline-state.service.ts
 import { Injectable, inject, signal } from '@angular/core';
-import { Subscription, timer } from 'rxjs';
+import { Subscription, interval } from 'rxjs';
 import { switchMap, takeWhile, tap } from 'rxjs/operators';
 import { HttpClient } from '@angular/common/http';
 import { ApiService, RunStatus, PipelineStep } from './api.service';
@@ -165,34 +165,50 @@ export class PipelineStateService {
     }
 
     // For each persisted run, check its current status on the backend.
-    // If still running/queued → re-attach polling.
-    // If already completed/failed → render final state and remove from storage.
-    alive.forEach(p => {
-      fetch(`${this.fortifyBase}/pipeline/status/${p.pipeline_id}`)
-        .then(r => r.json())
-        .then(resp => {
-          // Unwrap { ok, data } envelope from backend
-          const job = resp?.data ?? resp;
-          const isTerminal = job.status === 'completed' || job.status === 'failed';
+    // Retry up to 3 times with 1s delay before giving up — handles the case
+    // where the backend isn't ready in the first few ms after page load.
+    alive.forEach(p => this._rehydrateOne(p, 3));
+  }
 
-          if (isTerminal) {
-            // Render final state immediately without polling
-            this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'done');
-            this._applyFortifyStatus(p.pipeline_id, resp);
-            this._removePersisted(p.pipeline_id);
-          } else {
-            // Still running — inject card and resume polling
-            this._injectFortifyCard(p.pipeline_id, p.mode, p.body, job.status ?? 'running');
-            this._applyFortifyStatus(p.pipeline_id, resp);   // apply current state immediately
-            this._startFortifyPoll(p.pipeline_id);
-          }
-        })
-        .catch(() => {
-          // Backend unreachable — show card as unknown state, don't poll
-          this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'queued');
+  private _rehydrateOne(p: PersistedFortifyRun, retriesLeft: number) {
+    fetch(`${this.fortifyBase}/pipeline/status/${p.pipeline_id}`)
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(resp => {
+        // Unwrap { ok, data } envelope from backend
+        const job = resp?.data ?? resp;
+        const isTerminal = job.status === 'completed' || job.status === 'failed';
+
+        if (isTerminal) {
+          // Render final state immediately without polling
+          this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'done');
+          this._applyFortifyStatus(p.pipeline_id, resp);
           this._removePersisted(p.pipeline_id);
-        });
-    });
+        } else {
+          // Still running — inject card, apply current stage states, resume polling
+          const uiStatus = job.status === 'running' ? 'running' : 'queued';
+          this._injectFortifyCard(p.pipeline_id, p.mode, p.body, uiStatus);
+          this._applyFortifyStatus(p.pipeline_id, resp);
+          this._startFortifyPoll(p.pipeline_id);
+          // Restore the global running flag
+          if (!this.running()) {
+            this.running.set(true);
+            this._activeRunId = p.pipeline_id;
+          }
+        }
+      })
+      .catch(() => {
+        if (retriesLeft > 0) {
+          // Transient error (backend not ready yet) — retry after 1s, keep in localStorage
+          setTimeout(() => this._rehydrateOne(p, retriesLeft - 1), 1000);
+        } else {
+          // Backend genuinely unreachable after all retries — show card as queued
+          // but DO NOT remove from localStorage so the next reload can try again
+          this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'queued');
+        }
+      });
   }
 
   // ── Persist a Fortify run to localStorage ─────────────────────────────────
@@ -280,7 +296,13 @@ export class PipelineStateService {
     };
 
     this.runs.update(rs => [card, ...rs]);
-    this.selected.set(card);
+    // Auto-select: on first inject (new run from component), always select.
+    // On rehydration the selected signal may already be set to a Sonar run —
+    // only override if currently nothing is selected or the selected run is done.
+    const cur = this.selected();
+    if (!cur || cur.status === 'done' || cur.status === 'error' || cur.status === 'cancelled') {
+      this.selected.set(card);
+    }
   }
 
   // ── Start (or resume) polling for one Fortify pipeline_id ─────────────────
@@ -291,7 +313,7 @@ export class PipelineStateService {
     // tap() fires before the real sub is assigned (RxJS cold observable quirk)
     this._fortifyPolls.set(pipelineId, null as any);
 
-    const sub = timer(0, POLL_MS)
+    const sub = interval(POLL_MS)
       .pipe(
         switchMap(() =>
           this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`)
@@ -419,55 +441,36 @@ export class PipelineStateService {
   private _summariseStageOutput(stage: string, summary: any): string {
     if (!summary) return '';
     switch (stage) {
-      case 'triage':
-        // Backend sends { groups_count, ... }
-        return `${summary.groups_count ?? summary.total_groups ?? 0} groups`;
-      case 'version-resolver':
-        return summary.groups_count != null ? `${summary.groups_count} groups resolved` : '';
-      case 'context':
-        return summary.groups_count != null ? `${summary.groups_count} groups located` : (summary.pom_file ? `pom: ${summary.pom_file}` : '');
-      case 'api-diff':
-        return summary.has_breaking_changes
-          ? `⚠ ${summary.breaking_count} breaking change(s)`
-          : '✓ No breaking changes';
-      case 'ai-reasoning':
-        const safe = summary.safe ?? 0;
-        const esc  = summary.escalated ?? 0;
-        return (safe + esc) > 0 ? `✓ ${safe} safe · ⚠ ${esc} escalated` : '';
-      case 'adr-fix':
-        if (summary.fixed != null) return `Fixed: ${summary.fixed}/${summary.total ?? '?'}`;
-        return summary.branch_name ? `Branch: ${summary.branch_name}` : (summary.error_reason ?? '');
-      case 'pr-agent':
-        return summary.prs_created != null ? `${summary.prs_created} PR(s) created` : (summary.pr_url ? `PR: ${summary.pr_url}` : '');
-      case 'fortify-writeback':
-        return summary.total_fixed != null
-          ? `Fixed: ${summary.total_fixed}, Escalated: ${summary.total_escalated ?? 0}` : '';
-      default:
-        return '';
+      case 'triage':          return `${summary.total_groups ?? 0} groups, ${summary.total_skipped ?? 0} skipped`;
+      case 'version-resolver': return summary.candidates?.length
+        ? `Candidates: ${summary.candidates.slice(0, 3).join(', ')}`
+        : summary.next_safe ? `Next safe: ${summary.next_safe}` : '';
+      case 'context':         return summary.pom_file ? `pom: ${summary.pom_file}` : '';
+      case 'api-diff':        return summary.has_breaking_changes
+        ? `⚠ ${summary.breaking_count} breaking change(s)`
+        : '✓ No breaking changes';
+      case 'ai-reasoning':    return summary.confidence
+        ? `${summary.safe ? '✓ Safe' : '⚠ Unsafe'} · confidence: ${summary.confidence}` : '';
+      case 'adr-fix':         return summary.branch_name ? `Branch: ${summary.branch_name}` : summary.error_reason ?? '';
+      case 'pr-agent':        return summary.pr_url ? `PR: ${summary.pr_url}` : '';
+      case 'fortify-writeback': return summary.total_fixed != null
+        ? `Fixed: ${summary.total_fixed}, Escalated: ${summary.total_escalated ?? 0}` : '';
+      default:                return '';
     }
   }
 
   private _fortifyRunLabel(mode: FortifyMode, body: Record<string, unknown>): string {
-    const repo = body['repo'] ? ` · ${body['repo']}` : '';
     switch (mode) {
-      case 'live':     return `Release ${body['release_id'] ?? '—'}${repo}`;
-      case 'offline':  return `Offline · ${(body['report_path'] as string)?.split('/').pop() ?? 'report.json'}${repo}`;
-      case 'app-name': return `${body['app_name'] ?? '—'}${repo}`;
-      case 'dry-run': {
-        const src = body['report_path']
-          ? (body['report_path'] as string).split('/').pop()
-          : `Release ${body['release_id'] || '—'}`;
-        return `Dry Run · ${src}${repo}`;
-      }
+      case 'live':     return `Release ${body['release_id'] ?? '—'}`;
+      case 'offline':  return `Offline · ${(body['report_path'] as string)?.split('/').pop() ?? 'report.json'}`;
+      case 'app-name': return `${body['app_name'] ?? '—'}`;
+      case 'dry-run':  return `Dry Run · Release ${body['release_id'] ?? '—'}`;
     }
   }
 
   private _fortifyComponentLabel(mode: FortifyMode, body: Record<string, unknown>): string {
-    // 'repo' is a top-level field (owner/repo) set for all modes
-    if (body['repo']) return body['repo'] as string;
-    if (body['app_name']) return body['app_name'] as string;
     const cfg: any = body['config'] ?? {};
-    return cfg.github_repo ?? '';
+    return cfg.github_repo ?? (body['app_name'] as string) ?? '';
   }
 
   // ══════════════════════════════════════════════════════════════════════════
