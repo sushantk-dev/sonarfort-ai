@@ -369,10 +369,25 @@ export class PipelineStateService {
     // Backend wraps all responses: { ok: true, data: { ... } }
     const resp = raw?.data ?? raw;
 
-    const terminalStatus = resp.status === 'completed' ? 'done'
-                         : resp.status === 'failed'    ? 'error'
-                         : resp.status === 'running'   ? 'running'
-                         : 'queued';
+    const backendStatus = resp.status;
+    const fromBackend =
+      backendStatus === 'completed' ? 'done'
+      : backendStatus === 'failed'  ? 'error'
+      : backendStatus === 'running' ? 'running'
+      : 'queued';
+
+    // STATUS ORDER — never allow status to go backwards.
+    // Backend occasionally returns 'queued' for a run that the UI already
+    // knows is 'running' (race between worker pick-up and poll interval).
+    const STATUS_RANK: Record<string, number> = {
+      queued: 0, running: 1, done: 2, error: 2,
+    };
+    const currentRun = this.runs().find(r => r.id === pipelineId);
+    const currentStatus = currentRun?.status ?? 'queued';
+    const terminalStatus =
+      (STATUS_RANK[fromBackend] ?? 0) >= (STATUS_RANK[currentStatus as string] ?? 0)
+        ? fromBackend
+        : currentStatus as typeof fromBackend;
 
     const stages: Record<string, any> = resp.stages ?? {};
     const steps: PipelineStep[] = FORTIFY_STAGE_ORDER.map(key => {

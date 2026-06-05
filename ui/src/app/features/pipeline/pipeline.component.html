@@ -571,11 +571,13 @@
 
         <!-- Step trace -->
         <div class="trace">
-          <!-- Fortify: show only while genuinely queued (status=queued AND all steps pending) -->
+          <!-- Fortify: show while waiting to start (queued) OR just submitted (running + all pending) -->
           <div class="trace-init"
-               *ngIf="run.source === 'fortify' && run.status === 'queued' && allPending(run)">
+               *ngIf="run.source === 'fortify' && (run.status === 'queued' || run.status === 'running') && allPending(run)">
             <span class="trace-init__dot"></span>
-            <span class="trace-init__label">Pipeline queued — waiting to start…</span>
+            <span class="trace-init__label">
+              {{ run.status === 'queued' ? 'Pipeline queued — waiting to start…' : 'Pipeline starting…' }}
+            </span>
           </div>
           <div *ngFor="let step of run.steps; let i = index; let last = last"
                class="trace-step trace-step--{{ step.status }}">
