@@ -538,31 +538,34 @@
           </div>
         </div>
 
-        <!-- Fortify stat strip -->
-        <div class="stat-strip stat-strip--fortify" *ngIf="run.source === 'fortify'">
-          <div class="stat-strip__item">
-            <div class="stat-strip__val">{{ doneCnt(run) }}/{{ run.steps.length }}</div>
-            <div class="stat-strip__lbl">Stages done</div>
+        <!-- Fortify stat strip — compact key/value row instead of number cards -->
+        <div class="fortify-meta-bar" *ngIf="run.source === 'fortify'">
+          <div class="fortify-meta-bar__item">
+            <span class="fortify-meta-bar__lbl">Stages</span>
+            <span class="fortify-meta-bar__val">{{ doneCnt(run) }}/{{ run.steps.length }}</span>
           </div>
-          <div class="stat-strip__divider"></div>
-          <div class="stat-strip__item">
-            <div class="stat-strip__val stat-strip__val--mode">{{ run.fortifyRequest?.mode | uppercase }}</div>
-            <div class="stat-strip__lbl">Mode</div>
+          <div class="fortify-meta-bar__sep"></div>
+          <div class="fortify-meta-bar__item">
+            <span class="fortify-meta-bar__lbl">Mode</span>
+            <span class="fortify-meta-bar__val fortify-meta-bar__val--mode">{{ run.fortifyRequest?.mode | uppercase }}</span>
           </div>
-          <div class="stat-strip__divider"></div>
-          <div class="stat-strip__item" *ngIf="run.fortifyRequest?.body?.['repo']">
-            <div class="stat-strip__val stat-strip__val--repo" [title]="run.fortifyRequest?.body?.['repo']">
-              {{ run.fortifyRequest?.body?.['repo'] }}
+          <ng-container *ngIf="run.fortifyRequest?.body?.['repo']">
+            <div class="fortify-meta-bar__sep"></div>
+            <div class="fortify-meta-bar__item fortify-meta-bar__item--repo">
+              <span class="fortify-meta-bar__lbl">Repo</span>
+              <span class="fortify-meta-bar__val fortify-meta-bar__val--repo"
+                    [title]="run.fortifyRequest?.body?.['repo']">
+                {{ run.fortifyRequest?.body?.['repo'] }}
+              </span>
             </div>
-            <div class="stat-strip__lbl">Repo</div>
-          </div>
-          <div class="stat-strip__divider" *ngIf="run.fortifyRequest?.body?.['repo']"></div>
-          <div class="stat-strip__item">
-            <div class="stat-strip__val stat-strip__val--conf"
-                 [class]="confClass(run.confidence)">
+          </ng-container>
+          <div class="fortify-meta-bar__sep"></div>
+          <div class="fortify-meta-bar__item">
+            <span class="fortify-meta-bar__lbl">Confidence</span>
+            <span class="fortify-meta-bar__val fortify-meta-bar__val--conf"
+                  [class]="confClass(run.confidence)">
               {{ run.confidence ?? '—' }}
-            </div>
-            <div class="stat-strip__lbl">Confidence</div>
+            </span>
           </div>
         </div>
 

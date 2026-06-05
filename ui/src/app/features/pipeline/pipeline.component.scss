@@ -1624,43 +1624,87 @@
 }
 
 // ── Fortify stat strip variant ────────────────────────────────────────────
+// ── Fortify meta bar — compact horizontal key/value strip ────────────────
+.fortify-meta-bar {
+  display:       flex;
+  align-items:   center;
+  flex-wrap:     wrap;
+  gap:           0;
+  padding:       10px 22px;
+  border-bottom: 1px solid var(--border);
+  border-top:    2px solid rgba(29,158,117,.15);
+  background:    rgba(29,158,117,.02);
+  flex-shrink:   0;
+  min-height:    40px;
+
+  &__sep {
+    width:        1px;
+    height:       20px;
+    background:   var(--border);
+    margin:       0 16px;
+    flex-shrink:  0;
+  }
+
+  &__item {
+    display:     flex;
+    align-items: baseline;
+    gap:         6px;
+    min-width:   0;   // allow truncation
+
+    // Repo item gets flex-shrink so it compresses before others
+    &--repo {
+      flex:      1 1 0;
+      min-width: 80px;
+      max-width: 340px;
+    }
+  }
+
+  &__lbl {
+    font-size:      10px;
+    font-weight:    600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color:          var(--text-muted);
+    white-space:    nowrap;
+    flex-shrink:    0;
+  }
+
+  &__val {
+    font-size:   13px;
+    font-weight: 600;
+    color:       var(--text-primary);
+    white-space: nowrap;
+
+    &--mode {
+      font-family:    var(--font-mono);
+      font-size:      11px;
+      color:          #0F6E56;
+      letter-spacing: 0.05em;
+    }
+
+    &--repo {
+      font-family:   var(--font-mono);
+      font-size:     12px;
+      font-weight:   500;
+      color:         var(--text-secondary);
+      overflow:      hidden;
+      text-overflow: ellipsis;
+      white-space:   nowrap;
+      display:       block;
+    }
+
+    &--conf {
+      font-size: 12px;
+      &.high   { color: var(--status-success); }
+      &.medium { color: var(--status-warning); }
+      &.low    { color: var(--status-danger); }
+    }
+  }
+}
+
+// Keep old stat-strip--fortify for any other references but strip the broken item overrides
 .stat-strip--fortify {
   border-top: 2px solid rgba(29,158,117,.2);
-
-  // Fortify items have variable-length text — don't let them inflate
-  .stat-strip__item {
-    flex: 0 0 auto;
-    min-width: 72px;
-    max-width: 160px;
-    overflow: hidden;
-  }
-
-  // Stages-done cell can stay narrow
-  .stat-strip__item:first-child {
-    flex: 0 0 80px;
-  }
-}
-
-.stat-strip__val--mode {
-  font-size:    12px;
-  font-weight:  700;
-  font-family:  var(--font-mono);
-  color:        #0F6E56;
-  letter-spacing: 0.05em;
-  white-space:  nowrap;
-}
-
-.stat-strip__val--repo {
-  font-size:    11px;
-  font-weight:  500;
-  font-family:  var(--font-mono);
-  color:        var(--text-secondary);
-  max-width:    140px;
-  overflow:     hidden;
-  text-overflow: ellipsis;
-  white-space:  nowrap;
-  display:      block;
-  margin:       0 auto;
 }
 
 // ── Fortify pill — overrides global .pill severity colors ─────────────────
