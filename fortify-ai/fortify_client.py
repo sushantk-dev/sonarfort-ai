@@ -75,7 +75,7 @@ class FortifyClient:
     """
 
     _PAGE_SIZE = 50          # items per page for paginated endpoints
-    _REQUEST_TIMEOUT = 60    # seconds per HTTP call
+    _REQUEST_TIMEOUT = 100    # seconds per HTTP call
 
     def __init__(self, base_url: str, api_token: str) -> None:
         self._base_url = base_url.rstrip("/")
