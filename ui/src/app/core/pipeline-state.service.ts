@@ -1,6 +1,6 @@
 // src/app/core/pipeline-state.service.ts
 import { Injectable, inject, signal } from '@angular/core';
-import { Subscription, interval } from 'rxjs';
+import { Subscription, timer } from 'rxjs';
 import { switchMap, takeWhile, tap } from 'rxjs/operators';
 import { HttpClient } from '@angular/common/http';
 import { ApiService, RunStatus, PipelineStep } from './api.service';
@@ -291,7 +291,7 @@ export class PipelineStateService {
     // tap() fires before the real sub is assigned (RxJS cold observable quirk)
     this._fortifyPolls.set(pipelineId, null as any);
 
-    const sub = interval(POLL_MS)
+    const sub = timer(0, POLL_MS)
       .pipe(
         switchMap(() =>
           this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`)
@@ -419,36 +419,55 @@ export class PipelineStateService {
   private _summariseStageOutput(stage: string, summary: any): string {
     if (!summary) return '';
     switch (stage) {
-      case 'triage':          return `${summary.total_groups ?? 0} groups, ${summary.total_skipped ?? 0} skipped`;
-      case 'version-resolver': return summary.candidates?.length
-        ? `Candidates: ${summary.candidates.slice(0, 3).join(', ')}`
-        : summary.next_safe ? `Next safe: ${summary.next_safe}` : '';
-      case 'context':         return summary.pom_file ? `pom: ${summary.pom_file}` : '';
-      case 'api-diff':        return summary.has_breaking_changes
-        ? `⚠ ${summary.breaking_count} breaking change(s)`
-        : '✓ No breaking changes';
-      case 'ai-reasoning':    return summary.confidence
-        ? `${summary.safe ? '✓ Safe' : '⚠ Unsafe'} · confidence: ${summary.confidence}` : '';
-      case 'adr-fix':         return summary.branch_name ? `Branch: ${summary.branch_name}` : summary.error_reason ?? '';
-      case 'pr-agent':        return summary.pr_url ? `PR: ${summary.pr_url}` : '';
-      case 'fortify-writeback': return summary.total_fixed != null
-        ? `Fixed: ${summary.total_fixed}, Escalated: ${summary.total_escalated ?? 0}` : '';
-      default:                return '';
+      case 'triage':
+        // Backend sends { groups_count, ... }
+        return `${summary.groups_count ?? summary.total_groups ?? 0} groups`;
+      case 'version-resolver':
+        return summary.groups_count != null ? `${summary.groups_count} groups resolved` : '';
+      case 'context':
+        return summary.groups_count != null ? `${summary.groups_count} groups located` : (summary.pom_file ? `pom: ${summary.pom_file}` : '');
+      case 'api-diff':
+        return summary.has_breaking_changes
+          ? `⚠ ${summary.breaking_count} breaking change(s)`
+          : '✓ No breaking changes';
+      case 'ai-reasoning':
+        const safe = summary.safe ?? 0;
+        const esc  = summary.escalated ?? 0;
+        return (safe + esc) > 0 ? `✓ ${safe} safe · ⚠ ${esc} escalated` : '';
+      case 'adr-fix':
+        if (summary.fixed != null) return `Fixed: ${summary.fixed}/${summary.total ?? '?'}`;
+        return summary.branch_name ? `Branch: ${summary.branch_name}` : (summary.error_reason ?? '');
+      case 'pr-agent':
+        return summary.prs_created != null ? `${summary.prs_created} PR(s) created` : (summary.pr_url ? `PR: ${summary.pr_url}` : '');
+      case 'fortify-writeback':
+        return summary.total_fixed != null
+          ? `Fixed: ${summary.total_fixed}, Escalated: ${summary.total_escalated ?? 0}` : '';
+      default:
+        return '';
     }
   }
 
   private _fortifyRunLabel(mode: FortifyMode, body: Record<string, unknown>): string {
+    const repo = body['repo'] ? ` · ${body['repo']}` : '';
     switch (mode) {
-      case 'live':     return `Release ${body['release_id'] ?? '—'}`;
-      case 'offline':  return `Offline · ${(body['report_path'] as string)?.split('/').pop() ?? 'report.json'}`;
-      case 'app-name': return `${body['app_name'] ?? '—'}`;
-      case 'dry-run':  return `Dry Run · Release ${body['release_id'] ?? '—'}`;
+      case 'live':     return `Release ${body['release_id'] ?? '—'}${repo}`;
+      case 'offline':  return `Offline · ${(body['report_path'] as string)?.split('/').pop() ?? 'report.json'}${repo}`;
+      case 'app-name': return `${body['app_name'] ?? '—'}${repo}`;
+      case 'dry-run': {
+        const src = body['report_path']
+          ? (body['report_path'] as string).split('/').pop()
+          : `Release ${body['release_id'] || '—'}`;
+        return `Dry Run · ${src}${repo}`;
+      }
     }
   }
 
   private _fortifyComponentLabel(mode: FortifyMode, body: Record<string, unknown>): string {
+    // 'repo' is a top-level field (owner/repo) set for all modes
+    if (body['repo']) return body['repo'] as string;
+    if (body['app_name']) return body['app_name'] as string;
     const cfg: any = body['config'] ?? {};
-    return cfg.github_repo ?? (body['app_name'] as string) ?? '';
+    return cfg.github_repo ?? '';
   }
 
   // ══════════════════════════════════════════════════════════════════════════
