@@ -577,6 +577,7 @@
             <span class="trace-init__dot"></span>
             <span class="trace-init__label">
               {{ run.status === 'queued' ? 'Pipeline queued — waiting to start…' : 'Pipeline starting…' }}
+              <span class="trace-init__elapsed" *ngIf="queuedSeconds(run) > 3">{{ queuedSeconds(run) }}s</span>
             </span>
           </div>
           <div *ngFor="let step of run.steps; let i = index; let last = last"

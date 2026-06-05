@@ -242,6 +242,14 @@ export class PipelineComponent {
     return run.steps.every(s => s.status === 'pending');
   }
 
+  queuedSeconds(run: UiRun): number {
+    if (!run.fortifyRequest?.pipeline_id) return 0;
+    // Use started_at from the run if available, else approximate from now
+    const started = (run as any).startedAt ?? (run as any).started_at;
+    if (!started) return 0;
+    return Math.floor((Date.now() - new Date(started).getTime()) / 1000);
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   flagsOf(req: RunRequest): { label: string; on: boolean }[] {
     return [

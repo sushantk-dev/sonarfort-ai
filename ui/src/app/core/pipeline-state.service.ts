@@ -1,6 +1,6 @@
 // src/app/core/pipeline-state.service.ts
 import { Injectable, inject, signal } from '@angular/core';
-import { Subscription, interval } from 'rxjs';
+import { Subscription, timer } from 'rxjs';
 import { switchMap, takeWhile, tap } from 'rxjs/operators';
 import { HttpClient } from '@angular/common/http';
 import { ApiService, RunStatus, PipelineStep } from './api.service';
@@ -25,7 +25,8 @@ const FORTIFY_STAGE_LABELS: Record<string, string> = {
 
 const FORTIFY_STAGE_ORDER = Object.keys(FORTIFY_STAGE_LABELS);
 
-const POLL_MS     = 2500;
+const POLL_MS        = 2000;   // poll interval while running
+const QUEUED_POLL_MS = 600;    // faster poll while job is still queued
 
 // ── localStorage key for Fortify runs that survived a page reload ─────────────
 const FORTIFY_ACTIVE_KEY = 'sonarfort_fortify_active_runs';
@@ -313,7 +314,7 @@ export class PipelineStateService {
     // tap() fires before the real sub is assigned (RxJS cold observable quirk)
     this._fortifyPolls.set(pipelineId, null as any);
 
-    const sub = interval(POLL_MS)
+    const sub = timer(0, QUEUED_POLL_MS)
       .pipe(
         switchMap(() =>
           this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`)
