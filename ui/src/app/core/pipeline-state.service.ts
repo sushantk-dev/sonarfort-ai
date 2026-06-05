@@ -241,10 +241,10 @@ export class PipelineStateService {
   // FIX 1: no longer blocks if a Sonar run is active — queues instead
   // ══════════════════════════════════════════════════════════════════════════
   trackFortifyRun(pipelineId: string, mode: FortifyMode, body: Record<string, unknown>) {
-    // FIX 1: if a SONAR run is active, queue this Fortify run so it starts
-    // as soon as the Sonar run finishes. Multiple Fortify runs can coexist.
-    if (this._activeRunId && !this._fortifyPolls.has(this._activeRunId)) {
-      // Active run is a Sonar run — queue Fortify
+    // Only queue behind a SONAR run — Fortify runs can coexist with each other.
+    // A Sonar run is active when _activeRunId is set but NOT in _fortifyPolls.
+    const sonarRunActive = !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
+    if (sonarRunActive) {
       this._fortifyQueue.push({ pipelineId, mode, body });
       this._injectFortifyCard(pipelineId, mode, body, 'queued');
       this._persistFortifyRun(pipelineId, mode, body);
@@ -254,12 +254,8 @@ export class PipelineStateService {
     this._persistFortifyRun(pipelineId, mode, body);
     this._injectFortifyCard(pipelineId, mode, body, 'running');
     this._startFortifyPoll(pipelineId);
-
-    // Mark as running only if nothing else is running
-    if (!this.running()) {
-      this.running.set(true);
-      this._activeRunId = pipelineId;
-    }
+    this.running.set(true);
+    this._activeRunId = pipelineId;
   }
 
   // ── Inject a Fortify run card into the runs list (idempotent) ────────────
@@ -348,18 +344,25 @@ export class PipelineStateService {
     this._fortifyPolls.delete(pipelineId);
     this._removePersisted(pipelineId);
 
-    // FIX 1: drain the queue — start any queued Fortify runs now
+    // Clear _activeRunId so the next trackFortifyRun doesn't misidentify it
+    // as a still-running Sonar run and push to the queue instead of starting.
+    if (this._activeRunId === pipelineId) {
+      this._activeRunId = null;
+    }
+
+    // Drain the queue — start any Fortify runs that were waiting
     if (this._fortifyQueue.length > 0) {
       const next = this._fortifyQueue.shift()!;
-      // Update card status from queued → running
       this.runs.update(rs => rs.map(r =>
         r.id === next.pipelineId ? { ...r, status: 'running' } : r
       ));
+      this._activeRunId = next.pipelineId;
       this._persistFortifyRun(next.pipelineId, next.mode, next.body);
       this._startFortifyPoll(next.pipelineId);
+      return; // still running — don't clear running flag
     }
 
-    // Only clear the global running flag if no Sonar run is active
+    // Only clear the global running flag if no Sonar run is active either
     if (!this._activeRunId && this._fortifyPolls.size === 0) {
       this.running.set(false);
     }
