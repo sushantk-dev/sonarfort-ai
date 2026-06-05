@@ -181,7 +181,11 @@ export class PipelineComponent {
         };
         break;
       case 'app-name':
-        body = { ...body, app_name: this.fortifyAppName() };
+        body = {
+          ...body,
+          app_name: this.fortifyAppName(),
+          ...(this.fortifyGithubRepo() ? { repo: this.fortifyGithubRepo() } : {}),
+        };
         break;
       case 'dry-run':
         body = {
