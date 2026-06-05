@@ -11,6 +11,7 @@ export type ConfLabel = 'HIGH' | 'MEDIUM' | 'LOW' | null;
 export type FortifyMode = 'live' | 'offline' | 'app-name' | 'dry-run';
 
 // ── Fortify pipeline stages in execution order ────────────────────────────────
+// Must match ALL_STAGE_NAMES in api_server.py exactly
 const FORTIFY_STAGE_LABELS: Record<string, string> = {
   'triage':             'Triage',
   'version-resolver':   'Version Resolver',
@@ -18,7 +19,6 @@ const FORTIFY_STAGE_LABELS: Record<string, string> = {
   'api-diff':           'API Diff',
   'ai-reasoning':       'AI Reasoning',
   'adr-fix':            'ADR Fix',
-  'ai-code-fix':        'AI Code Fix',
   'pr-agent':           'PR Agent',
   'fortify-writeback':  'Fortify Writeback',
 };

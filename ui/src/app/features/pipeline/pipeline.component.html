@@ -571,9 +571,9 @@
 
         <!-- Step trace -->
         <div class="trace">
-          <!-- Fortify: show an initialising row when active but all steps still pending -->
+          <!-- Fortify: show only when truly no stage has started yet (all still pending) -->
           <div class="trace-init"
-               *ngIf="run.source === 'fortify' && (run.status === 'queued' || run.status === 'running') && doneCnt(run) === 0">
+               *ngIf="run.source === 'fortify' && (run.status === 'queued' || run.status === 'running') && run.steps.every(s => s.status === 'pending')">
             <span class="trace-init__dot"></span>
             <span class="trace-init__label">
               {{ run.status === 'queued' ? 'Pipeline queued — waiting to start…' : 'Pipeline starting…' }}
