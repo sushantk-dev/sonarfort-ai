@@ -199,6 +199,14 @@ class ConfigOverrides(BaseModel):
 
 class LivePipelineRequest(BaseModel):
     release_id: int = Field(..., description="Fortify SSC release ID to remediate")
+    repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub repository in 'owner/repo' format. "
+            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
+        ),
+    )
     max_upgrades: int = Field(
         default=0,
         ge=0,
@@ -228,6 +236,14 @@ class AppNamePipelineRequest(BaseModel):
 
 class AppIdPipelineRequest(BaseModel):
     app_id: int = Field(..., description="Fortify applicationId — skips name lookup, resolves directly to latest release_id")
+    repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub repository in 'owner/repo' format. "
+            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
+        ),
+    )
     max_upgrades: int = Field(
         default=0,
         ge=0,
@@ -239,6 +255,14 @@ class AppIdPipelineRequest(BaseModel):
 class OfflinePipelineRequest(BaseModel):
     report_path: str = Field(..., description="Absolute path to Fortify JSON report on disk")
     release_id: int = Field(default=0, description="Release ID override (0 = read from file)")
+    repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub repository in 'owner/repo' format. "
+            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
+        ),
+    )
     max_upgrades: int = Field(
         default=0,
         ge=0,
@@ -253,6 +277,14 @@ class DryRunRequest(BaseModel):
     report_path: Optional[str] = Field(default=None, description="Use offline JSON if provided")
     app_name: Optional[str] = Field(default=None, description="Fortify application name (resolved to app_id → release_id)")
     app_id: Optional[int] = Field(default=None, description="Fortify applicationId (skips name lookup)")
+    repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub repository in 'owner/repo' format. "
+            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
+        ),
+    )
     max_upgrades: int = Field(
         default=0,
         ge=0,
@@ -346,6 +378,14 @@ class PartialPipelineRequest(BaseModel):
     report_path: Optional[str] = Field(default=None, description="Offline JSON report path (skips SSC API)")
     app_name: Optional[str] = Field(default=None, description="Fortify application name (resolved to app_id → release_id)")
     app_id: Optional[int] = Field(default=None, description="Fortify applicationId (skips name lookup, resolves to latest release_id)")
+    repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub repository in 'owner/repo' format. "
+            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
+        ),
+    )
     max_upgrades: int = Field(
         default=0,
         ge=0,
@@ -818,10 +858,15 @@ async def pipeline_live(req: LivePipelineRequest):
     async def _run():
         t0 = time.time()
         loop = asyncio.get_event_loop()
+        clone_dir: str | None = None
         with _JOBS_LOCK:
             _JOBS[pid]["status"] = "running"
         try:
             cfg = _apply_overrides(load_config(), req.config)
+            cfg, clone_dir = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _clone_repo_if_needed(cfg, req.repo),
+            )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, req.release_id, None, None),
@@ -832,9 +877,15 @@ async def pipeline_live(req: LivePipelineRequest):
                                            max_upgrades=req.max_upgrades,
                                            pipeline_id=pid),
             )
+            if req.repo:
+                result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
+        finally:
+            if clone_dir:
+                import shutil
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     asyncio.create_task(_run())
     return ok({"pipeline_id": pid, "status": "queued"})
@@ -857,10 +908,15 @@ async def pipeline_offline(req: OfflinePipelineRequest):
     async def _run():
         t0 = time.time()
         loop = asyncio.get_event_loop()
+        clone_dir: str | None = None
         with _JOBS_LOCK:
             _JOBS[pid]["status"] = "running"
         try:
             cfg = _apply_overrides(load_config(), req.config)
+            cfg, clone_dir = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _clone_repo_if_needed(cfg, req.repo),
+            )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, req.release_id, req.report_path, None),
@@ -871,9 +927,15 @@ async def pipeline_offline(req: OfflinePipelineRequest):
                                            max_upgrades=req.max_upgrades,
                                            pipeline_id=pid),
             )
+            if req.repo:
+                result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
+        finally:
+            if clone_dir:
+                import shutil
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     asyncio.create_task(_run())
     return ok({"pipeline_id": pid, "status": "queued"})
@@ -965,10 +1027,15 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
     async def _run():
         t0 = time.time()
         loop = asyncio.get_event_loop()
+        clone_dir: str | None = None
         with _JOBS_LOCK:
             _JOBS[pid]["status"] = "running"
         try:
             cfg = _apply_overrides(load_config(), req.config)
+            cfg, clone_dir = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _clone_repo_if_needed(cfg, req.repo),
+            )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, 0, None, None, req.app_id),
@@ -980,9 +1047,15 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
                                            pipeline_id=pid),
             )
             result["app_id"] = app_id
+            if req.repo:
+                result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
+        finally:
+            if clone_dir:
+                import shutil
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     asyncio.create_task(_run())
     return ok({"pipeline_id": pid, "status": "queued"})
@@ -1006,10 +1079,15 @@ async def pipeline_dry_run(req: DryRunRequest):
     async def _run():
         t0 = time.time()
         loop = asyncio.get_event_loop()
+        clone_dir: str | None = None
         with _JOBS_LOCK:
             _JOBS[pid]["status"] = "running"
         try:
             cfg = _apply_overrides(load_config(), req.config)
+            cfg, clone_dir = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _clone_repo_if_needed(cfg, req.repo),
+            )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(
@@ -1023,9 +1101,15 @@ async def pipeline_dry_run(req: DryRunRequest):
                                            dry_run=True, max_upgrades=req.max_upgrades,
                                            pipeline_id=pid),
             )
+            if req.repo:
+                result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
+        finally:
+            if clone_dir:
+                import shutil
+                shutil.rmtree(clone_dir, ignore_errors=True)
 
     asyncio.create_task(_run())
     return ok({"pipeline_id": pid, "status": "queued"})
@@ -1541,10 +1625,15 @@ def _make_partial_endpoint(stop_after: StageLabel):
         async def _run():
             t0 = time.time()
             loop = asyncio.get_event_loop()
+            clone_dir: str | None = None
             with _JOBS_LOCK:
                 _JOBS[pid]["status"] = "running"
             try:
                 cfg = _apply_overrides(load_config(), req.config)
+                cfg, clone_dir = await loop.run_in_executor(
+                    _EXECUTOR,
+                    lambda: _clone_repo_if_needed(cfg, req.repo),
+                )
                 client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                     _EXECUTOR,
                     lambda: _resolve_vulnerabilities(
@@ -1558,9 +1647,15 @@ def _make_partial_endpoint(stop_after: StageLabel):
                                        stop_after, pipeline_id=pid,
                                        max_upgrades=req.max_upgrades),
                 )
+                if req.repo:
+                    result["repo"] = req.repo
                 _finish_job(pid, "completed", result=result, t0=t0)
             except Exception as exc:
                 _finish_job(pid, "failed", error=str(exc), t0=t0)
+            finally:
+                if clone_dir:
+                    import shutil
+                    shutil.rmtree(clone_dir, ignore_errors=True)
 
         asyncio.create_task(_run())
         return ok({"pipeline_id": pid, "status": "queued"})

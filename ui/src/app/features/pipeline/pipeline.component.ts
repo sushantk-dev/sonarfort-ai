@@ -74,7 +74,7 @@ export class PipelineComponent {
   // ── Fortify run form signals ──────────────────────────────────────────────
   fortifyReleaseId   = signal('');
   fortifyAppName     = signal('');
-  fortifyGithubRepo  = signal('');       // owner/repo override
+  fortifyGithubRepo  = signal('');       // owner/repo — clones repo so no local PROJECT_PATH needed
   fortifyReportPath  = signal('');       // offline mode: path to JSON report
   fortifyMaxUpgrades = signal(0);        // 0 = no limit
   showFortifyForm    = signal(false);
@@ -164,14 +164,16 @@ export class PipelineComponent {
 
     let body: Record<string, unknown> = {
       max_upgrades: this.fortifyMaxUpgrades() || 0,
-      config: {
-        ...(this.fortifyGithubRepo() ? { github_repo: this.fortifyGithubRepo() } : {}),
-      },
+      ...(this.fortifyGithubRepo() ? { repo: this.fortifyGithubRepo() } : {}),
+      config: {},
     };
 
     switch (mode) {
       case 'live':
-        body = { ...body, release_id: Number(this.fortifyReleaseId()) };
+        body = {
+          ...body,
+          release_id: Number(this.fortifyReleaseId()),
+        };
         break;
       case 'offline':
         body = {
@@ -184,7 +186,6 @@ export class PipelineComponent {
         body = {
           ...body,
           app_name: this.fortifyAppName(),
-          ...(this.fortifyGithubRepo() ? { repo: this.fortifyGithubRepo() } : {}),
         };
         break;
       case 'dry-run':

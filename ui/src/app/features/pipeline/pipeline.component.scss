@@ -1580,6 +1580,17 @@
   letter-spacing: 0.05em;
 }
 
+.stat-strip__val--repo {
+  font-size:    11px;
+  font-weight:  500;
+  font-family:  var(--font-mono);
+  color:        var(--text-secondary);
+  max-width:    120px;
+  overflow:     hidden;
+  text-overflow: ellipsis;
+  white-space:  nowrap;
+}
+
 // ── Fortify pill — overrides global .pill severity colors ─────────────────
 // Applied when severity === 'FORTIFY' via SevClassPipe → .pill--fortify
 .pill--fortify {

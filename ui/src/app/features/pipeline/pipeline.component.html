@@ -204,7 +204,7 @@
                  placeholder="e.g. 1723380">
         </div>
         <div class="run-form__field">
-          <label>GitHub Repo <span class="label-opt">owner/repo</span></label>
+          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
           <input class="run-form__input" [value]="fortifyGithubRepo()"
                  (input)="fortifyGithubRepo.set($any($event.target).value)"
                  placeholder="acme/backend">
@@ -217,7 +217,7 @@
         </div>
       </ng-container>
 
-      <!-- OFFLINE: report_path + release_id + max_upgrades -->
+      <!-- OFFLINE: report_path + release_id + repo + max_upgrades -->
       <ng-container *ngIf="fortifyMode() === 'offline'">
         <div class="run-form__field run-form__field--wide">
           <label>Report Path <span class="label-opt">.json</span></label>
@@ -230,6 +230,12 @@
           <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
                  (input)="fortifyReleaseId.set($any($event.target).value)"
                  placeholder="0">
+        </div>
+        <div class="run-form__field">
+          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
+          <input class="run-form__input" [value]="fortifyGithubRepo()"
+                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+                 placeholder="acme/backend">
         </div>
         <div class="run-form__field run-form__field--sm">
           <label>Max Upgrades <span class="label-opt">0 = all</span></label>
@@ -248,7 +254,7 @@
                  placeholder="1038_US_MyApp_USIS">
         </div>
         <div class="run-form__field">
-          <label>GitHub Repo <span class="label-opt">override</span></label>
+          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
           <input class="run-form__input" [value]="fortifyGithubRepo()"
                  (input)="fortifyGithubRepo.set($any($event.target).value)"
                  placeholder="acme/backend">
@@ -261,7 +267,7 @@
         </div>
       </ng-container>
 
-      <!-- DRY-RUN: release_id or report_path, no side effects -->
+      <!-- DRY-RUN: release_id or report_path + repo, no side effects -->
       <ng-container *ngIf="fortifyMode() === 'dry-run'">
         <div class="run-form__field run-form__field--sm">
           <label>Release ID <span class="label-opt">or use report</span></label>
@@ -274,6 +280,12 @@
           <input class="run-form__input" [value]="fortifyReportPath()"
                  (input)="fortifyReportPath.set($any($event.target).value)"
                  placeholder="/tmp/report.json">
+        </div>
+        <div class="run-form__field">
+          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
+          <input class="run-form__input" [value]="fortifyGithubRepo()"
+                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+                 placeholder="acme/backend">
         </div>
         <div class="run-form__field run-form__field--sm">
           <label>Max Upgrades <span class="label-opt">0 = all</span></label>
@@ -529,6 +541,13 @@
             <div class="stat-strip__lbl">Mode</div>
           </div>
           <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item" *ngIf="run.fortifyRequest?.body?.['repo']">
+            <div class="stat-strip__val stat-strip__val--repo" [title]="run.fortifyRequest?.body?.['repo']">
+              {{ run.fortifyRequest?.body?.['repo'] }}
+            </div>
+            <div class="stat-strip__lbl">Repo</div>
+          </div>
+          <div class="stat-strip__divider" *ngIf="run.fortifyRequest?.body?.['repo']"></div>
           <div class="stat-strip__item">
             <div class="stat-strip__val stat-strip__val--conf"
                  [class]="confClass(run.confidence)">
