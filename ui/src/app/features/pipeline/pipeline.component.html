@@ -365,10 +365,13 @@
                 *ngIf="run.status !== 'running' || run.ruleKey !== '—'">
             {{ run.severity }}
           </span>
-          <span class="run-card__rule">
+          <span class="run-card__rule" [class.run-card__rule--fortify]="run.source === 'fortify'">
             {{ run.status === 'running' && run.ruleKey === '—' ? 'Pipeline running…' : run.ruleKey }}
           </span>
-          <span *ngIf="run.live && run.status === 'running'" class="live-badge">LIVE</span>
+          <!-- Sonar live badge -->
+          <span *ngIf="run.source !== 'fortify' && run.live && run.status === 'running'" class="live-badge">LIVE</span>
+          <!-- Fortify active badges -->
+          <span *ngIf="run.source === 'fortify' && run.status === 'running'" class="live-badge live-badge--fortify">RUNNING</span>
           <span *ngIf="run.status === 'queued'" class="queued-badge">QUEUED</span>
           <span *ngIf="run.status === 'cancelled'" class="cancelled-badge">CANCELLED</span>
           <span *ngIf="run.source === 'fortify'" class="run-card__source-badge run-card__source-badge--fortify">Fortify</span>
@@ -424,11 +427,15 @@
       <ng-container *ngIf="selected() as run">
 
         <!-- Detail header -->
-        <div class="detail__header">
+        <div class="detail__header" [class.detail__header--fortify]="run.source === 'fortify'">
           <div class="detail__header-row">
             <span class="pill {{ $any(run.severity) | sevClass }}">{{ run.severity }}</span>
-            <span class="detail__rule">{{ run.ruleKey }}</span>
-            <span *ngIf="run.live && run.status === 'running'" class="live-badge">LIVE</span>
+            <span class="detail__rule" [class.detail__rule--fortify]="run.source === 'fortify'">{{ run.ruleKey }}</span>
+            <!-- Sonar live badge -->
+            <span *ngIf="run.source !== 'fortify' && run.live && run.status === 'running'" class="live-badge">LIVE</span>
+            <!-- Fortify: show status badge whenever active -->
+            <span *ngIf="run.source === 'fortify' && run.status === 'queued'" class="queued-badge">QUEUED</span>
+            <span *ngIf="run.source === 'fortify' && run.status === 'running'" class="live-badge live-badge--fortify">RUNNING</span>
             <span *ngIf="run.status === 'cancelled'" class="cancelled-badge">CANCELLED</span>
             <span *ngIf="run.outcome && run.status !== 'cancelled'"
                   class="badge {{ $any(run.outcome) | outcomeClass }}">
@@ -438,8 +445,10 @@
           <div class="detail__comp">
             <ng-container *ngIf="run.component; else compPlaceholder">{{ run.component }}</ng-container>
             <ng-template #compPlaceholder>
-              <span *ngIf="run.status === 'running'" class="detail__comp--pulse">Running pipeline…</span>
-              <span *ngIf="run.status !== 'running'">—</span>
+              <span *ngIf="run.status === 'running' || run.status === 'queued'" class="detail__comp--pulse">
+                {{ run.source === 'fortify' ? (run.status === 'queued' ? 'Queued…' : 'Running pipeline…') : 'Running pipeline…' }}
+              </span>
+              <span *ngIf="run.status !== 'running' && run.status !== 'queued'">—</span>
             </ng-template>
           </div>
 
@@ -559,6 +568,14 @@
 
         <!-- Step trace -->
         <div class="trace">
+          <!-- Fortify: show an initialising row when active but all steps still pending -->
+          <div class="trace-init"
+               *ngIf="run.source === 'fortify' && (run.status === 'queued' || run.status === 'running') && doneCnt(run) === 0">
+            <span class="trace-init__dot"></span>
+            <span class="trace-init__label">
+              {{ run.status === 'queued' ? 'Pipeline queued — waiting to start…' : 'Pipeline starting…' }}
+            </span>
+          </div>
           <div *ngFor="let step of run.steps; let i = index; let last = last"
                class="trace-step trace-step--{{ step.status }}">
             <div class="trace-step__track">

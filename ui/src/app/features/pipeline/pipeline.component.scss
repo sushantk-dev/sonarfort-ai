@@ -283,6 +283,14 @@
   color: var(--text-primary);
   flex: 1;
   letter-spacing: -0.3px;
+  // Fortify rule keys can be very long — truncate gracefully
+  &--fortify {
+    font-size:     13px;
+    overflow:      hidden;
+    text-overflow: ellipsis;
+    white-space:   nowrap;
+    min-width:     0;
+  }
 }
 
 .detail__comp {
@@ -854,6 +862,63 @@
 
 // ── Live badge ────────────────────────────────────────────────────────────
 .live-badge {
+  font-size:    10px;
+  font-weight:  600;
+  padding:      2px 7px;
+  border-radius: 4px;
+  background:   rgba(var(--brand-rgb, 29,158,117), .12);
+  color:        var(--brand);
+  border:       1px solid rgba(var(--brand-rgb, 29,158,117), .3);
+  flex-shrink:  0;
+  animation:    badge-pulse 2s ease-in-out infinite;
+
+  // Fortify running badge — slightly different green shade to distinguish from Sonar LIVE
+  &--fortify {
+    background:   rgba(15, 110, 86, .12);
+    color:        #0A5C47;
+    border-color: rgba(15, 110, 86, .3);
+    animation:    badge-pulse 1.5s ease-in-out infinite;
+  }
+}
+
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.6; }
+}
+
+// Fortify run-card rule text — truncate long app-name strings
+.run-card__rule--fortify {
+  font-size:     12px;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  white-space:   nowrap;
+  min-width:     0;
+}
+
+// Trace initialising row — shown when Fortify run is active but no steps have started
+.trace-init {
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+  padding:     10px 0 14px;
+  color:       var(--text-muted);
+  font-size:   12px;
+
+  &__dot {
+    width:         8px;
+    height:        8px;
+    border-radius: 50%;
+    background:    var(--brand);
+    flex-shrink:   0;
+    animation:     pulse-dot 1.2s ease-in-out infinite;
+  }
+
+  &__label {
+    font-style: italic;
+    color:      var(--brand);
+    font-weight: 500;
+  }
+}
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.5px;
@@ -1570,14 +1635,28 @@
 // ── Fortify stat strip variant ────────────────────────────────────────────
 .stat-strip--fortify {
   border-top: 2px solid rgba(29,158,117,.2);
+
+  // Fortify items have variable-length text — don't let them inflate
+  .stat-strip__item {
+    flex: 0 0 auto;
+    min-width: 72px;
+    max-width: 160px;
+    overflow: hidden;
+  }
+
+  // Stages-done cell can stay narrow
+  .stat-strip__item:first-child {
+    flex: 0 0 80px;
+  }
 }
 
 .stat-strip__val--mode {
-  font-size:    13px;
+  font-size:    12px;
   font-weight:  700;
   font-family:  var(--font-mono);
   color:        #0F6E56;
   letter-spacing: 0.05em;
+  white-space:  nowrap;
 }
 
 .stat-strip__val--repo {
@@ -1585,10 +1664,12 @@
   font-weight:  500;
   font-family:  var(--font-mono);
   color:        var(--text-secondary);
-  max-width:    120px;
+  max-width:    140px;
   overflow:     hidden;
   text-overflow: ellipsis;
   white-space:  nowrap;
+  display:      block;
+  margin:       0 auto;
 }
 
 // ── Fortify pill — overrides global .pill severity colors ─────────────────
