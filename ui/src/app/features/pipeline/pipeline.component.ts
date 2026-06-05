@@ -238,6 +238,10 @@ export class PipelineComponent {
     this.state.startRun(req);
   }
 
+  allPending(run: UiRun): boolean {
+    return run.steps.every(s => s.status === 'pending');
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   flagsOf(req: RunRequest): { label: string; on: boolean }[] {
     return [
