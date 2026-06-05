@@ -31,6 +31,9 @@ const QUEUED_POLL_MS = 600;    // faster poll while job is still queued
 // ── localStorage key for Fortify runs that survived a page reload ─────────────
 const FORTIFY_ACTIVE_KEY = 'sonarfort_fortify_active_runs';
 
+// ── localStorage key for full run history (both Sonar and Fortify) ───────────
+const ALL_RUNS_KEY = 'sonarfort_all_runs';
+
 export interface RunRequest {
   repo_url:   string;
   commit_sha: string;
@@ -73,6 +76,7 @@ export interface UiRun {
   request?:      RunRequest;
   fortifyRequest?: FortifyRunRequest;
   source?:       'sonar' | 'fortify';
+  startedAt?:    number;   // epoch ms — for elapsed timer and history ordering
 }
 
 @Injectable({ providedIn: 'root' })
@@ -112,15 +116,30 @@ export class PipelineStateService {
   // STARTUP — rehydrate both Sonar and Fortify in-progress runs
   // ══════════════════════════════════════════════════════════════════════════
   private _rehydrate() {
-    // ── Sonar runs (from backend list) ────────────────────────────────────
+    // ── Step 1: Load saved history immediately (no network needed) ────────────
+    const history = this._loadRunHistory();
+    if (history.length > 0) {
+      this.runs.set(history);
+      this.selected.set(history[0]);
+    }
+
+    // ── Step 2: Fetch live Sonar runs from backend and merge ──────────────────
     this.api.listRuns().subscribe({
       next: ({ runs }) => {
-        const hydrated: UiRun[] = (runs ?? []).map((r: any) => this._backendRunToUiRun(r));
-        this.runs.set(hydrated);
-        this.selected.set(hydrated[0] ?? null);
+        const fromBackend: UiRun[] = (runs ?? []).map((r: any) => this._backendRunToUiRun(r));
+
+        // Merge: backend runs take precedence over history for same IDs.
+        // History-only runs (not in backend) are kept as-is.
+        const backendIds = new Set(fromBackend.map(r => r.id));
+        const historyOnly = history.filter(r => !backendIds.has(r.id));
+        const merged = [...fromBackend, ...historyOnly]
+          .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+
+        this.runs.set(merged);
+        this.selected.set(merged[0] ?? null);
 
         // Re-attach Sonar polling for any run still in progress
-        const inProgress = hydrated.find(
+        const inProgress = fromBackend.find(
           r => r.source !== 'fortify' && (r.status === 'running' || r.status === 'queued')
         );
         if (inProgress) {
@@ -136,13 +155,16 @@ export class PipelineStateService {
           });
         }
 
-        // FIX 2: after Sonar hydration, rehydrate any persisted Fortify runs
+        // After Sonar hydration, rehydrate any persisted Fortify active runs
         this._rehydrateFortify();
       },
       error: () => {
-        const seeded = this._seedRuns();
-        this.runs.set(seeded);
-        this.selected.set(seeded[0] ?? null);
+        // Backend unreachable — history is already loaded, just rehydrate Fortify
+        if (history.length === 0) {
+          const seeded = this._seedRuns();
+          this.runs.set(seeded);
+          this.selected.set(seeded[0] ?? null);
+        }
         this._rehydrateFortify();
       },
     });
@@ -236,6 +258,34 @@ export class PipelineStateService {
     } catch {}
   }
 
+  // ── Full run history — persists all runs until user clicks X ─────────────
+
+  private _saveRunToHistory(run: UiRun) {
+    try {
+      const history = this._loadRunHistory();
+      // Upsert: update existing entry or prepend new one
+      const without = history.filter(r => r.id !== run.id);
+      const updated = [run, ...without].slice(0, 200); // cap at 200 runs
+      localStorage.setItem(ALL_RUNS_KEY, JSON.stringify(updated));
+    } catch {}
+  }
+
+  private _loadRunHistory(): UiRun[] {
+    try {
+      const raw = localStorage.getItem(ALL_RUNS_KEY);
+      if (!raw) return [];
+      return JSON.parse(raw) as UiRun[];
+    } catch { return []; }
+  }
+
+  private _removeFromHistory(id: string) {
+    try {
+      const history = this._loadRunHistory().filter(r => r.id !== id);
+      if (history.length === 0) localStorage.removeItem(ALL_RUNS_KEY);
+      else localStorage.setItem(ALL_RUNS_KEY, JSON.stringify(history));
+    } catch {}
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // FORTIFY — public entry point (called from component after POST succeeds)
   // FIX 1: no longer blocks if a Sonar run is active — queues instead
@@ -290,6 +340,7 @@ export class PipelineStateService {
       status,
       fortifyRequest: fortifyReq,
       source:         'fortify',
+      startedAt:      Date.now(),
     };
 
     this.runs.update(rs => [card, ...rs]);
@@ -443,8 +494,13 @@ export class PipelineStateService {
         outcome:    outcome     ?? r.outcome,
         prUrl:      prUrl       ?? r.prUrl,
         confidence: confidence  ?? r.confidence,
+        startedAt:  r.startedAt ?? Date.now(),
       };
       if (this.selected()?.id === pipelineId) this.selected.set(updated);
+      // Persist to history on terminal state so it survives reload
+      if (terminalStatus === 'done' || terminalStatus === 'error') {
+        this._saveRunToHistory(updated);
+      }
       return updated;
     }));
 
@@ -520,10 +576,11 @@ export class PipelineStateService {
       component: '',
       steps: ['Ingest','Load Repo','RAG Fetch','Fetch Rule','Planner','Generator','Critic','Validate','Deliver']
         .map(label => ({ label, status: 'pending' as const, detail: '', ms: 0 })),
-      live:    true,
-      status:  'running',
-      request: req,
-      source:  'sonar',
+      live:      true,
+      status:    'running',
+      request:   req,
+      source:    'sonar',
+      startedAt: Date.now(),
     };
 
     this.runs.update(rs => [liveRun, ...rs]);
@@ -586,9 +643,16 @@ export class PipelineStateService {
         ruleKey:    first?.rule_key  ? first.rule_key  : r.ruleKey,
         severity:   first?.severity  ? first.severity  : r.severity,
         component:  first?.file_path ? first.file_path : r.component,
+        startedAt:  r.startedAt ?? Date.now(),
       };
 
       if (this.selected()?.id === runId) this.selected.set(updated);
+
+      // Save to persistent history when done or error
+      if (status.status === 'done' || status.status === 'error' || noResults) {
+        this._saveRunToHistory(updated);
+      }
+
       return updated;
     }));
 
@@ -607,7 +671,6 @@ export class PipelineStateService {
 
       if ((status.results?.length ?? 0) > 1) this._explodeResults(runId, status);
 
-      // FIX 1: drain queued Fortify runs now that Sonar is done
       this._drainFortifyQueue();
     }
   }
@@ -652,6 +715,7 @@ export class PipelineStateService {
       status:     r.status ?? 'done',
       request:    r.request,
       source:     r.source ?? 'sonar',
+      startedAt:  r.started_at ? new Date(r.started_at).getTime() : undefined,
     };
   }
 
@@ -703,8 +767,14 @@ export class PipelineStateService {
   // ── Delete ────────────────────────────────────────────────────────────────
   deleteRun(id: string) {
     if (id === this._activeRunId) return;
+    // Remove from UI
     this.runs.update(rs => rs.filter(r => r.id !== id));
     if (this.selected()?.id === id) this.selected.set(this.runs()[0] ?? null);
+    // Remove from persistent history
+    this._removeFromHistory(id);
+    // Remove from active Fortify tracking (if it was a Fortify run)
+    this._removePersisted(id);
+    // Best-effort delete from Sonar backend (no-op for Fortify runs)
     this.api.deleteRun(id).subscribe({ error: () => {} });
   }
 
