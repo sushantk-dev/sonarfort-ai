@@ -1,5 +1,5 @@
 """
-FortifyAI — Fortify OAuth Authentication
+FortifyAI -- Fortify OAuth Authentication
 -----------------------------------------
 Handles Bearer token acquisition and refresh via the Fortify OAuth2
 password-grant endpoint:
@@ -17,7 +17,7 @@ password-grant endpoint:
 Proactive refresh (recommended usage)
 --------------------------------------
 Call `ensure_token(cfg)` before creating a FortifyClient.  It returns a new
-config copy with a guaranteed-fresh token — fetching from the Fortify OAuth
+config copy with a guaranteed-fresh token -- fetching from the Fortify OAuth
 endpoint only when the cached token is absent or within 30 s of expiry.
 
     from fortify_auth import ensure_token
@@ -58,9 +58,9 @@ _REQUEST_TIMEOUT = 30  # seconds
 _EXPIRY_BUFFER_SECS = 60
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # In-process token cache
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 @dataclass
 class _CachedToken:
@@ -68,7 +68,7 @@ class _CachedToken:
     expires_at: float          # epoch seconds (time.time() compatible)
 
 
-# Cache keyed by (base_url, username) — supports multiple tenants
+# Cache keyed by (base_url, username) -- supports multiple tenants
 _token_cache: dict[tuple[str, str], _CachedToken] = {}
 _cache_lock  = threading.Lock()
 
@@ -97,7 +97,7 @@ def _store_token(cfg: FortifyAIConfig, token_data: dict) -> str:
             expires_at=expires_at,
         )
     logger.debug(
-        f"[FortifyAuth] Token cached — expires in {expires_in}s "
+        f"[FortifyAuth] Token cached -- expires in {expires_in}s "
         f"(at {time.strftime('%H:%M:%S', time.localtime(expires_at))}, "
         f"buffer {_EXPIRY_BUFFER_SECS}s)"
     )
@@ -111,9 +111,9 @@ def invalidate_cache(cfg: FortifyAIConfig) -> None:
     logger.debug("[FortifyAuth] Token cache invalidated.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # Public proactive-refresh API
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
     """
@@ -122,16 +122,16 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
     Decision logic
     ~~~~~~~~~~~~~~
     1. ``cfg.fortify_api_token`` is already set **and** the in-process cache
-       has a valid entry → return ``cfg`` unchanged (zero network calls).
+       has a valid entry -> return ``cfg`` unchanged (zero network calls).
     2. The cache has a valid token but ``cfg.fortify_api_token`` is stale/empty
-       → return a copy with the cached token injected.
+       -> return a copy with the cached token injected.
     3. Cache miss or token within ``_EXPIRY_BUFFER_SECS`` of expiry
-       → fetch a fresh token, update the cache, return a copy with the new
+       -> fetch a fresh token, update the cache, return a copy with the new
        token injected and write it back to .env.
     4. OAuth credentials missing **and** ``fortify_api_token`` is already set
-       → assume the caller manages the token manually; return ``cfg`` unchanged.
+       -> assume the caller manages the token manually; return ``cfg`` unchanged.
 
-    The returned config is a Pydantic ``model_copy`` — the original ``cfg``
+    The returned config is a Pydantic ``model_copy`` -- the original ``cfg``
     is never mutated.
     """
     # Fast path: check the in-process cache first (no credential check needed)
@@ -146,7 +146,7 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
     if not cfg.fortify_username or not cfg.fortify_password:
         if cfg.fortify_api_token:
             logger.debug(
-                "[FortifyAuth] No OAuth credentials — using static FORTIFY_API_TOKEN."
+                "[FortifyAuth] No OAuth credentials -- using static FORTIFY_API_TOKEN."
             )
             # Still seed the cache with a generous TTL so repeated calls are free
             with _cache_lock:
@@ -161,7 +161,7 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
         )
 
     # Fetch a fresh token from the OAuth endpoint
-    logger.info("[FortifyAuth] Token missing or near expiry — fetching fresh token.")
+    logger.info("[FortifyAuth] Token missing or near expiry -- fetching fresh token.")
     token_data   = fetch_token(cfg)
     access_token = _store_token(cfg, token_data)
 
@@ -171,9 +171,9 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
     return cfg.model_copy(update={"fortify_api_token": access_token})
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # Core token fetch
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 def fetch_token(
     cfg: FortifyAIConfig,
@@ -184,7 +184,7 @@ def fetch_token(
     """
     POST /oauth/token with password grant.
 
-    Parameters override .env values when provided — useful for one-off
+    Parameters override .env values when provided -- useful for one-off
     token requests without modifying config.
 
     Returns the full token response dict:
@@ -197,8 +197,8 @@ def fetch_token(
         }
 
     Raises:
-        ValueError  — if required credentials are missing
-        requests.HTTPError — on non-2xx response from Fortify
+        ValueError  -- if required credentials are missing
+        requests.HTTPError -- on non-2xx response from Fortify
     """
     resolved_username = username or cfg.fortify_username
     resolved_password = password or cfg.fortify_password
@@ -232,7 +232,7 @@ def fetch_token(
 
     logger.info(
         f"[FortifyAuth] Fetching OAuth token for user '{resolved_username}' "
-        f"scope='{resolved_scope}' → {url}"
+        f"scope='{resolved_scope}' -> {url}"
     )
 
     t0 = time.time()
@@ -247,7 +247,7 @@ def fetch_token(
 
     if not resp.ok:
         logger.error(
-            f"[FortifyAuth] ❌ Token fetch failed — "
+            f"[FortifyAuth] ERROR Token fetch failed -- "
             f"HTTP {resp.status_code} ({elapsed}s): {resp.text[:300]}"
         )
         resp.raise_for_status()
@@ -257,7 +257,7 @@ def fetch_token(
     expires_in   = token_data.get("expires_in", "?")
 
     logger.info(
-        f"[FortifyAuth] ✅ Token obtained ({elapsed}s) — "
+        f"[FortifyAuth] OK Token obtained ({elapsed}s) -- "
         f"expires_in={expires_in}s  "
         f"preview={access_token[:12]}..."
     )
@@ -265,9 +265,9 @@ def fetch_token(
     return token_data
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # .env writeback
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 def write_token_to_env(token: str, env_path: str | Path = ".env") -> None:
     """
@@ -294,203 +294,12 @@ def write_token_to_env(token: str, env_path: str | Path = ".env") -> None:
     if pattern.search(original):
         updated = pattern.sub(new_line, original)
     else:
-        # Append — ensure there's a trailing newline before the new line
+        # Append -- ensure there's a trailing newline before the new line
         updated = original.rstrip("\n") + "\n" + new_line + "\n"
 
     env_file.write_text(updated, encoding="utf-8")
     logger.info(
-        f"[FortifyAuth] ✅ FORTIFY_API_TOKEN written to {env_file.resolve()} "
-        f"(preview: {token[:12]}...)"
-    )
-
-
-def refresh_token_in_env(
-    cfg: FortifyAIConfig,
-    env_path: str | Path = ".env",
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-    scope: Optional[str] = None,
-) -> dict:
-    """
-    Convenience: fetch a fresh token and write it to .env in one call.
-
-    Returns the full token response dict (same as fetch_token).
-    """
-    token_data = fetch_token(cfg, username=username, password=password, scope=scope)
-    access_token = token_data.get("access_token", "")
-    if access_token:
-        write_token_to_env(access_token, env_path=env_path)
-    return token_data
-
-Handles Bearer token acquisition and refresh via the Fortify OAuth2
-password-grant endpoint:
-
-    POST https://api.ams.fortify.com/oauth/token
-    Content-Type: application/x-www-form-urlencoded
-
-    grant_type=password
-    scope=api-tenant
-    username=<FORTIFY_USERNAME>
-    password=<FORTIFY_PASSWORD>
-    security_code=
-    do_totp=false
-
-Usage:
-    from fortify_auth import fetch_token, refresh_token_in_env
-
-    token_info = fetch_token(cfg)
-    # → {"access_token": "...", "token_type": "Bearer", "expires_in": 28800, ...}
-
-    # Persist the new token back to .env automatically:
-    refresh_token_in_env(cfg, env_path=".env")
-"""
-
-from __future__ import annotations
-
-import re
-import time
-from pathlib import Path
-from typing import Optional
-
-import requests
-from loguru import logger
-
-from config import FortifyAIConfig
-
-# Fortify OAuth endpoint path (relative to fortify_base_url)
-_OAUTH_PATH = "/oauth/token"
-_REQUEST_TIMEOUT = 30  # seconds
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Core token fetch
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def fetch_token(
-    cfg: FortifyAIConfig,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-    scope: Optional[str] = None,
-) -> dict:
-    """
-    POST /oauth/token with password grant.
-
-    Parameters override .env values when provided — useful for one-off
-    token requests without modifying config.
-
-    Returns the full token response dict:
-        {
-            "access_token": "eyJ...",
-            "token_type":   "Bearer",
-            "expires_in":   28800,       # seconds (8 h typical)
-            "scope":        "api-tenant",
-            ...
-        }
-
-    Raises:
-        ValueError  — if required credentials are missing
-        requests.HTTPError — on non-2xx response from Fortify
-    """
-    resolved_username = username or cfg.fortify_username
-    resolved_password = password or cfg.fortify_password
-    resolved_scope    = scope    or cfg.fortify_scope or "api-tenant"
-
-    if not resolved_username:
-        raise ValueError(
-            "FORTIFY_USERNAME is required for OAuth token fetch. "
-            "Set it in .env or pass as a request parameter."
-        )
-    if not resolved_password:
-        raise ValueError(
-            "FORTIFY_PASSWORD is required for OAuth token fetch. "
-            "Set it in .env or pass as a request parameter."
-        )
-    if not cfg.fortify_base_url:
-        raise ValueError(
-            "FORTIFY_BASE_URL is required. Set it in .env."
-        )
-
-    url = cfg.fortify_base_url.rstrip("/") + _OAUTH_PATH
-
-    payload = {
-        "grant_type":    "password",
-        "scope":         resolved_scope,
-        "username":      resolved_username,
-        "password":      resolved_password,
-        "security_code": "",
-        "do_totp":       "false",
-    }
-
-    logger.info(
-        f"[FortifyAuth] Fetching OAuth token for user '{resolved_username}' "
-        f"scope='{resolved_scope}' → {url}"
-    )
-
-    t0 = time.time()
-    resp = requests.post(
-        url,
-        data=payload,                          # form-encoded, NOT JSON
-        headers={"Accept": "application/json"},
-        timeout=_REQUEST_TIMEOUT,
-    )
-
-    elapsed = round(time.time() - t0, 2)
-
-    if not resp.ok:
-        logger.error(
-            f"[FortifyAuth] ❌ Token fetch failed — "
-            f"HTTP {resp.status_code} ({elapsed}s): {resp.text[:300]}"
-        )
-        resp.raise_for_status()
-
-    token_data: dict = resp.json()
-    access_token = token_data.get("access_token", "")
-    expires_in   = token_data.get("expires_in", "?")
-
-    logger.info(
-        f"[FortifyAuth] ✅ Token obtained ({elapsed}s) — "
-        f"expires_in={expires_in}s  "
-        f"preview={access_token[:12]}..."
-    )
-
-    return token_data
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# .env writeback
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def write_token_to_env(token: str, env_path: str | Path = ".env") -> None:
-    """
-    Update FORTIFY_API_TOKEN in the .env file in-place.
-
-    - If the key already exists, the value is replaced on that line.
-    - If the key is absent, a new line is appended.
-    - A relative env_path is resolved against the directory containing
-      this file (fortify_auth.py), so it works regardless of the cwd
-      uvicorn was launched from.
-
-    The file is read and written as UTF-8; all other lines are untouched.
-    """
-    env_file = Path(env_path)
-    if not env_file.is_absolute():
-        # Resolve relative to the project root (same dir as this module)
-        env_file = (Path(__file__).parent / env_path).resolve()
-    original = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
-
-    key = "FORTIFY_API_TOKEN"
-    new_line = f'{key}={token}'
-    pattern = re.compile(rf"^{key}\s*=.*$", re.MULTILINE)
-
-    if pattern.search(original):
-        updated = pattern.sub(new_line, original)
-    else:
-        # Append — ensure there's a trailing newline before the new line
-        updated = original.rstrip("\n") + "\n" + new_line + "\n"
-
-    env_file.write_text(updated, encoding="utf-8")
-    logger.info(
-        f"[FortifyAuth] ✅ FORTIFY_API_TOKEN written to {env_file.resolve()} "
+        f"[FortifyAuth] OK FORTIFY_API_TOKEN written to {env_file.resolve()} "
         f"(preview: {token[:12]}...)"
     )
 
