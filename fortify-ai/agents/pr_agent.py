@@ -6,7 +6,7 @@ Responsibility:
   Pull Request via PyGithub with the full FortifyAI context.
 
 PR spec:
-  Title:   [FortifyAI] FORTIFY-a4105c54: Fix CVE-2024-38820 — spring-context 5.3.31 → 6.1.20
+  Title:   [FortifyAI] fortify-fix-147266-a4105c54: Fix CVE-2024-38820 — spring-context 5.3.31 → 6.1.20
   Labels:  security, dependency, auto-fix, <severity.lower()>
   Draft:   true  if confidence == "medium"
            false if confidence == "high"
@@ -275,8 +275,17 @@ def create_pull_request(
 
     # ── Build PR metadata ─────────────────────────────────────────────────────
     cve_short   = cves[0] if len(cves) == 1 else f"{cves[0]}+{len(cves)-1}" if cves else "CVE"
-    commit_id   = re.search(r"(FORTIFY-\w+)", branch_name)
-    jira_ref    = commit_id.group(1) if commit_id else branch_name
+    # Extract readable ref from branch name.
+    # New format: feature/fortify-fix-{releaseId}-{randId}  → fortify-fix-147266-a4105c54
+    # Legacy format: feature/FORTIFY-a4105c54_fix_YYYYMMDD  → FORTIFY-a4105c54
+    new_style = re.search(r"feature/(fortify-fix-[\w\-]+)", branch_name, re.IGNORECASE)
+    old_style  = re.search(r"(FORTIFY-\w+)", branch_name)
+    if new_style:
+        jira_ref = new_style.group(1)
+    elif old_style:
+        jira_ref = old_style.group(1)
+    else:
+        jira_ref = branch_name
     title       = (
         f"[FortifyAI] {jira_ref}: Fix {cve_short} — "
         f"{artifact_id} {current_ver} → {candidate}"
