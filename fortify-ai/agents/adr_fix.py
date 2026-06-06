@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,19 +41,18 @@ from loguru import logger
 from state import AgentState, AdrResult
 
 
-# ── Commit ID builder ─────────────────────────────────────────────────────────
+# ── Branch name builder ───────────────────────────────────────────────────────
 
-def _build_commit_id(group: dict, jira_prefix: str = "FORTIFY") -> str:
+def _build_branch_name(release_id: int) -> str:
     """
-    Build the JIRA-style commit ID for ADR's --commit flag.
+    Build the feature branch name passed to ADR's --commit flag.
 
-    Uses first 8 chars of the representative_vuln_id so the branch name is
-    stable and traceable back to the Fortify finding:
-      FORTIFY-a4105c54
+    Format: feature/fortify-fix-{releaseId}-{randId}
+      releaseId — Fortify SSC release ID
+      randId    — first 8 hex chars of a random UUID for uniqueness
     """
-    vuln_id = group.get("representative_vuln_id", "")
-    short = vuln_id.replace("-", "")[:8] if vuln_id else datetime.now().strftime("%Y%m%d")
-    return f"{jira_prefix}-{short}"
+    rand_id = uuid.uuid4().hex[:8]
+    return f"feature/fortify-fix-{release_id}-{rand_id}"
 
 
 # ── ADR stdout parser ─────────────────────────────────────────────────────────
@@ -243,17 +243,19 @@ def run_adr_fix(
     adr_path: str,
     project_path: str,
     jira_prefix: str = "FORTIFY",
+    release_id: int = 0,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
 
     Steps:
-      1. Build commit ID from vuln_id
+      1. Build branch name: feature/fortify-fix-{releaseId}-{randId}
       2. Log the doing-when preamble
       3. Invoke adr.py --commit --push
       4. Parse stdout for branch/commit/pdf/build_time
-      5. Log done-when result lines
-      6. Return AdrResult
+      5. Abort with success=False if ADR made 0 fixes (dep not found in poms)
+      6. Log done-when result lines
+      7. Return AdrResult
     """
     parsed = group["parsed"]
     artifact_id = parsed["artifact_id"]
@@ -262,24 +264,32 @@ def run_adr_fix(
         group.get("version_candidates", {}).get("candidates", ["?"])[0]
     )
 
-    commit_id = _build_commit_id(group, jira_prefix)
+    branch_name = _build_branch_name(release_id)
 
     # Build the target-versions payload for adr_fortify.py.
-    # Key format: "groupId:artifactId" — matches what pom.xml parse produces.
-    coord_key = f"{parsed['group_id']}:{parsed['artifact_id']}"
+    # Key format must match what adr_fortify.py produces when parsing pom.xml:
+    # "groupId:artifactId" — both sides come from the same Fortify primaryLocation.
+    # We also include an artifactId-only key as a fallback in case the pom parser
+    # resolves the groupId differently (e.g. via ${project.groupId} inheritance).
+    coord_key      = f"{parsed['group_id']}:{parsed['artifact_id']}"
+    coord_key_bare = parsed['artifact_id']   # fallback: match on artifactId alone
+
+    version_entry = {
+        "safe_version": candidate,
+        "severity":     group.get("severity", "High"),
+        "cve_id":       group.get("cves", [""])[0],
+    }
     target_versions = {
-        coord_key: {
-            "safe_version": candidate,
-            "severity":     group.get("severity", "High"),
-            "cve_id":       group.get("cves", [""])[0],
-        }
+        coord_key:      version_entry,
+        coord_key_bare: version_entry,   # bare artifactId fallback
     }
 
     logger.info(f"[ADR Fix] Applying {artifact_id} {current_version} → {candidate}")
-    logger.info(f"[ADR Fix] Commit ID: {commit_id}")
+    logger.info(f"[ADR Fix] Branch: {branch_name}")
+    logger.info(f"[ADR Fix] Target key: '{coord_key}' (bare fallback: '{coord_key_bare}')")
 
     success, stdout, stderr = invoke_adr(
-        adr_path, project_path, commit_id, target_versions=target_versions
+        adr_path, project_path, branch_name, target_versions=target_versions
     )
 
     if success:
@@ -371,9 +381,10 @@ def adr_fix_node(
         return state
 
     adr_results: list[dict] = []
+    release_id: int = state.get("release_id", 0)  # type: ignore[attr-defined]
 
     for group in groups:
-        result = run_adr_fix(group, adr_path, project_path, jira_prefix)
+        result = run_adr_fix(group, adr_path, project_path, jira_prefix, release_id=release_id)
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],
             "result": result,
