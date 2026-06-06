@@ -3,11 +3,10 @@
 // ── Page shell ────────────────────────────────────────────────────────────
 .page {
   padding: 32px 36px;
-  height: 100vh;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  overflow: hidden;
 }
 
 .page-header {
@@ -76,7 +75,7 @@
   grid-template-columns: 300px 1fr;
   gap: 16px;
   flex: 1;
-  min-height: 0;   // critical — lets flex children scroll independently
+  min-height: 480px;  // enough to show all 8 stages + some detail pane content
 }
 
 // ── Run list (left column) ────────────────────────────────────────────────
@@ -86,6 +85,8 @@
   gap: 8px;
   overflow-y: auto;
   padding-right: 2px;
+  max-height: calc(100vh - 260px);  // scrollable, but never taller than viewport minus header+form
+  align-self: start;  // don't stretch to grid height — size to content up to max-height
 }
 
 .run-card {
@@ -1399,6 +1400,7 @@
   border-left:  3px solid #1D9E75;
   border-radius: 10px;
   overflow:     hidden;
+  flex-shrink:  0;   // never compress — let run-list scroll instead
 
   &__head {
     display:     flex;
