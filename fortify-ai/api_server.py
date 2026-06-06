@@ -41,6 +41,8 @@ Execution Modes:
 
   UTILITY
     GET  /health                   — liveness probe
+    GET  /api/config               — read current .env config (tokens masked)
+    POST /api/config               — write fields back to .env
     GET  /config/validate          — validate current .env config
     GET  /releases                 — list releases for an app name
 
@@ -368,7 +370,7 @@ class FortifyWritebackRequest(BaseModel):
     groups: list[dict] = Field(..., description="Reasoned groups")
     adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix")
     pr_results: list[dict] = Field(default_factory=list)
-    output_dir: str = Field(default="/tmp/fortifyai")
+    output_dir: str = Field(default="")  # empty = read ADR_OUTPUT_DIR from .env at runtime
 
 
 # ── Partial pipeline ──────────────────────────────────────────────────────────
@@ -691,6 +693,144 @@ async def startup_event():
 def health():
     """Liveness probe — always returns 200 OK."""
     return {"ok": True, "service": "FortifyAI API"}
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Fields that the UI Settings page can read/write. All optional."""
+    gcp_project:                 Optional[str]   = None
+    vertex_model:                Optional[str]   = None
+    max_issues:                  Optional[int]   = None
+    max_tokens:                  Optional[int]   = None
+    confidence_high_threshold:   Optional[float] = None
+    confidence_medium_threshold: Optional[float] = None
+    planner_temp:                Optional[float] = None
+    generator_temp:              Optional[float] = None
+    max_critic_retries:          Optional[int]   = None
+    chroma_persist_dir:          Optional[str]   = None
+    embedding_model:             Optional[str]   = None
+    rag_top_k:                   Optional[int]   = None
+    sonar_host_url:              Optional[str]   = None
+    fortify_host_url:            Optional[str]   = None
+    adr_output_dir:              Optional[str]   = None
+    # Tokens — write-only; reading returns "***" if set, "" if empty
+    github_token:                Optional[str]   = None
+    sonar_token:                 Optional[str]   = None
+    fortify_token:               Optional[str]   = None
+
+
+def _mask(val: str) -> str:
+    """Return '***' when a secret is set, empty string when it isn't."""
+    return "***" if val else ""
+
+
+@app.get("/api/config", tags=["Utility"])
+def get_config():
+    """
+    Return current .env config values for the UI Settings page.
+    Secret tokens are masked as '***' (never returned in plain text).
+    adr_output_dir is always included so the UI knows where escalation
+    files are written without needing to hardcode the path.
+    """
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+    return {
+        "gcp_project":                 cfg.gcp_project,
+        "vertex_model":                getattr(cfg, "vertex_model", ""),
+        "max_issues":                  getattr(cfg, "max_issues", 1),
+        "max_tokens":                  getattr(cfg, "max_tokens", 8192),
+        "confidence_high_threshold":   getattr(cfg, "confidence_high_threshold", 0.80),
+        "confidence_medium_threshold": getattr(cfg, "confidence_medium_threshold", 0.50),
+        "planner_temperature":         getattr(cfg, "planner_temp", 0.1),
+        "generator_temperature":       getattr(cfg, "generator_temp", 0.3),
+        "max_critic_retries":          cfg.max_retries,
+        "chroma_persist_dir":          getattr(cfg, "chroma_persist_dir", ""),
+        "embedding_model":             getattr(cfg, "embedding_model", ""),
+        "rag_top_k":                   getattr(cfg, "rag_top_k", 3),
+        "sonar_host_url":              getattr(cfg, "sonar_host_url", ""),
+        "fortify_host_url":            cfg.fortify_base_url,
+        "adr_output_dir":              cfg.adr_output_dir,
+        # Tokens — masked
+        "github_token":                _mask(cfg.github_token),
+        "sonar_token":                 _mask(getattr(cfg, "sonar_token", "")),
+        "fortify_token":               _mask(cfg.fortify_api_token),
+    }
+
+
+@app.post("/api/config", tags=["Utility"])
+def save_config(req: ConfigUpdateRequest):
+    """
+    Persist Settings-page fields to .env.
+    Only non-None fields are written; existing keys not in the request
+    are left untouched. Tokens are only written when a non-empty string
+    is supplied (empty string or None = leave unchanged).
+    """
+    import re as _re
+
+    env_path = Path(".env")
+    # Read existing .env content, or start fresh
+    lines: list[str] = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+
+    # Map from request field → .env key name
+    field_map: dict[str, str] = {
+        "gcp_project":                 "GCP_PROJECT",
+        "vertex_model":                "VERTEX_MODEL",
+        "max_issues":                  "MAX_ISSUES",
+        "max_tokens":                  "MAX_TOKENS",
+        "confidence_high_threshold":   "CONFIDENCE_HIGH_THRESHOLD",
+        "confidence_medium_threshold": "CONFIDENCE_MEDIUM_THRESHOLD",
+        "planner_temp":                "PLANNER_TEMP",
+        "generator_temp":              "GENERATOR_TEMP",
+        "max_critic_retries":          "MAX_CRITIC_RETRIES",
+        "chroma_persist_dir":          "CHROMA_PERSIST_DIR",
+        "embedding_model":             "EMBEDDING_MODEL",
+        "rag_top_k":                   "RAG_TOP_K",
+        "sonar_host_url":              "SONAR_HOST_URL",
+        "fortify_host_url":            "FORTIFY_BASE_URL",
+        "adr_output_dir":              "ADR_OUTPUT_DIR",
+        "github_token":                "GITHUB_TOKEN",
+        "sonar_token":                 "SONAR_TOKEN",
+        "fortify_token":               "FORTIFY_API_TOKEN",
+    }
+
+    updates: dict[str, str] = {}
+    for field, env_key in field_map.items():
+        val = getattr(req, field, None)
+        if val is None:
+            continue
+        # For token fields: skip if empty string (keep existing value)
+        if field in ("github_token", "sonar_token", "fortify_token") and not str(val):
+            continue
+        updates[env_key] = str(val)
+
+    if not updates:
+        return {"message": "No fields to update"}
+
+    # Update existing lines in-place, collect keys already handled
+    handled: set[str] = set()
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        match = _re.match(r"^([A-Z0-9_]+)\s*=", stripped)
+        if match:
+            key = match.group(1)
+            if key in updates:
+                new_lines.append(f"{key}={updates[key]}")
+                handled.add(key)
+                continue
+        new_lines.append(line)
+
+    # Append keys that didn't exist yet
+    for key, val in updates.items():
+        if key not in handled:
+            new_lines.append(f"{key}={val}")
+
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return {"message": f"Saved {len(updates)} field(s) to .env", "updated": list(updates.keys())}
 
 
 @app.get("/config/validate", tags=["Utility"])
@@ -1705,10 +1845,13 @@ if __name__ == "__main__":
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/escalations", tags=["Escalations"])
-def list_fortify_escalations(output_dir: str = Query(default="/tmp/fortifyai")) -> dict:
-    """List all Fortify escalation .txt files from output_dir."""
+def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) -> dict:
+    """List all Fortify escalation .txt files.
+    Reads output directory from ADR_OUTPUT_DIR in .env; override via ?output_dir=.
+    """
     from pathlib import Path
-    esc_dir = Path(output_dir)
+    resolved_dir = output_dir or load_config().adr_output_dir
+    esc_dir = Path(resolved_dir)
     if not esc_dir.exists():
         return {"escalations": [], "total": 0}
 
@@ -1758,16 +1901,19 @@ def list_fortify_escalations(output_dir: str = Query(default="/tmp/fortifyai")) 
 @app.get("/escalations/{filename}", tags=["Escalations"])
 def get_fortify_escalation(
     filename: str,
-    output_dir: str = Query(default="/tmp/fortifyai")
+    output_dir: Optional[str] = Query(default=None)
 ) -> dict:
-    """Return the full text content of one Fortify escalation file."""
+    """Return the full text content of one Fortify escalation file.
+    Reads output directory from ADR_OUTPUT_DIR in .env; override via ?output_dir=.
+    """
     from pathlib import Path
     if "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    esc_path = Path(output_dir) / filename
+    resolved_dir = output_dir or load_config().adr_output_dir
+    esc_path = Path(resolved_dir) / filename
     if not esc_path.exists():
-        raise HTTPException(status_code=404, detail=f"Escalation {filename!r} not found in {output_dir!r}")
+        raise HTTPException(status_code=404, detail=f"Escalation {filename!r} not found in {resolved_dir!r}")
 
     stat = esc_path.stat()
     return {
@@ -1780,16 +1926,19 @@ def get_fortify_escalation(
 @app.delete("/escalations/{filename}", tags=["Escalations"])
 def delete_fortify_escalation(
     filename: str,
-    output_dir: str = Query(default="/tmp/fortifyai")
+    output_dir: Optional[str] = Query(default=None)
 ) -> dict:
-    """Delete a Fortify escalation file."""
+    """Delete a Fortify escalation file.
+    Reads output directory from ADR_OUTPUT_DIR in .env; override via ?output_dir=.
+    """
     from pathlib import Path
     if "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    esc_path = Path(output_dir) / filename
+    resolved_dir = output_dir or load_config().adr_output_dir
+    esc_path = Path(resolved_dir) / filename
     if not esc_path.exists():
-        raise HTTPException(status_code=404, detail=f"Escalation {filename!r} not found")
+        raise HTTPException(status_code=404, detail=f"Escalation {filename!r} not found in {resolved_dir!r}")
 
     esc_path.unlink()
     return {"message": f"Deleted {filename}", "ok": True}

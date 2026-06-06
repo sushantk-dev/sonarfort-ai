@@ -3,7 +3,6 @@ import { Component, inject, signal, OnInit, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ApiService } from '../../core/api.service';
 import { ApiConfigService } from '../../core/api-config.service';
-import { SettingsStateService } from '../../core/settings-state.service';
 
 // ── Shared escalation item shape ─────────────────────────────────────────────
 export interface EscalationItem {
@@ -30,9 +29,8 @@ export interface EscalationItem {
   styleUrl:    './escalations.component.scss',
 })
 export class EscalationsComponent implements OnInit {
-  private api      = inject(ApiService);
-  private apiCfg   = inject(ApiConfigService);
-  private settings = inject(SettingsStateService);
+  private api    = inject(ApiService);
+  private apiCfg = inject(ApiConfigService);
   /** Routes to Fortify server — separate port if configured, else shared */
   /** Fortify pipeline API (port 8001) — now has /escalations endpoint */
   private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
@@ -45,9 +43,6 @@ export class EscalationsComponent implements OnInit {
 
   // ── Fortify escalations ───────────────────────────────────────────────────
   fortifyItems = signal<EscalationItem[]>([]);
-
-  /** Reads ADR_OUTPUT_DIR from backend config (.env) via SettingsStateService */
-  fortifyOutputDir = computed(() => this.settings.cfg().adrOutputDir);
 
   // ── Active list — derived from source tab ─────────────────────────────────
   items = computed(() =>
@@ -93,7 +88,7 @@ export class EscalationsComponent implements OnInit {
   async loadFortify() {
     this.fortifyLoading.set(true);
     try {
-      const resp = await fetch(`${this.fortifyBase}/escalations?output_dir=${encodeURIComponent(this.fortifyOutputDir())}`);
+      const resp = await fetch(`${this.fortifyBase}/escalations`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
 
@@ -158,7 +153,7 @@ export class EscalationsComponent implements OnInit {
     this.loadingContent.set(true);
     try {
       const resp = await fetch(
-        `${this.fortifyBase}/escalations/${encodeURIComponent(item.filename)}?output_dir=${encodeURIComponent(this.fortifyOutputDir())}`
+        `${this.fortifyBase}/escalations/${encodeURIComponent(item.filename)}`
       );
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
@@ -200,7 +195,7 @@ export class EscalationsComponent implements OnInit {
   private async _deleteFortify(filename: string) {
     try {
       const resp = await fetch(
-        `${this.fortifyBase}/escalations/${encodeURIComponent(filename)}?output_dir=${encodeURIComponent(this.fortifyOutputDir())}`,
+        `${this.fortifyBase}/escalations/${encodeURIComponent(filename)}`,
         { method: 'DELETE' }
       );
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -243,7 +238,7 @@ export class EscalationsComponent implements OnInit {
   private async _downloadFortify(item: EscalationItem) {
     try {
       const resp = await fetch(
-        `${this.fortifyBase}/escalations/${encodeURIComponent(item.filename)}?output_dir=${encodeURIComponent(this.fortifyOutputDir())}`
+        `${this.fortifyBase}/escalations/${encodeURIComponent(item.filename)}`
       );
       const data = await resp.json();
       this._triggerDownload(data.content ?? '', item.filename, 'text/plain');
