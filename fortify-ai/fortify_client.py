@@ -75,7 +75,7 @@ class FortifyClient:
     """
 
     _PAGE_SIZE = 50          # items per page for paginated endpoints
-    _REQUEST_TIMEOUT = 100    # seconds per HTTP call
+    _REQUEST_TIMEOUT = 60    # seconds per HTTP call
 
     def __init__(self, base_url: str, api_token: str) -> None:
         self._base_url = base_url.rstrip("/")
@@ -85,6 +85,8 @@ class FortifyClient:
 
     @classmethod
     def from_config(cls, config: FortifyAIConfig) -> "FortifyClient":
+        from fortify_auth import ensure_token  # local import avoids circular dep
+        config = ensure_token(config)          # proactive refresh — no-op if fresh
         return cls(
             base_url=config.fortify_base_url,
             api_token=config.fortify_api_token,
@@ -118,6 +120,19 @@ class FortifyClient:
     def _url(self, path: str) -> str:
         """Build a full URL from a relative API path."""
         return urljoin(self._base_url + "/", path.lstrip("/"))
+
+    def _refresh_session(self, config: FortifyAIConfig) -> None:
+        """
+        Force-refresh the OAuth token and rebuild the session Authorization
+        header in-place.  Called automatically on 401 responses.
+        """
+        from fortify_auth import ensure_token, invalidate_cache
+        invalidate_cache(config)
+        config = ensure_token(config)
+        self._session.headers.update({
+            "Authorization": f"Bearer {config.fortify_api_token}",
+        })
+        logger.info("[FortifyClient] Session re-authorized with fresh token.")
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         """GET a single JSON response; raise on HTTP error."""
