@@ -348,6 +348,7 @@ class AdrFixRequest(BaseModel):
     adr_path: str = Field(..., description="Absolute path to adr.py")
     project_path: str = Field(..., description="Absolute path to Maven project root")
     jira_prefix: str = Field(default="FORTIFY")
+    release_id: int = Field(default=0, description="Fortify release ID — used in branch name (feature/fortify-fix-{releaseId}-{randId})")
 
 
 class AiCodeFixRequest(BaseModel):
@@ -640,6 +641,7 @@ def _run_full_pipeline(
                 group, adr_path=cfg.adr_path,
                 project_path=str(project_path),
                 jira_prefix=cfg.jira_id_prefix,
+                release_id=release_id,
             )
             adr_results.append({"artifact_id": artifact_id, "result": result})
     _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
@@ -1470,6 +1472,7 @@ def stage_adr_fix(req: AdrFixRequest):
                 group, adr_path=req.adr_path,
                 project_path=req.project_path,
                 jira_prefix=req.jira_prefix,
+                release_id=req.release_id,
             )
             results.append({"artifact_id": artifact_id, "result": result})
 
@@ -1734,6 +1737,7 @@ def _run_until(
                     group, adr_path=cfg.adr_path,
                     project_path=str(project_path),
                     jira_prefix=cfg.jira_id_prefix,
+                    release_id=release_id,
                 ),
             })
     _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
