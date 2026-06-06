@@ -755,6 +755,12 @@
 
     &--wide { flex: 2; }
     &--sm   { flex: 0 0 110px; min-width: unset; }
+
+    // Dry-run mode: 4 fields in one row — proportional widths, no wrapping
+    &--dryrun-id     { flex: 0 0 140px;  min-width: unset; }
+    &--dryrun-report { flex: 1 1 180px;  min-width: 0; }
+    &--dryrun-repo   { flex: 1 1 160px;  min-width: 0; }
+    &--dryrun-upg    { flex: 0 0 110px;  min-width: unset; }
   }
 
   &__input {

@@ -269,25 +269,25 @@
 
       <!-- DRY-RUN: release_id or report_path + repo, no side effects -->
       <ng-container *ngIf="fortifyMode() === 'dry-run'">
-        <div class="run-form__field run-form__field--sm">
+        <div class="run-form__field run-form__field--dryrun-id">
           <label>Release ID <span class="label-opt">or use report</span></label>
           <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
                  (input)="fortifyReleaseId.set($any($event.target).value)"
                  placeholder="e.g. 1723380">
         </div>
-        <div class="run-form__field run-form__field--wide">
+        <div class="run-form__field run-form__field--dryrun-report">
           <label>Report Path <span class="label-opt">optional, overrides release ID</span></label>
           <input class="run-form__input" [value]="fortifyReportPath()"
                  (input)="fortifyReportPath.set($any($event.target).value)"
                  placeholder="/tmp/report.json">
         </div>
-        <div class="run-form__field">
+        <div class="run-form__field run-form__field--dryrun-repo">
           <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
           <input class="run-form__input" [value]="fortifyGithubRepo()"
                  (input)="fortifyGithubRepo.set($any($event.target).value)"
                  placeholder="acme/backend">
         </div>
-        <div class="run-form__field run-form__field--sm">
+        <div class="run-form__field run-form__field--dryrun-upg">
           <label>Max Upgrades <span class="label-opt">0 = all</span></label>
           <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
                  (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
