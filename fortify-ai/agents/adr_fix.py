@@ -7,7 +7,7 @@ Responsibility:
 
   adr_fortify.py invocation:
     python <adr_path> <project_path> \\
-        --commit FORTIFY-<vuln_id_prefix> \\
+        --commit feature/fortify-fix-{releaseId}-{randId} \\
         --push \\
         --target-versions '{"groupId:artifactId": {"safe_version": "..."}}'
 
@@ -16,12 +16,12 @@ Responsibility:
 
   The JIRA/commit ID uses the first 8 chars of the representative_vuln_id from
   the Fortify API — e.g. FORTIFY-a4105c54 — matching the branch naming convention
-  in the ADR spec: feature/FORTIFY-a4105c54_fix_YYYYMMDD
+  in the ADR spec: feature/fortify-fix-{releaseId}-{randId}
 
 Console output (done-when):
   [ADR Fix] Applying spring-context 5.3.31 → 6.1.20
   [ADR Fix] ✅ Build passed (87s)
-  [ADR Fix] ✅ Branch: feature/FORTIFY-a4105c54_fix_20260517
+  [ADR Fix] ✅ Branch: feature/fortify-fix-1697672-c6266fa8
   [ADR Fix] ✅ Commit: 3f8a21bc
 """
 
@@ -45,19 +45,16 @@ from state import AgentState, AdrResult
 
 def _build_branch_name(release_id: int) -> str:
     """
-    Build the feature branch name.
+    Build the canonical feature branch name.
 
-    Full branch:  feature/fortify-fix-{releaseId}-{randId}
-    Commit ID:    fortify-fix-{releaseId}-{randId}   ← passed to adr_fortify.py --commit
+    Format: feature/fortify-fix-{releaseId}-{randId}
 
-    adr_fortify.py constructs the branch itself as:
-      feature/{jira_id}_fortify_fix_{YYYYMMDD}
-    So we pass only the ID portion; adr_fortify.py prepends 'feature/' and appends '_fortify_fix_DATE'.
-    We store the full expected branch name on this side for logging and as a fallback.
+    This value is passed verbatim to adr_fortify.py --commit.
+    adr_fortify.py detects the 'feature/' prefix and uses it as-is,
+    so both sides always produce the exact same branch name.
     """
-    rand_id   = uuid.uuid4().hex[:8]
-    commit_id = f"fortify-fix-{release_id}-{rand_id}"
-    return commit_id
+    rand_id = uuid.uuid4().hex[:8]
+    return f"feature/fortify-fix-{release_id}-{rand_id}"
 
 
 # ── ADR stdout parser ─────────────────────────────────────────────────────────
@@ -67,7 +64,7 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
     Extract structured data from ADR's stdout.
 
     ADR prints lines like:
-      Branch created: feature/FORTIFY-a4105c54_fix_20260517
+      Branch created: feature/fortify-fix-1697672-c6266fa8
       Commit: 3f8a21bc
       PDF report: /path/to/ADR_scan_report_20260517_143022.pdf
       Build passed in 87s
@@ -269,9 +266,7 @@ def run_adr_fix(
         group.get("version_candidates", {}).get("candidates", ["?"])[0]
     )
 
-    commit_id = _build_branch_name(release_id)
-    # adr_fortify.py builds:  feature/{jira_id}_fortify_fix_{YYYYMMDD}
-    expected_branch = f"feature/{commit_id}_fortify_fix_{datetime.now().strftime('%Y%m%d')}"
+    branch_name = _build_branch_name(release_id)
 
     # Build the target-versions payload for adr_fortify.py.
     # Key format must match what adr_fortify.py produces when parsing pom.xml:
@@ -292,11 +287,11 @@ def run_adr_fix(
     }
 
     logger.info(f"[ADR Fix] Applying {artifact_id} {current_version} → {candidate}")
-    logger.info(f"[ADR Fix] Commit ID: {commit_id}  →  expected branch: {expected_branch}")
+    logger.info(f"[ADR Fix] Branch: {branch_name}")
     logger.info(f"[ADR Fix] Target key: '{coord_key}' (bare fallback: '{coord_key_bare}')")
 
     success, stdout, stderr = invoke_adr(
-        adr_path, project_path, commit_id, target_versions=target_versions
+        adr_path, project_path, branch_name, target_versions=target_versions
     )
 
     if success:
@@ -322,7 +317,7 @@ def run_adr_fix(
                 error_reason=reason,
             )
 
-        branch = parsed_out["branch_name"] or expected_branch
+        branch = parsed_out["branch_name"] or branch_name  # use pre-built name as fallback
         commit = parsed_out["commit_hash"] or "unknown"
         pdf = parsed_out["pdf_path"]
         build_time = parsed_out["build_time_seconds"]
