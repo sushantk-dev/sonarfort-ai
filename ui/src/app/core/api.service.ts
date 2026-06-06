@@ -117,6 +117,7 @@ export interface BackendConfig {
   langchain_tracing:           boolean;
   parallel_issues:             boolean;
   enable_sonar_rescan:         boolean;
+  adr_output_dir:              string;
 }
 
 @Injectable({ providedIn: 'root' })

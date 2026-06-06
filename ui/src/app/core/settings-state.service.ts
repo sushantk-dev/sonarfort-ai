@@ -25,6 +25,7 @@ export interface AppConfig {
   chromaPath:     string;
   embeddingModel: string;
   ragTopK:        number;
+  adrOutputDir:   string;
 }
 
 export const VERTEX_MODELS = [
@@ -78,6 +79,7 @@ export class SettingsStateService {
     chromaPath:     './chroma_db',
     embeddingModel: 'text-embedding-005',
     ragTopK:        3,
+    adrOutputDir:   '/tmp/fortifyai',
   });
 
   // Which tokens are already set on the backend
@@ -149,6 +151,7 @@ export class SettingsStateService {
           chromaPath:     remote.chroma_persist_dir          || c.chromaPath,
           embeddingModel: remote.embedding_model             || c.embeddingModel,
           ragTopK:        remote.rag_top_k                   ?? c.ragTopK,
+          adrOutputDir:   remote.adr_output_dir              || c.adrOutputDir,
           // Tokens: keep empty — we show the masked placeholder UI instead
           githubToken:    '',
           sonarToken:     '',

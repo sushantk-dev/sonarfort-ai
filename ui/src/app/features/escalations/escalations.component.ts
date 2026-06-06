@@ -3,6 +3,7 @@ import { Component, inject, signal, OnInit, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ApiService } from '../../core/api.service';
 import { ApiConfigService } from '../../core/api-config.service';
+import { SettingsStateService } from '../../core/settings-state.service';
 
 // ── Shared escalation item shape ─────────────────────────────────────────────
 export interface EscalationItem {
@@ -29,8 +30,9 @@ export interface EscalationItem {
   styleUrl:    './escalations.component.scss',
 })
 export class EscalationsComponent implements OnInit {
-  private api    = inject(ApiService);
-  private apiCfg = inject(ApiConfigService);
+  private api      = inject(ApiService);
+  private apiCfg   = inject(ApiConfigService);
+  private settings = inject(SettingsStateService);
   /** Routes to Fortify server — separate port if configured, else shared */
   /** Fortify pipeline API (port 8001) — now has /escalations endpoint */
   private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
@@ -43,7 +45,9 @@ export class EscalationsComponent implements OnInit {
 
   // ── Fortify escalations ───────────────────────────────────────────────────
   fortifyItems = signal<EscalationItem[]>([]);
-  fortifyOutputDir = signal('/tmp/fortifyai');   // matches config.adr_output_dir default
+
+  /** Reads ADR_OUTPUT_DIR from backend config (.env) via SettingsStateService */
+  fortifyOutputDir = computed(() => this.settings.cfg().adrOutputDir);
 
   // ── Active list — derived from source tab ─────────────────────────────────
   items = computed(() =>
