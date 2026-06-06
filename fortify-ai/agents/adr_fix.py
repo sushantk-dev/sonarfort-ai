@@ -45,14 +45,19 @@ from state import AgentState, AdrResult
 
 def _build_branch_name(release_id: int) -> str:
     """
-    Build the feature branch name passed to ADR's --commit flag.
+    Build the feature branch name.
 
-    Format: feature/fortify-fix-{releaseId}-{randId}
-      releaseId — Fortify SSC release ID
-      randId    — first 8 hex chars of a random UUID for uniqueness
+    Full branch:  feature/fortify-fix-{releaseId}-{randId}
+    Commit ID:    fortify-fix-{releaseId}-{randId}   ← passed to adr_fortify.py --commit
+
+    adr_fortify.py constructs the branch itself as:
+      feature/{jira_id}_fortify_fix_{YYYYMMDD}
+    So we pass only the ID portion; adr_fortify.py prepends 'feature/' and appends '_fortify_fix_DATE'.
+    We store the full expected branch name on this side for logging and as a fallback.
     """
-    rand_id = uuid.uuid4().hex[:8]
-    return f"feature/fortify-fix-{release_id}-{rand_id}"
+    rand_id   = uuid.uuid4().hex[:8]
+    commit_id = f"fortify-fix-{release_id}-{rand_id}"
+    return commit_id
 
 
 # ── ADR stdout parser ─────────────────────────────────────────────────────────
@@ -264,7 +269,9 @@ def run_adr_fix(
         group.get("version_candidates", {}).get("candidates", ["?"])[0]
     )
 
-    branch_name = _build_branch_name(release_id)
+    commit_id = _build_branch_name(release_id)
+    # adr_fortify.py builds:  feature/{jira_id}_fortify_fix_{YYYYMMDD}
+    expected_branch = f"feature/{commit_id}_fortify_fix_{datetime.now().strftime('%Y%m%d')}"
 
     # Build the target-versions payload for adr_fortify.py.
     # Key format must match what adr_fortify.py produces when parsing pom.xml:
@@ -285,11 +292,11 @@ def run_adr_fix(
     }
 
     logger.info(f"[ADR Fix] Applying {artifact_id} {current_version} → {candidate}")
-    logger.info(f"[ADR Fix] Branch: {branch_name}")
+    logger.info(f"[ADR Fix] Commit ID: {commit_id}  →  expected branch: {expected_branch}")
     logger.info(f"[ADR Fix] Target key: '{coord_key}' (bare fallback: '{coord_key_bare}')")
 
     success, stdout, stderr = invoke_adr(
-        adr_path, project_path, branch_name, target_versions=target_versions
+        adr_path, project_path, commit_id, target_versions=target_versions
     )
 
     if success:
@@ -315,7 +322,7 @@ def run_adr_fix(
                 error_reason=reason,
             )
 
-        branch = parsed_out["branch_name"] or branch_name  # use pre-built name as fallback
+        branch = parsed_out["branch_name"] or expected_branch
         commit = parsed_out["commit_hash"] or "unknown"
         pdf = parsed_out["pdf_path"]
         build_time = parsed_out["build_time_seconds"]

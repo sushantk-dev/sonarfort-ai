@@ -1987,7 +1987,17 @@ def _prepare_git_branch(repo_root: str, jira_id: str, base_branch_override: str 
     NOTE: Call this BEFORE applying any file changes so the branch is the
     correct base for all modifications."""
     today  = datetime.now().strftime("%Y%m%d")
-    branch = f"feature/{jira_id}_fortify_fix_{today}"
+
+    # If jira_id is already a full branch name (starts with 'feature/') use it as-is.
+    # If it matches the FortifyAI commit-id pattern (fortify-fix-{id}-{rand}),
+    # build the canonical branch name from it.
+    # Otherwise fall back to the legacy format.
+    if jira_id.startswith("feature/"):
+        branch = jira_id
+    elif re.match(r"^fortify-fix-\d+-[0-9a-f]+$", jira_id):
+        branch = f"feature/{jira_id}_fortify_fix_{today}"
+    else:
+        branch = f"feature/{jira_id}_fortify_fix_{today}"
 
     # fetch is best-effort — temp clones created by the pipeline may have no remote
     try:
