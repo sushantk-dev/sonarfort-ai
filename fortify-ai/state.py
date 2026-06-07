@@ -45,6 +45,8 @@ class ApiDiffResult(TypedDict):
 class AiReasoningResult(TypedDict):
     safe: bool
     confidence: str                # "high" | "medium" | "low"
+    confidence_score: float        # 0.0–1.0  (high=1.0, medium=0.65, low=0.30)
+    confidence_pct: int            # 0–100   (confidence_score × 100, rounded)
     at_risk_lines: list[str]
     reason: str
     pre_fix_required: bool

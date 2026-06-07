@@ -61,23 +61,24 @@ interface PersistedFortifyRun {
 }
 
 export interface UiRun {
-  id:            string;
-  ruleKey:       string;
-  severity:      string;
-  component:     string;
-  steps:         PipelineStep[];
-  outcome?:      string;
-  confidence?:   ConfLabel;
-  prUrl?:        string;     // first PR — kept for Sonar backwards compat
-  prUrls?:       string[];   // all PRs — Fortify can fix multiple deps per run
-  ragHits?:      number;
-  retries?:      number;
-  live:          boolean;
-  status?:       'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'empty';
-  request?:      RunRequest;
-  fortifyRequest?: FortifyRunRequest;
-  source?:       'sonar' | 'fortify';
-  startedAt?:    number;   // epoch ms — for elapsed timer and history ordering
+  id:                 string;
+  ruleKey:            string;
+  severity:           string;
+  component:          string;
+  steps:              PipelineStep[];
+  outcome?:           string;
+  confidence?:        ConfLabel;
+  confidencePercent?: string;   // e.g. "65%" — derived from avg confidence_score
+  prUrl?:             string;     // first PR — kept for Sonar backwards compat
+  prUrls?:            string[];   // all PRs — Fortify can fix multiple deps per run
+  ragHits?:           number;
+  retries?:           number;
+  live:               boolean;
+  status?:            'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'empty';
+  request?:           RunRequest;
+  fortifyRequest?:    FortifyRunRequest;
+  source?:            'sonar' | 'fortify';
+  startedAt?:         number;   // epoch ms — for elapsed timer and history ordering
 }
 
 @Injectable({ providedIn: 'root' })
@@ -476,10 +477,11 @@ export class PipelineStateService {
     });
 
     const result = resp.result ?? {};
-    let outcome: string | undefined;
-    let prUrl:   string | undefined;
-    let prUrls:  string[] | undefined;
-    let confidence: ConfLabel | undefined;
+    let outcome:           string    | undefined;
+    let prUrl:             string    | undefined;
+    let prUrls:            string[]  | undefined;
+    let confidence:        ConfLabel | undefined;
+    let confidencePercent: string    | undefined;
 
     if (terminalStatus === 'done') {
       const prResults: any[] = result.pr_results ?? [];
@@ -501,7 +503,8 @@ export class PipelineStateService {
         const avgConf = scored.reduce(
           (sum: number, g: any) => sum + (g.ai_reasoning.confidence_score as number), 0
         ) / scored.length;
-        confidence = this.confLabel(avgConf);
+        confidence        = this.confLabel(avgConf);
+        confidencePercent = this.confPercent(avgConf);
       }
     }
 
@@ -509,12 +512,13 @@ export class PipelineStateService {
       if (r.id !== pipelineId) return r;
       const updated: UiRun = {
         ...r, steps,
-        status:     terminalStatus as any,
-        outcome:    outcome     ?? r.outcome,
-        prUrl:      prUrl       ?? r.prUrl,
-        prUrls:     prUrls      ?? r.prUrls,
-        confidence: confidence  ?? r.confidence,
-        startedAt:  r.startedAt ?? Date.now(),
+        status:            terminalStatus as any,
+        outcome:           outcome           ?? r.outcome,
+        prUrl:             prUrl             ?? r.prUrl,
+        prUrls:            prUrls            ?? r.prUrls,
+        confidence:        confidence        ?? r.confidence,
+        confidencePercent: confidencePercent ?? r.confidencePercent,
+        startedAt:         r.startedAt ?? Date.now(),
       };
       if (this.selected()?.id === pipelineId) this.selected.set(updated);
       // Persist to history on terminal state so it survives reload
@@ -657,15 +661,18 @@ export class PipelineStateService {
 
       const updated: UiRun = {
         ...r,
-        steps:      mergedSteps,
-        outcome:    noResults ? 'empty' : (first?.outcome ?? r.outcome),
-        confidence: first ? this.confLabel(first.confidence) : r.confidence,
-        prUrl:      first?.pr_url ?? r.prUrl,
-        status:     noResults ? 'empty' as any : status.status,
-        ruleKey:    first?.rule_key  ? first.rule_key  : r.ruleKey,
-        severity:   first?.severity  ? first.severity  : r.severity,
-        component:  first?.file_path ? first.file_path : r.component,
-        startedAt:  r.startedAt ?? Date.now(),
+        steps:             mergedSteps,
+        outcome:           noResults ? 'empty' : (first?.outcome ?? r.outcome),
+        confidence:        first ? this.confLabel(first.confidence) : r.confidence,
+        confidencePercent: first?.confidence != null
+                             ? this.confPercent(first.confidence)
+                             : r.confidencePercent,
+        prUrl:             first?.pr_url ?? r.prUrl,
+        status:            noResults ? 'empty' as any : status.status,
+        ruleKey:           first?.rule_key  ? first.rule_key  : r.ruleKey,
+        severity:          first?.severity  ? first.severity  : r.severity,
+        component:         first?.file_path ? first.file_path : r.component,
+        startedAt:         r.startedAt ?? Date.now(),
       };
 
       if (this.selected()?.id === runId) this.selected.set(updated);
@@ -700,18 +707,19 @@ export class PipelineStateService {
   private _explodeResults(runId: string, status: RunStatus) {
     const parentReq = this.runs().find(r => r.id === runId)?.request;
     const newCards: UiRun[] = status.results.map((r, i) => ({
-      id:         `${runId}-${i}`,
-      ruleKey:    r.rule_key,
-      severity:   r.severity,
-      component:  r.file_path,
-      outcome:    r.outcome,
-      confidence: this.confLabel(r.confidence),
-      prUrl:      r.pr_url ?? undefined,
-      steps:      status.steps ?? [],
-      live:       true,
-      status:     'done' as const,
-      request:    parentReq,
-      source:     'sonar' as const,
+      id:                `${runId}-${i}`,
+      ruleKey:           r.rule_key,
+      severity:          r.severity,
+      component:         r.file_path,
+      outcome:           r.outcome,
+      confidence:        this.confLabel(r.confidence),
+      confidencePercent: this.confPercent(r.confidence),
+      prUrl:             r.pr_url ?? undefined,
+      steps:             status.steps ?? [],
+      live:              true,
+      status:            'done' as const,
+      request:           parentReq,
+      source:            'sonar' as const,
     }));
     this.runs.update(rs => [...newCards, ...rs.filter(r => r.id !== runId)]);
     if (newCards[0]) this.selected.set(newCards[0]);
@@ -720,24 +728,27 @@ export class PipelineStateService {
   // ── Backend run hydration ─────────────────────────────────────────────────
   private _backendRunToUiRun(r: any): UiRun {
     const first = Array.isArray(r.results) ? r.results[0] : undefined;
-    const confLabel: ConfLabel = first?.confidence != null ? this.confLabel(first.confidence) : null;
+    const confScore: number | null = first?.confidence ?? null;
+    const confLabel: ConfLabel = confScore != null ? this.confLabel(confScore) : null;
+    const confPercent: string | undefined = confScore != null ? this.confPercent(confScore) : undefined;
     const steps: PipelineStep[] = Array.isArray(r.steps)
       ? r.steps.map((s: any) => ({ label: s.label ?? '', status: s.status ?? 'done', detail: s.detail ?? '', ms: s.ms ?? 0 }))
       : [];
     return {
-      id:         r.id ?? r.run_id,
-      ruleKey:    first?.rule_key  ?? '—',
-      severity:   first?.severity  ?? 'INFO',
-      component:  first?.file_path ?? '',
-      outcome:    first?.outcome   ?? (r.status === 'error' ? 'error' : undefined),
-      confidence: confLabel,
-      prUrl:      first?.pr_url    ?? undefined,
+      id:                r.id ?? r.run_id,
+      ruleKey:           first?.rule_key  ?? '—',
+      severity:          first?.severity  ?? 'INFO',
+      component:         first?.file_path ?? '',
+      outcome:           first?.outcome   ?? (r.status === 'error' ? 'error' : undefined),
+      confidence:        confLabel,
+      confidencePercent: confPercent,
+      prUrl:             first?.pr_url    ?? undefined,
       steps,
-      live:       false,
-      status:     r.status ?? 'done',
-      request:    r.request,
-      source:     r.source ?? 'sonar',
-      startedAt:  r.started_at ? new Date(r.started_at).getTime() : undefined,
+      live:              false,
+      status:            r.status ?? 'done',
+      request:           r.request,
+      source:            r.source ?? 'sonar',
+      startedAt:         r.started_at ? new Date(r.started_at).getTime() : undefined,
     };
   }
 
@@ -784,6 +795,11 @@ export class PipelineStateService {
     if (score >= 0.8) return 'HIGH';
     if (score >= 0.5) return 'MEDIUM';
     return 'LOW';
+  }
+
+  /** Convert a 0-1 confidence score to a percentage string, e.g. "65%" */
+  confPercent(score: number): string {
+    return `${Math.round(score * 100)}%`;
   }
 
   // ── Delete ────────────────────────────────────────────────────────────────

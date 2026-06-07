@@ -42,6 +42,15 @@ from loguru import logger
 
 from state import AgentState, AiReasoningResult
 
+# ── Confidence score mapping ──────────────────────────────────────────────────
+# Maps the LLM's categorical confidence string to a normalised 0-1 float.
+# These values drive confLabel() thresholds in the frontend (≥0.8 HIGH, ≥0.5 MEDIUM).
+CONFIDENCE_SCORE_MAP: dict[str, float] = {
+    "high":   1.0,
+    "medium": 0.65,
+    "low":    0.30,
+}
+
 # ── Prompt template ───────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
@@ -178,6 +187,9 @@ def _validate_result(data: dict, recommended_candidate: str) -> AiReasoningResul
     if confidence not in ("high", "medium", "low"):
         confidence = "medium"
 
+    confidence_score = CONFIDENCE_SCORE_MAP[confidence]
+    confidence_pct   = round(confidence_score * 100)
+
     at_risk = data.get("at_risk_lines", [])
     if not isinstance(at_risk, list):
         at_risk = []
@@ -190,6 +202,8 @@ def _validate_result(data: dict, recommended_candidate: str) -> AiReasoningResul
     return AiReasoningResult(
         safe=safe,
         confidence=confidence,
+        confidence_score=confidence_score,
+        confidence_pct=confidence_pct,
         at_risk_lines=at_risk,
         reason=reason,
         pre_fix_required=pre_fix,
@@ -216,9 +230,12 @@ def _heuristic_reasoning(
     affected = api_diff.get("affected_lines", [])
 
     if not has_breaking:
+        _score = CONFIDENCE_SCORE_MAP["high"]
         return AiReasoningResult(
             safe=True,
             confidence="high",
+            confidence_score=_score,
+            confidence_pct=round(_score * 100),
             at_risk_lines=[],
             reason=(
                 "No breaking API changes detected by japicmp. "
@@ -229,9 +246,12 @@ def _heuristic_reasoning(
         )
 
     if affected:
+        _score = CONFIDENCE_SCORE_MAP["medium"]
         return AiReasoningResult(
             safe=True,
             confidence="medium",
+            confidence_score=_score,
+            confidence_pct=round(_score * 100),
             at_risk_lines=affected,
             reason=(
                 f"Breaking API changes detected and {len(affected)} call site(s) "
@@ -241,9 +261,12 @@ def _heuristic_reasoning(
             recommended_candidate=candidate,
         )
 
+    _score = CONFIDENCE_SCORE_MAP["medium"]
     return AiReasoningResult(
         safe=True,
         confidence="medium",
+        confidence_score=_score,
+        confidence_pct=round(_score * 100),
         at_risk_lines=[],
         reason=(
             "Breaking API changes detected but none cross-referenced to calling code. "
@@ -360,7 +383,8 @@ def _log_result(
     )
     logger.info(
         f"               Safe: {result['safe']}  {safe_icon}   "
-        f"Confidence: {result['confidence']} {conf_icon}"
+        f"Confidence: {result['confidence']} {conf_icon}  "
+        f"({result['confidence_pct']}%  score={result['confidence_score']:.2f})"
     )
     logger.info(f"               Reason: {result['reason']}")
     if result["at_risk_lines"]:
@@ -414,6 +438,8 @@ def reason_all_groups(
             group["ai_reasoning"] = AiReasoningResult(
                 safe=False,
                 confidence="low",
+                confidence_score=CONFIDENCE_SCORE_MAP["low"],
+                confidence_pct=round(CONFIDENCE_SCORE_MAP["low"] * 100),
                 at_risk_lines=[],
                 reason="No safe version candidates available",
                 pre_fix_required=False,
