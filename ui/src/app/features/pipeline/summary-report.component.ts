@@ -647,7 +647,7 @@ const STAGE_LABELS: Record<string, string> = {
     }
     .dep-table__head {
       display: grid;
-      grid-template-columns: 26px minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);
+      grid-template-columns: 26px minmax(0,2fr) 70px 80px minmax(0,1.2fr) 130px;
       gap: 10px;
       padding: 8px 14px;
       background: var(--surface-2);
@@ -658,19 +658,26 @@ const STAGE_LABELS: Record<string, string> = {
     }
     .dep-row {
       display: grid;
-      grid-template-columns: 26px minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);
+      grid-template-columns: 26px minmax(0,2fr) 70px 80px minmax(0,1.2fr) 130px;
       gap: 10px;
-      align-items: center;
+      align-items: start;
       padding: 10px 14px;
       border-bottom: 1px solid var(--border);
       font-size: 13px;
     }
     .dep-row:last-child { border-bottom: none; }
-    .dep-row__icon { display: flex; align-items: center; }
+    .dep-row__icon {
+      display: flex;
+      align-items: center;
+      align-self: center;
+    }
     .dep-row__icon--fixed     { color: #3B6D11; }
     .dep-row__icon--escalated { color: #854F0B; }
     .dep-row__icon--failed    { color: #A32D2D; }
-    .dep-row__name { min-width: 0; }
+    .dep-row__name {
+      min-width: 0;
+      align-self: center;
+    }
     .dep-row__artifact {
       display: block;
       font-weight: 500;
@@ -687,9 +694,12 @@ const STAGE_LABELS: Record<string, string> = {
       white-space: nowrap;
       color: var(--text-muted);
     }
-    .dep-row__ver { color: var(--text-muted); }
+    .dep-row__ver {
+      color: var(--text-muted);
+      align-self: center;
+    }
     .dep-row__ver--ok { color: #0F6E56; }
-    .dep-row__cves { display: flex; flex-wrap: wrap; gap: 3px; }
+    .dep-row__cves { display: flex; flex-wrap: wrap; gap: 3px; align-self: start; }
     .cve-chip {
       font-size: 10px;
       padding: 1px 5px;
