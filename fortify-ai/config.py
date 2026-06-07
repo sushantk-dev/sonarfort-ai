@@ -13,14 +13,15 @@ from pydantic import Field
 
 class FortifyAIConfig(BaseSettings):
     # ── Pydantic v2 settings config ──────────────────────────────────────────
-    # SettingsConfigDict replaces the inner `class Config` (v1 pattern).
-    # The env_file here is just the default fallback; load_config() overrides
-    # it at runtime via _env_file= so the parent-directory .env is found first.
+    # Replaces the inner `class Config` (v1 pattern) so that _env_file passed
+    # in load_config() is actually honoured instead of silently ignored.
+    # extra="allow" preserves the original behaviour — any additional env vars
+    # not declared as fields are still accessible on the config object.
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore",
+        extra="allow",
     )
 
     # ── Fortify SSC ──────────────────────────────────────────────────────────
@@ -133,14 +134,14 @@ def load_config() -> FortifyAIConfig:
     """Load and validate config from the correct .env file.
 
     Search order:
-      1. ../env  — one level above this file (project root when code lives in a sub-folder)
-      2. .env    — current working directory (flat layout / fallback)
+      1. .env in the same directory as this file (alongside config.py)
+      2. .env in the current working directory (fallback)
 
-    Using SettingsConfigDict (pydantic-settings v2) means _env_file passed to
-    the constructor is honoured correctly, so whichever path is resolved here
-    is the one that actually gets read.
+    Using SettingsConfigDict (pydantic-settings v2) means _env_file passed
+    to the constructor is honoured correctly, so the resolved path is the
+    one that actually gets read.
     """
-    parent_env = Path(__file__).resolve().parent / ".env"
+    parent_env = Path(__file__).resolve().parent.parent / ".env"
     local_env  = Path(".env")
     env_path   = str(parent_env) if parent_env.exists() else str(local_env)
     return FortifyAIConfig(_env_file=env_path)
