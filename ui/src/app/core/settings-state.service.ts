@@ -17,7 +17,7 @@ export interface AppConfig {
   githubToken:    string;
   sonarToken:     string;
   sonarOrg:       string;
-  fortifyToken:   string;
+  fortifyApiToken:   string;
   fortifyHostUrl: string;
   plannerTemp:    number;
   generatorTemp:  number;
@@ -49,7 +49,7 @@ export const EMBEDDING_MODELS = [
 export interface TokenStatus {
   githubToken:  boolean;   // true = set in .env
   sonarToken:   boolean;
-  fortifyToken: boolean;
+  fortifyApiToken: boolean;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -71,7 +71,7 @@ export class SettingsStateService {
     githubToken:    '',
     sonarToken:     '',
     sonarOrg:       'https://sonarcloud.io',
-    fortifyToken:   '',
+    fortifyApiToken:   '',
     fortifyHostUrl: 'https://api.ams.fortify.com',
     plannerTemp:    0.1,
     generatorTemp:  0.3,
@@ -86,7 +86,7 @@ export class SettingsStateService {
   tokenStatus = signal<TokenStatus>({
     githubToken:  false,
     sonarToken:   false,
-    fortifyToken: false,
+    fortifyApiToken: false,
   });
 
   // Track which token fields the user is actively editing
@@ -132,7 +132,7 @@ export class SettingsStateService {
         this.tokenStatus.set({
           githubToken:  remote.github_token    === '***',
           sonarToken:   remote.sonar_token     === '***',
-          fortifyToken: remote.fortify_token   === '***',
+          fortifyApiToken: remote.fortify_api_token   === '***',
         });
 
         this.cfg.update(c => ({
@@ -155,7 +155,7 @@ export class SettingsStateService {
           // Tokens: keep empty — we show the masked placeholder UI instead
           githubToken:    '',
           sonarToken:     '',
-          fortifyToken:   '',
+          fortifyApiToken:   '',
                 }));
 
         // Sync UI fields from live apiCfg (may differ if loaded from localStorage)
@@ -215,8 +215,8 @@ export class SettingsStateService {
     if (editing.has('sonarToken') || (!this.tokenStatus().sonarToken && c.sonarToken)) {
       payload['sonar_token'] = c.sonarToken;
     }
-    if (editing.has('fortifyToken') || (!this.tokenStatus().fortifyToken && c.fortifyToken)) {
-      payload['fortify_token'] = c.fortifyToken;
+    if (editing.has('fortifyApiToken') || (!this.tokenStatus().fortifyApiToken && c.fortifyApiToken)) {
+      payload['fortify_api_token'] = c.fortifyApiToken;
     }
 
     // Always send sonar_host_url when it has a value
@@ -239,12 +239,12 @@ export class SettingsStateService {
           ...ts,
           ...(payload['github_token']  !== undefined ? { githubToken:  !!c.githubToken  } : {}),
           ...(payload['sonar_token']   !== undefined ? { sonarToken:   !!c.sonarToken   } : {}),
-          ...(payload['fortify_token'] !== undefined ? { fortifyToken: !!c.fortifyToken } : {}),
+          ...(payload['fortify_api_token'] !== undefined ? { fortifyApiToken: !!c.fortifyApiToken } : {}),
         }));
 
         // Clear editing state and token values after save
         this.editingTokens.set(new Set());
-        this.cfg.update(cc => ({ ...cc, githubToken: '', sonarToken: '', fortifyToken: '' }));
+        this.cfg.update(cc => ({ ...cc, githubToken: '', sonarToken: '', fortifyApiToken: '' }));
 
         // Reload backend config so new .env values take effect immediately
         // without needing a uvicorn restart
