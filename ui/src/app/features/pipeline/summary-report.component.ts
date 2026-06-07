@@ -549,6 +549,8 @@ const STAGE_LABELS: Record<string, string> = {
       padding: 14px 16px;
       border-radius: 8px;
       background: var(--surface-2);
+      min-width: 0;
+      overflow: hidden;
     }
     .stat-card__icon {
       width: 34px; height: 34px;
@@ -764,13 +766,13 @@ const STAGE_LABELS: Record<string, string> = {
     .stat-card--conf .stat-card__icon { background: #E6F1FB22; color: #185FA5; }
     .stat-card__value--conf {
       display: flex;
-      flex-direction: row;
-      align-items: baseline;
-      gap: 5px;
-      flex-wrap: nowrap;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1px;
+      min-width: 0;
     }
     .stat-card__value-sub {
-      font-size: 14px;
+      font-size: 12px;
       font-weight: 400;
       color: var(--text-muted);
       white-space: nowrap;
