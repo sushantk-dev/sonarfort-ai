@@ -5,6 +5,8 @@ All environment variables loaded via Pydantic BaseSettings.
 Copy .env.example → .env and fill in your values before running.
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
@@ -122,5 +124,12 @@ class FortifyAIConfig(BaseSettings):
 
 
 def load_config() -> FortifyAIConfig:
-    """Load and validate config. Raises ValidationError on missing required vars."""
-    return FortifyAIConfig()
+    """Load and validate config. Raises ValidationError on missing required vars.
+
+    Looks for .env in the parent directory first (../), then falls back to
+    .env in the current working directory.
+    """
+    parent_env = Path(__file__).resolve().parent.parent / ".env"
+    local_env = Path(".env")
+    env_path = str(parent_env) if parent_env.exists() else str(local_env)
+    return FortifyAIConfig(_env_file=env_path)
