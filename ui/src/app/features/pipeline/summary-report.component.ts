@@ -322,13 +322,15 @@ const STAGE_LABELS: Record<string, string> = {
 
                 <!-- Severity + confidence + PR -->
                 <div class="dep-row__meta">
-                  <span class="sev-badge sev-badge--{{ (dep.parsed?.severity || dep.severity || 'INFO').toLowerCase() }}">
-                    {{ dep.parsed?.severity || dep.severity || 'INFO' }}
-                  </span>
-                  <span *ngIf="dep._confidence != null"
-                        class="conf-chip conf-chip--{{ confidenceClass(dep._confidence >= 0.75 ? 'HIGH' : dep._confidence >= 0.45 ? 'MEDIUM' : 'LOW') }}">
-                    {{ (dep._confidence * 100).toFixed(0) }}%
-                  </span>
+                  <div class="dep-row__meta-badges">
+                    <span class="sev-badge sev-badge--{{ (dep.parsed?.severity || dep.severity || 'INFO').toLowerCase() }}">
+                      {{ dep.parsed?.severity || dep.severity || 'INFO' }}
+                    </span>
+                    <span *ngIf="dep._confidence != null"
+                          class="conf-chip conf-chip--{{ confidenceClass(dep._confidence >= 0.75 ? 'HIGH' : dep._confidence >= 0.45 ? 'MEDIUM' : 'LOW') }}">
+                      {{ (dep._confidence * 100).toFixed(0) }}%
+                    </span>
+                  </div>
                   <a *ngIf="dep._prUrl" [href]="dep._prUrl" target="_blank"
                      rel="noopener" class="pr-inline-link" title="Open PR">
                     <svg width="11" height="11" viewBox="0 0 13 13" fill="none">
@@ -707,17 +709,26 @@ const STAGE_LABELS: Record<string, string> = {
     /* Last column meta: severity + confidence + PR */
     .dep-row__meta {
       display: flex;
-      flex-wrap: wrap;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    .dep-row__meta-badges {
+      display: flex;
+      flex-direction: row;
       align-items: center;
       gap: 4px;
+      flex-wrap: nowrap;
     }
 
     /* Confidence chip */
     .conf-chip {
       font-size: 10px;
       font-weight: 500;
-      padding: 1px 5px;
+      padding: 2px 6px;
       border-radius: 3px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .conf-chip--high   { background: #EAF3DE; color: #3B6D11; border: 1px solid #97C459; }
     .conf-chip--medium { background: #FAEEDA; color: #854F0B; border: 1px solid #EF9F27; }
@@ -741,8 +752,19 @@ const STAGE_LABELS: Record<string, string> = {
 
     /* Confidence stat card */
     .stat-card--conf .stat-card__icon { background: #E6F1FB22; color: #185FA5; }
-    .stat-card__value--conf { display: flex; align-items: baseline; gap: 5px; }
-    .stat-card__value-sub { font-size: 13px; font-weight: 400; color: var(--text-muted); }
+    .stat-card__value--conf {
+      display: flex;
+      flex-direction: row;
+      align-items: baseline;
+      gap: 5px;
+      flex-wrap: nowrap;
+    }
+    .stat-card__value-sub {
+      font-size: 14px;
+      font-weight: 400;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
     .stat-card__value--conf.high   { color: #3B6D11; }
     .stat-card__value--conf.medium { color: #854F0B; }
     .stat-card__value--conf.low    { color: #A32D2D; }
