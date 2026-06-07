@@ -92,11 +92,16 @@ def ai_reasoning_agent(state: AgentState) -> AgentState:
     Iteration 7: ChatVertexAI safety judgment — high/medium/low confidence.
     Delegates to agents.ai_reasoning.ai_reasoning_node.
     """
-    gcp_project = state.get("_gcp_project")   # type: ignore[attr-defined]
-    gcp_location = state.get("_gcp_location")  # type: ignore[attr-defined]
+    gcp_project  = state.get("_gcp_project")                          # type: ignore[attr-defined]
+    gcp_location = state.get("_gcp_location", "us-central1")          # type: ignore[attr-defined]
+    vertex_model = state.get("_vertex_model", "gemini-2.5-flash")     # type: ignore[attr-defined]
+    max_tokens   = state.get("_max_tokens", 8192)                     # type: ignore[attr-defined]
     if gcp_project is None:
         return _stub("AiReasoning", state)
-    return ai_reasoning_node(state, gcp_project, gcp_location or "us-central1")
+    return ai_reasoning_node(
+        state, gcp_project, gcp_location or "us-central1",
+        vertex_model=vertex_model, max_tokens=max_tokens,
+    )
 
 
 def adr_fix_agent(state: AgentState) -> AgentState:
@@ -129,12 +134,17 @@ def ai_code_fix_agent(state: AgentState) -> AgentState:
     Iteration 9b: AI-generated patch for broken call sites after upgrade.
     Delegates to agents.ai_code_fix.ai_code_fix_node.
     """
-    project_path = state.get("_project_path")  # type: ignore[attr-defined]
-    gcp_project = state.get("_gcp_project", "")  # type: ignore[attr-defined]
-    gcp_location = state.get("_gcp_location", "us-central1")  # type: ignore[attr-defined]
+    project_path = state.get("_project_path")                          # type: ignore[attr-defined]
+    gcp_project  = state.get("_gcp_project", "")                      # type: ignore[attr-defined]
+    gcp_location = state.get("_gcp_location", "us-central1")          # type: ignore[attr-defined]
+    vertex_model = state.get("_vertex_model", "gemini-2.5-flash")     # type: ignore[attr-defined]
+    max_tokens   = state.get("_max_tokens", 8192)                     # type: ignore[attr-defined]
     if project_path is None:
         return _stub("AiCodeFix", state)
-    return ai_code_fix_node(state, project_path, gcp_project, gcp_location)
+    return ai_code_fix_node(
+        state, project_path, gcp_project, gcp_location,
+        vertex_model=vertex_model, max_tokens=max_tokens,
+    )
 
 
 def pr_agent(state: AgentState) -> AgentState:
@@ -218,7 +228,7 @@ def route_build_result(
         return "pr_agent"
     # Build failed — check retry budget
     retry_count = state.get("retry_count", 0)
-    max_retries = 3  # matches config default; Iteration 9 will read from config
+    max_retries = state.get("_max_retries", 3)  # type: ignore[attr-defined]
     if retry_count >= max_retries:
         return "escalate"
     return "failure_analysis"

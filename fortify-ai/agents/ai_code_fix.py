@@ -278,6 +278,8 @@ def ai_code_fix_node(
     project_path: str,
     gcp_project: str,
     gcp_location: str,
+    vertex_model: str = "gemini-2.5-flash",
+    max_tokens: int = 8192,
 ) -> AgentState:
     """
     LangGraph node: ai_code_fix.
@@ -287,6 +289,10 @@ def ai_code_fix_node(
             state["_reasoned_groups"]   (or _diff_groups)
     Writes: state["ai_code_fix_applied"]
             state["audit_trail"]
+
+    vertex_model: model name from VERTEX_MODEL config
+    max_tokens:   max output tokens from MAX_TOKENS config (use \u22654096 for
+                  multi-patch JSON responses to avoid silent truncation)
     """
     groups: list[dict] = (
         state.get("_reasoned_groups")  # type: ignore[attr-defined]
@@ -301,11 +307,12 @@ def ai_code_fix_node(
         state["ai_code_fix_applied"] = False
         return state
 
-    # Build LLM (reuse ai_reasoning builder).
-    # Use 4096 tokens — multi-patch JSON responses silently truncate at 1024,
-    # causing json.loads() to fail and all patches to be dropped (Gap 2 fix).
+    # Build LLM using the configured model and token limit.
+    # max_tokens should be \u22654096 for this agent — multi-patch JSON responses
+    # silently truncate at lower limits, causing json.loads() to fail and all
+    # patches to be dropped.
     from agents.ai_reasoning import _build_llm
-    llm = _build_llm(gcp_project, gcp_location, max_output_tokens=4096)
+    llm = _build_llm(gcp_project, gcp_location, model_name=vertex_model, max_output_tokens=max_tokens)
 
     proj = Path(project_path)
     any_applied = False
