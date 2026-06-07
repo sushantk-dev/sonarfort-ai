@@ -567,18 +567,6 @@
               {{ run.confidence ?? '—' }}
             </span>
           </div>
-          <!-- Summary shortcut — appears once run is terminal -->
-          <ng-container *ngIf="run.status === 'done' || run.status === 'error'">
-            <div class="fortify-meta-bar__sep"></div>
-            <a [routerLink]="['/pipeline/summary', run.id]"
-               class="fortify-meta-bar__summary-link">
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-                <rect x="1" y="1" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.2"/>
-                <path d="M3 4h6M3 6h4M3 8h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
-              </svg>
-              Summary
-            </a>
-          </ng-container>
         </div>
 
         <!-- Step trace -->
@@ -633,9 +621,23 @@
             {{ outcomeIcon(run.outcome) }}
           </div>
           <div class="outcome__body">
-            <div class="outcome__title">{{ outcomeTitle(run.outcome) }}</div>
-            <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank"
-               class="outcome__link">{{ run.prUrl }}</a>
+            <div class="outcome__title">
+              {{ outcomeTitle(run.outcome) }}
+              <span *ngIf="run.prUrls && run.prUrls.length > 1"
+                    class="outcome__pr-count">{{ run.prUrls.length }} PRs</span>
+            </div>
+            <!-- Multiple PRs (Fortify fixes several deps) -->
+            <ng-container *ngIf="run.prUrls && run.prUrls.length > 0; else singlePr">
+              <div class="outcome__pr-list">
+                <a *ngFor="let url of run.prUrls"
+                   [href]="url" target="_blank" class="outcome__link">{{ url }}</a>
+              </div>
+            </ng-container>
+            <!-- Fallback: single prUrl (Sonar / legacy) -->
+            <ng-template #singlePr>
+              <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank"
+                 class="outcome__link">{{ run.prUrl }}</a>
+            </ng-template>
           </div>
           <!-- Summary report link — Fortify runs only -->
           <a *ngIf="run.source === 'fortify' && (run.status === 'done' || run.status === 'error')"

@@ -68,7 +68,8 @@ export interface UiRun {
   steps:         PipelineStep[];
   outcome?:      string;
   confidence?:   ConfLabel;
-  prUrl?:        string;
+  prUrl?:        string;     // first PR — kept for Sonar backwards compat
+  prUrls?:       string[];   // all PRs — Fortify can fix multiple deps per run
   ragHits?:      number;
   retries?:      number;
   live:          boolean;
@@ -97,11 +98,13 @@ export class PipelineStateService {
 
   /**
    * Set to the pipeline_id of the most recently completed (or errored) Fortify
-   * run. Components can watch this signal with effect() and navigate to the
-   * summary report page when it becomes non-null.
-   * Reset to null by calling clearLastCompleted().
+   * run. PipelineComponent watches this with effect() and navigates to the
+   * summary report. Reset by calling clearLastCompleted() after navigation.
    */
   lastCompletedFortifyId = signal<string | null>(null);
+
+  /** Call after navigating so the effect doesn't re-trigger on revisit. */
+  clearLastCompleted() { this.lastCompletedFortifyId.set(null); }
 
   private _activeRunId: string | null = null;
   private _poll?: Subscription;
@@ -474,24 +477,32 @@ export class PipelineStateService {
 
     const result = resp.result ?? {};
     let outcome: string | undefined;
-    let prUrl: string | undefined;
+    let prUrl:   string | undefined;
+    let prUrls:  string[] | undefined;
     let confidence: ConfLabel | undefined;
 
     if (terminalStatus === 'done') {
       const prResults: any[] = result.pr_results ?? [];
-      const fixed     = prResults.filter((p: any) => p?.pr_url).length;
+      const allUrls = prResults.map((p: any) => p?.pr_url).filter(Boolean) as string[];
+      const fixed     = allUrls.length;
       const escalated = result.total_escalated ?? 0;
       outcome = fixed > 0 ? 'pr_opened' : escalated > 0 ? 'escalated' : 'empty';
-      prUrl   = prResults[0]?.pr_url ?? undefined;
+      prUrl   = allUrls[0];
+      prUrls  = allUrls.length > 0 ? allUrls : undefined;
     } else if (terminalStatus === 'error') {
       outcome = 'error';
     }
 
     if (result.groups?.length) {
-      const avgConf = result.groups.reduce(
-        (sum: number, g: any) => sum + (g.ai_reasoning?.confidence_score ?? 0), 0
-      ) / result.groups.length;
-      confidence = this.confLabel(avgConf);
+      const scored = (result.groups as any[]).filter(
+        (g: any) => g.ai_reasoning?.confidence_score != null
+      );
+      if (scored.length > 0) {
+        const avgConf = scored.reduce(
+          (sum: number, g: any) => sum + (g.ai_reasoning.confidence_score as number), 0
+        ) / scored.length;
+        confidence = this.confLabel(avgConf);
+      }
     }
 
     this.runs.update(rs => rs.map(r => {
@@ -501,6 +512,7 @@ export class PipelineStateService {
         status:     terminalStatus as any,
         outcome:    outcome     ?? r.outcome,
         prUrl:      prUrl       ?? r.prUrl,
+        prUrls:     prUrls      ?? r.prUrls,
         confidence: confidence  ?? r.confidence,
         startedAt:  r.startedAt ?? Date.now(),
       };
@@ -508,7 +520,7 @@ export class PipelineStateService {
       // Persist to history on terminal state so it survives reload
       if (terminalStatus === 'done' || terminalStatus === 'error') {
         this._saveRunToHistory(updated);
-        // Signal to interested components (e.g. pipeline page) that this run finished
+        // Signal to PipelineComponent to navigate to the summary report page
         this.lastCompletedFortifyId.set(pipelineId);
       }
       return updated;
@@ -749,9 +761,6 @@ export class PipelineStateService {
   }
 
   // ── Shared helpers ────────────────────────────────────────────────────────
-  /** Reset after the component has navigated so it doesn't re-trigger on revisit. */
-  clearLastCompleted() { this.lastCompletedFortifyId.set(null); }
-
   select(run: UiRun)   { this.selected.set(run); }
   doneCnt(run: UiRun)  { return run.steps.filter(s => s.status === 'done').length; }
   confClass(c: ConfLabel | string | undefined) { return (c ?? '').toLowerCase(); }
