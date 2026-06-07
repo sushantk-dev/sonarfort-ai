@@ -103,7 +103,7 @@ export interface BackendConfig {
   github_repo:                 string;
   sonar_token:                 string;
   sonar_host_url:              string;
-  fortify_token:               string;
+  fortify_api_token:               string;
   fortify_host_url:            string;
   planner_temperature:         number;
   generator_temperature:       number;
