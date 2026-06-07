@@ -1,7 +1,8 @@
 // src/app/features/pipeline/pipeline.component.ts
-import { Component, inject, signal, computed } from '@angular/core';
+import { Component, inject, signal, computed, effect } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
 import { PipelineStateService, UiRun, RunRequest } from '../../core/pipeline-state.service';
 import { ApiConfigService } from '../../core/api-config.service';
 import { SevClassPipe }    from '../../shared/sev-class.pipe';
@@ -29,6 +30,19 @@ const ENDPOINT_MAP: Record<FortifyMode, string> = {
 export class PipelineComponent {
   state    = inject(PipelineStateService);
   private apiCfg = inject(ApiConfigService);
+  private router  = inject(Router);
+
+  constructor() {
+    // When a Fortify pipeline run completes (or errors), automatically navigate
+    // to the summary report page so the user sees results immediately.
+    effect(() => {
+      const completedId = this.state.lastCompletedFortifyId();
+      if (completedId) {
+        this.state.clearLastCompleted();
+        this.router.navigate(['/pipeline/summary', completedId]);
+      }
+    });
+  }
 
   // ── Source tab: 'sonar' | 'fortify' | 'both' ─────────────────────────────
   activeSource = signal<'sonar' | 'fortify'>('sonar');

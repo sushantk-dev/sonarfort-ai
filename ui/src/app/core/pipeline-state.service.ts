@@ -95,6 +95,14 @@ export class PipelineStateService {
   running  = signal(false);
   error    = signal<string | null>(null);
 
+  /**
+   * Set to the pipeline_id of the most recently completed (or errored) Fortify
+   * run. Components can watch this signal with effect() and navigate to the
+   * summary report page when it becomes non-null.
+   * Reset to null by calling clearLastCompleted().
+   */
+  lastCompletedFortifyId = signal<string | null>(null);
+
   private _activeRunId: string | null = null;
   private _poll?: Subscription;
 
@@ -500,6 +508,8 @@ export class PipelineStateService {
       // Persist to history on terminal state so it survives reload
       if (terminalStatus === 'done' || terminalStatus === 'error') {
         this._saveRunToHistory(updated);
+        // Signal to interested components (e.g. pipeline page) that this run finished
+        this.lastCompletedFortifyId.set(pipelineId);
       }
       return updated;
     }));
@@ -739,6 +749,9 @@ export class PipelineStateService {
   }
 
   // ── Shared helpers ────────────────────────────────────────────────────────
+  /** Reset after the component has navigated so it doesn't re-trigger on revisit. */
+  clearLastCompleted() { this.lastCompletedFortifyId.set(null); }
+
   select(run: UiRun)   { this.selected.set(run); }
   doneCnt(run: UiRun)  { return run.steps.filter(s => s.status === 'done').length; }
   confClass(c: ConfLabel | string | undefined) { return (c ?? '').toLowerCase(); }
