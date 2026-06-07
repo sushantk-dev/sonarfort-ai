@@ -593,15 +593,21 @@ def _run_full_pipeline(
 
     # Stage 1 — triage
     t = _stage_start("triage")
-    groups = group_by_dependency(raw_vulns)
+    groups, triage_skipped = group_by_dependency(raw_vulns)
     groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
     if not groups:
-        _stage_done("triage", t, {"groups_count": 0})
+        _stage_done("triage", t, {
+            "total_groups": 0, "groups_count": 0,
+            "total_skipped": triage_skipped,
+        })
         for s in ["version-resolver", "context", "api-diff",
                   "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback"]:
             _stage_skip(s)
         return {"status": "skipped", "reason": "No actionable findings"}
-    _stage_done("triage", t, {"groups_count": len(groups)})
+    _stage_done("triage", t, {
+        "total_groups": len(groups), "groups_count": len(groups),
+        "total_skipped": triage_skipped,
+    })
 
     # Stage 2 — version resolver
     t = _stage_start("version-resolver")
@@ -1374,9 +1380,12 @@ def stage_triage(req: TriageRequest):
     t0 = time.time()
     try:
         from agents.triage import group_by_dependency, apply_max_upgrades
-        groups = group_by_dependency(req.raw_vulnerabilities)
+        groups, skipped = group_by_dependency(req.raw_vulnerabilities)
         groups = apply_max_upgrades(groups, req.max_upgrades)
-        return ok({"groups": groups, "count": len(groups)}, time.time() - t0)
+        return ok({
+            "groups": groups, "count": len(groups),
+            "total_groups": len(groups), "total_skipped": skipped,
+        }, time.time() - t0)
     except Exception as exc:
         return err(str(exc), exc)
 
@@ -1696,11 +1705,14 @@ def _run_until(
 
     # Stage 0 — triage
     t = _s_start("triage")
-    groups = group_by_dependency(raw_vulns)
+    groups, triage_skipped = group_by_dependency(raw_vulns)
     groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
     result["groups"] = groups
     result["groups_count"] = len(groups)
-    _s_done("triage", t, {"groups_count": len(groups)})
+    _s_done("triage", t, {
+        "total_groups": len(groups), "groups_count": len(groups),
+        "total_skipped": triage_skipped,
+    })
     if idx == 0 or not groups:
         for s in STAGE_ORDER[1:]:
             _s_skip(s)

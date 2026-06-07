@@ -71,10 +71,12 @@ def should_skip(vuln: dict) -> tuple[bool, str]:
 
 # ── Grouping ──────────────────────────────────────────────────────────────────
 
-def group_by_dependency(vulns: list[dict]) -> list[dict[str, Any]]:
+def group_by_dependency(vulns: list[dict]) -> tuple[list[dict[str, Any]], int]:
     """
     Group valid vulnerabilities by primaryLocation.
-    Returns one record per unique dep, with all CVEs and vuln_ids collected.
+    Returns (groups, skipped_count) where groups is one record per unique dep
+    with all CVEs and vuln_ids collected, and skipped_count is the number of
+    findings filtered out by the triage rules.
     """
     dep_map: dict[str, dict[str, Any]] = {}
 
@@ -149,7 +151,7 @@ def group_by_dependency(vulns: list[dict]) -> list[dict[str, Any]]:
             f"✅ {cve_count} {cve_word} — proceed"
         )
 
-    return groups
+    return groups, skipped_count
 
 
 def apply_max_upgrades(groups: list[dict[str, Any]], max_upgrades: int) -> list[dict[str, Any]]:
@@ -214,7 +216,7 @@ def triage_node(state: AgentState) -> AgentState:
         })
         return state
 
-    groups = group_by_dependency(raw)
+    groups, skipped_count = group_by_dependency(raw)
 
     if not groups:
         logger.warning("[Triage] All findings filtered out — nothing to remediate")
@@ -225,6 +227,7 @@ def triage_node(state: AgentState) -> AgentState:
             "status": "skipped",
             "reason": state["skip_reason"],
             "input_count": len(raw),
+            "skipped_count": skipped_count,
         })
         return state
 
@@ -239,6 +242,7 @@ def triage_node(state: AgentState) -> AgentState:
         "status": "ok",
         "input_count": len(raw),
         "output_groups": len(groups),
+        "skipped_count": skipped_count,
         "max_upgrades": max_upgrades or "unlimited",
         "deps": [g["parsed"]["artifact_id"] for g in groups],
     })
