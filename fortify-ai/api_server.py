@@ -71,6 +71,20 @@ from pydantic import BaseModel, Field
 from config import FortifyAIConfig, load_config
 from state import AgentState
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _resolve_env_path() -> Path:
+    """
+    Return the same .env path that load_config() resolves:
+      1. One level above this file (project root when code lives in a sub-folder)
+      2. Fallback: .env in the current working directory
+    Used by auth_token and save_config so token writes land in the right file.
+    """
+    parent_env = Path(__file__).resolve().parent.parent / ".env"
+    local_env  = Path(".env")
+    return parent_env if parent_env.exists() else local_env
+
 # ── Pipeline job store ────────────────────────────────────────────────────────
 # Keyed by pipeline_id (str UUID).  Each entry:
 #   {
@@ -689,7 +703,17 @@ def _run_full_pipeline(
 
 @app.on_event("startup")
 async def startup_event():
-    auth_token()
+    """Fetch a fresh Fortify Bearer token at boot and write it to the parent .env."""
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(_EXECUTOR, auth_token)
+        if isinstance(result, dict) and result.get("ok"):
+            print("[Startup] Fortify token fetched and written to .env")
+        else:
+            print(f"[Startup] Fortify token fetch skipped or failed: {result}")
+    except Exception as exc:
+        # Non-fatal — server still starts; token can be fetched via POST /auth/token
+        print(f"[Startup] Fortify token fetch error (non-fatal): {exc}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITY ENDPOINTS
@@ -774,7 +798,7 @@ def save_config(req: ConfigUpdateRequest):
     """
     import re as _re
 
-    env_path = Path(".env")
+    env_path = _resolve_env_path()
     # Read existing .env content, or start fresh
     lines: list[str] = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
 
@@ -900,6 +924,14 @@ def auth_token(req: Optional[AuthTokenRequest] = None):
         # req is fully optional — all fields fall back to .env values when absent
         _req = req or AuthTokenRequest()
         cfg  = load_config()
+
+        # Resolve the same .env that load_config() uses so the token is written
+        # to the correct file (parent dir), not a bare ".env" in the cwd.
+        if _req.env_path == ".env":
+            resolved_env_path = str(_resolve_env_path())
+        else:
+            resolved_env_path = _req.env_path  # honour explicit caller override
+
         token_data = fetch_token(
             cfg,
             username=_req.username,
@@ -907,14 +939,14 @@ def auth_token(req: Optional[AuthTokenRequest] = None):
             scope=_req.scope,
         )
         if _req.write_to_env and token_data.get("access_token"):
-            write_token_to_env(token_data["access_token"], env_path=_req.env_path)
+            write_token_to_env(token_data["access_token"], env_path=resolved_env_path)
         return ok({
             "access_token":   token_data.get("access_token"),
             "token_type":     token_data.get("token_type", "Bearer"),
             "expires_in":     token_data.get("expires_in"),
             "scope":          token_data.get("scope"),
             "written_to_env": _req.write_to_env,
-            "env_path":       _req.env_path,
+            "env_path":       resolved_env_path,
         }, _time.time() - t0)
     except Exception as exc:
         return err(str(exc), exc)
