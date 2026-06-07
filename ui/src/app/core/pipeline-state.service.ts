@@ -19,6 +19,7 @@ const FORTIFY_STAGE_LABELS: Record<string, string> = {
   'api-diff':           'API Diff',
   'ai-reasoning':       'AI Reasoning',
   'adr-fix':            'ADR Fix',
+  'ai-code-fix':        'AI Code Fix',
   'pr-agent':           'PR Agent',
   'fortify-writeback':  'Fortify Writeback',
 };
