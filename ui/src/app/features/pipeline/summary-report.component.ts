@@ -21,11 +21,26 @@ interface DepGroup {
   current_candidate?: string;
   version_candidates?: { candidates?: string[] };
   escalate_reason?: string;
+  next_node?:       string;
   ai_reasoning?: {
-    confidence_score?: number;
-    reasoning?:        string;
+    confidence_score?:    number;
+    reasoning?:           string;
+    recommended_version?: string;
   };
   _outcome?: 'fixed' | 'escalated' | 'failed';
+}
+
+interface AdrEntry {
+  artifact_id: string;
+  result?: {
+    success?:       boolean;
+    branch_name?:   string;
+    error_reason?:  string;
+  };
+  // sometimes the result fields are inlined directly
+  success?:      boolean;
+  branch_name?:  string;
+  error_reason?: string;
 }
 
 interface PrResult {
@@ -46,6 +61,7 @@ interface PipelineResult {
   total_failed?:    number;
   release_id?:      number;
   groups?:          DepGroup[];
+  adr_results?:     AdrEntry[];
   pr_results?:      PrResult[];
 }
 
@@ -181,6 +197,28 @@ const STAGE_LABELS: Record<string, string> = {
               <span class="stat-card__value">{{ totalDeps() }}</span>
             </div>
           </div>
+
+          <div class="stat-card stat-card--conf">
+            <div class="stat-card__icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M5.5 8.5C5.5 8.5 6.5 10 8 10C9.5 10 10.5 8.5 10.5 8.5"
+                      stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                <circle cx="6" cy="6.5" r=".8" fill="currentColor"/>
+                <circle cx="10" cy="6.5" r=".8" fill="currentColor"/>
+              </svg>
+            </div>
+            <div class="stat-card__body">
+              <span class="stat-card__label">Avg confidence</span>
+              <span class="stat-card__value stat-card__value--conf"
+                    [class]="confidenceClass(avgConfidence())">
+                {{ avgConfidence() }}
+                <span class="stat-card__value-sub" *ngIf="avgConfidence() !== '—'">
+                  {{ avgConfidenceScore() }}
+                </span>
+              </span>
+            </div>
+          </div>
         </div>
 
         <!-- ── Progress bar ────────────────────────────────────────────── -->
@@ -228,7 +266,7 @@ const STAGE_LABELS: Record<string, string> = {
               <span>Current</span>
               <span>Target</span>
               <span>CVEs</span>
-              <span>Severity</span>
+              <span>Sev / Conf</span>
             </div>
 
             <ng-container *ngFor="let dep of displayedGroups()">
@@ -276,10 +314,27 @@ const STAGE_LABELS: Record<string, string> = {
                         class="cve-more">+{{ ((dep.parsed?.cves || dep.cves) || []).length - 2 }}</span>
                 </div>
 
-                <!-- Severity -->
-                <span class="sev-badge sev-badge--{{ (dep.parsed?.severity || dep.severity || 'INFO').toLowerCase() }}">
-                  {{ dep.parsed?.severity || dep.severity || 'INFO' }}
-                </span>
+                <!-- Severity + confidence + PR -->
+                <div class="dep-row__meta">
+                  <span class="sev-badge sev-badge--{{ (dep.parsed?.severity || dep.severity || 'INFO').toLowerCase() }}">
+                    {{ dep.parsed?.severity || dep.severity || 'INFO' }}
+                  </span>
+                  <span *ngIf="dep._confidence != null"
+                        class="conf-chip conf-chip--{{ confidenceClass(dep._confidence >= 0.75 ? 'HIGH' : dep._confidence >= 0.45 ? 'MEDIUM' : 'LOW') }}">
+                    {{ (dep._confidence * 100).toFixed(0) }}%
+                  </span>
+                  <a *ngIf="dep._prUrl" [href]="dep._prUrl" target="_blank"
+                     rel="noopener" class="pr-inline-link" title="Open PR">
+                    <svg width="11" height="11" viewBox="0 0 13 13" fill="none">
+                      <circle cx="3" cy="3" r="1.5" stroke="currentColor" stroke-width="1.2"/>
+                      <circle cx="3" cy="10" r="1.5" stroke="currentColor" stroke-width="1.2"/>
+                      <circle cx="10" cy="3" r="1.5" stroke="currentColor" stroke-width="1.2"/>
+                      <path d="M3 4.5V8.5M10 4.5C10 7 7.5 8.5 4.5 8.5"
+                            stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                    </svg>
+                    PR
+                  </a>
+                </div>
               </div>
             </ng-container>
 
@@ -288,9 +343,9 @@ const STAGE_LABELS: Record<string, string> = {
             </div>
           </div>
 
-          <!-- PR links for fixed tab -->
-          <div class="pr-links" *ngIf="activeTab() === 'fixed' && prResults().length > 0">
-            <a *ngFor="let pr of prResults()"
+          <!-- PR links footer — fixed tab -->
+          <div class="pr-links" *ngIf="activeTab() === 'fixed' && allPrResults().length > 0">
+            <a *ngFor="let pr of allPrResults()"
                [href]="pr.pr_url" target="_blank" rel="noopener" class="pr-link">
               <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
                 <circle cx="3" cy="3" r="1.5" stroke="currentColor" stroke-width="1.2"/>
@@ -299,7 +354,9 @@ const STAGE_LABELS: Record<string, string> = {
                 <path d="M3 4.5V8.5M10 4.5C10 7 7.5 8.5 4.5 8.5" stroke="currentColor"
                       stroke-width="1.2" stroke-linecap="round"/>
               </svg>
-              PR #{{ pr.pr_number }}
+              <span *ngIf="pr.artifact_id" class="pr-link__artifact">{{ pr.artifact_id }}</span>
+              <span *ngIf="pr.pr_number">· PR #{{ pr.pr_number }}</span>
+              <span *ngIf="!pr.pr_number">· Open PR</span>
             </a>
           </div>
         </ng-container>
@@ -582,7 +639,7 @@ const STAGE_LABELS: Record<string, string> = {
     }
     .dep-table__head {
       display: grid;
-      grid-template-columns: 26px minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) 72px;
+      grid-template-columns: 26px minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);
       gap: 10px;
       padding: 8px 14px;
       background: var(--surface-2);
@@ -593,7 +650,7 @@ const STAGE_LABELS: Record<string, string> = {
     }
     .dep-row {
       display: grid;
-      grid-template-columns: 26px minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) 72px;
+      grid-template-columns: 26px minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);
       gap: 10px;
       align-items: center;
       padding: 10px 14px;
@@ -640,6 +697,52 @@ const STAGE_LABELS: Record<string, string> = {
       font-size: 13px;
       color: var(--text-muted);
     }
+
+    /* Last column meta: severity + confidence + PR */
+    .dep-row__meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* Confidence chip */
+    .conf-chip {
+      font-size: 10px;
+      font-weight: 500;
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+    .conf-chip--high   { background: #EAF3DE; color: #3B6D11; border: 1px solid #97C459; }
+    .conf-chip--medium { background: #FAEEDA; color: #854F0B; border: 1px solid #EF9F27; }
+    .conf-chip--low    { background: #FCEBEB; color: #A32D2D; border: 1px solid #F09595; }
+
+    /* Inline PR link in dep row */
+    .pr-inline-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--brand, #7c6af7);
+      text-decoration: none;
+      padding: 1px 5px;
+      border: 1px solid currentColor;
+      border-radius: 3px;
+      opacity: 0.8;
+    }
+    .pr-inline-link:hover { opacity: 1; }
+
+    /* Confidence stat card */
+    .stat-card--conf .stat-card__icon { background: #E6F1FB22; color: #185FA5; }
+    .stat-card__value--conf { display: flex; align-items: baseline; gap: 5px; }
+    .stat-card__value-sub { font-size: 13px; font-weight: 400; color: var(--text-muted); }
+    .stat-card__value--conf.high   { color: #3B6D11; }
+    .stat-card__value--conf.medium { color: #854F0B; }
+    .stat-card__value--conf.low    { color: #A32D2D; }
+
+    /* PR link footer artifact label */
+    .pr-link__artifact { font-weight: 500; }
 
     /* Severity badges */
     .sev-badge {
@@ -757,18 +860,50 @@ export class SummaryReportComponent implements OnInit {
   activeTab   = signal<'all' | 'fixed' | 'escalated' | 'stages'>('all');
   expandedId  = signal<string | null>(null);
 
-  // ── Derived values ────────────────────────────────────────────────────────
+  // ── Core derived: annotate each group with _outcome and _prUrl ────────────
+  //
+  // Backend result shape:
+  //   result.groups[]        — all dependency groups (no _outcome field)
+  //   result.adr_results[]   — [{ artifact_id, result: { success, branch_name, error_reason } }]
+  //   result.pr_results[]    — [{ pr_url, pr_number }] — one entry per SUCCESSFUL adr_result, in order
+  //
+  // Cross-reference logic (mirrors fortify_writeback.py run_all_reports):
+  //   adr_result.success === true  → fixed  (pr_results consumed in order)
+  //   group.next_node === 'escalate' OR adr has error_reason → escalated
+  //   escalation report write failed → failed
 
-  pipelineResult = () => this.status()?.result ?? null;
+  allGroups = (): (DepGroup & { _outcome: string; _prUrl?: string; _confidence?: number })[] => {
+    const result  = this.status()?.result;
+    if (!result) return [];
 
-  allGroups = (): DepGroup[] => {
-    const groups = this.status()?.result?.groups ?? [];
-    // Annotate _outcome if not already set by backend
+    const groups     = result.groups     ?? [];
+    const adrResults = result.adr_results ?? [];
+    const prResults  = result.pr_results  ?? [];
+
+    // Build artifact_id → adr result map
+    const adrByArtifact = new Map<string, any>();
+    for (const r of adrResults) {
+      adrByArtifact.set(r.artifact_id, r.result ?? r);
+    }
+
+    // Walk pr_results in order — they correspond to successful adr_results in group order
+    let prIdx = 0;
+
     return groups.map(g => {
-      if (g._outcome) return g;
-      const pr = this.status()?.result?.pr_results ?? [];
-      // If a PR exists for this dep it was fixed (rough heuristic)
-      return { ...g, _outcome: pr.length > 0 ? 'fixed' : 'escalated' } as DepGroup;
+      const artifactId = g.parsed?.artifact_id ?? g.artifact_id ?? '';
+      const adr        = adrByArtifact.get(artifactId);
+      const confidence = g.ai_reasoning?.confidence_score;
+
+      if (adr?.success === true) {
+        const pr = prResults[prIdx++];
+        return { ...g, _outcome: 'fixed', _prUrl: pr?.pr_url, _confidence: confidence };
+      }
+
+      // Not fixed — determine escalated vs failed
+      // escalated = a report file was written (escalation_files present) or has escalate_reason
+      const hasReason = !!(g.escalate_reason || g.ai_reasoning?.reasoning || adr?.error_reason);
+      const outcome   = hasReason ? 'escalated' : 'failed';
+      return { ...g, _outcome: outcome, _confidence: confidence };
     });
   };
 
@@ -776,12 +911,22 @@ export class SummaryReportComponent implements OnInit {
   escalatedGroups = () => this.allGroups().filter(g => g._outcome === 'escalated');
   failedGroups    = () => this.allGroups().filter(g => g._outcome === 'failed');
 
-  displayedGroups = (): DepGroup[] =>
+  displayedGroups = () =>
     this.activeTab() === 'fixed' ? this.fixedGroups() : this.allGroups();
 
-  prResults = (): PrResult[] =>
-    (this.status()?.result?.pr_results ?? []).filter(p => !!p.pr_url);
+  // All PRs with URLs, preserving per-group mapping
+  allPrResults = (): { pr_url: string; pr_number?: number; artifact_id?: string }[] =>
+    this.fixedGroups()
+      .filter(g => g._prUrl)
+      .map(g => ({
+        pr_url:      g._prUrl!,
+        pr_number:   (this.status()?.result?.pr_results ?? [])
+                       .find(p => p.pr_url === g._prUrl)?.pr_number,
+        artifact_id: g.parsed?.artifact_id ?? g.artifact_id,
+      }));
 
+  // Totals — prefer backend summary values (from fortify-writeback stage),
+  // fall back to counting annotated groups
   totalFixed     = () => this.status()?.result?.total_fixed     ?? this.fixedGroups().length;
   totalEscalated = () => this.status()?.result?.total_escalated ?? this.escalatedGroups().length;
   totalFailed    = () => this.status()?.result?.total_failed    ?? this.failedGroups().length;
@@ -789,6 +934,27 @@ export class SummaryReportComponent implements OnInit {
 
   pctFixed = () =>
     this.totalDeps() > 0 ? Math.round((this.totalFixed() / this.totalDeps()) * 100) : 0;
+
+  // Average confidence across all groups that have a score
+  avgConfidence = (): string => {
+    const scores = this.allGroups()
+      .map(g => g._confidence)
+      .filter((s): s is number => s != null && !isNaN(s));
+    if (!scores.length) return '—';
+    const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+    if (avg >= 0.75) return 'HIGH';
+    if (avg >= 0.45) return 'MEDIUM';
+    return 'LOW';
+  };
+
+  avgConfidenceScore = (): string => {
+    const scores = this.allGroups()
+      .map(g => g._confidence)
+      .filter((s): s is number => s != null && !isNaN(s));
+    if (!scores.length) return '—';
+    const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+    return (avg * 100).toFixed(0) + '%';
+  };
 
   stageList = () =>
     Object.entries(STAGE_LABELS).map(([key, label]) => {
@@ -801,14 +967,30 @@ export class SummaryReportComponent implements OnInit {
         : 'pending';
       return {
         key, label, uiStatus,
-        elapsed: s.elapsed_seconds != null
-          ? s.elapsed_seconds.toFixed(1) : null,
+        elapsed: s.elapsed_seconds != null ? s.elapsed_seconds.toFixed(1) : null,
+        detail:  s.error ?? (s.output_summary ? this._summarise(key, s.output_summary) : null),
       };
     });
+
+  private _summarise(stage: string, s: any): string {
+    switch (stage) {
+      case 'triage':             return `${s.total_groups ?? 0} groups, ${s.total_skipped ?? 0} skipped`;
+      case 'version-resolver':   return s.next_safe ? `Next safe: ${s.next_safe}` : '';
+      case 'api-diff':           return s.has_breaking_changes ? `⚠ ${s.breaking_count} breaking` : '✓ No breaking changes';
+      case 'ai-reasoning':       return s.confidence ? `${s.safe ? '✓ Safe' : '⚠ Unsafe'} · ${s.confidence}` : '';
+      case 'adr-fix':            return s.branch_name ?? s.error_reason ?? '';
+      case 'pr-agent':           return s.pr_url ? `PR opened` : '';
+      case 'fortify-writeback':  return s.total_fixed != null ? `Fixed: ${s.total_fixed}, Escalated: ${s.total_escalated ?? 0}` : '';
+      default:                   return '';
+    }
+  }
+
+  pipelineResult = () => this.status()?.result ?? null;
 
   targetVersion = (dep: DepGroup): string =>
     dep.current_candidate
     ?? dep.version_candidates?.candidates?.[0]
+    ?? dep.ai_reasoning?.recommended_version
     ?? '—';
 
   formatSeconds = (s: number): string => {
@@ -817,6 +999,8 @@ export class SummaryReportComponent implements OnInit {
     const r = Math.round(s % 60);
     return r > 0 ? `${m}m ${r}s` : `${m}m`;
   };
+
+  confidenceClass = (label: string): string => label.toLowerCase();
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
