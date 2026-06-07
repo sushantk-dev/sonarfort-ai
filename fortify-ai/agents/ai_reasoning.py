@@ -105,16 +105,25 @@ Assess the upgrade safety and respond in JSON only.
 
 # ── LLM initialisation ────────────────────────────────────────────────────────
 
-def _build_llm(gcp_project: str, gcp_location: str, max_output_tokens: int = 1024):
+_FALLBACK_MODEL = "gemini-1.5-pro-002"
+
+
+def _build_llm(
+    gcp_project: str,
+    gcp_location: str,
+    model_name: str = "gemini-2.5-flash",
+    max_output_tokens: int = 1024,
+):
     """
-    Build a ChatVertexAI instance.
-    Tries claude-sonnet-4-5 first, falls back to gemini-1.5-pro-002.
+    Build a ChatVertexAI instance using the model configured via VERTEX_MODEL.
+    Falls back to ``_FALLBACK_MODEL`` if the requested model is unavailable.
     Returns the LLM object or None if Vertex AI is unavailable.
 
     max_output_tokens:
-      1024  — default, sufficient for AI Reasoning JSON verdict (~6 fields)
-      4096  — use for AI Code Fix, which may return multi-patch JSON responses
-               that silently truncate and fail json.loads() at 1024 tokens
+      Driven by the MAX_TOKENS config field (default 8192).
+      1024 is sufficient for AI Reasoning JSON verdicts (~6 fields);
+      ≥4096 is recommended for AI Code Fix multi-patch JSON responses that
+      would otherwise silently truncate and fail json.loads().
     """
     try:
         import vertexai  # type: ignore
@@ -124,23 +133,23 @@ def _build_llm(gcp_project: str, gcp_location: str, max_output_tokens: int = 102
 
         try:
             llm = ChatVertexAI(
-                model_name="claude-sonnet-4-5@20251001",
+                model_name=model_name,
                 max_output_tokens=max_output_tokens,
                 temperature=0.1,          # low temp for deterministic JSON
             )
-            logger.debug("[AI Reasoning] Using claude-sonnet-4-5 on Vertex AI")
+            logger.debug(f"[AI Reasoning] Using {model_name} on Vertex AI")
             return llm
         except Exception as exc:
             logger.warning(
-                f"[AI Reasoning] claude-sonnet-4-5 unavailable ({exc}) — "
-                "falling back to gemini-1.5-pro-002"
+                f"[AI Reasoning] {model_name} unavailable ({exc}) — "
+                f"falling back to {_FALLBACK_MODEL}"
             )
             llm = ChatVertexAI(
-                model_name="gemini-1.5-pro-002",
+                model_name=_FALLBACK_MODEL,
                 max_output_tokens=max_output_tokens,
                 temperature=0.1,
             )
-            logger.debug("[AI Reasoning] Using gemini-1.5-pro-002 on Vertex AI")
+            logger.debug(f"[AI Reasoning] Using {_FALLBACK_MODEL} on Vertex AI")
             return llm
 
     except ImportError:
@@ -415,13 +424,18 @@ def reason_all_groups(
     groups: list[dict],
     gcp_project: str,
     gcp_location: str,
+    vertex_model: str = "gemini-2.5-flash",
+    max_tokens: int = 8192,
 ) -> list[dict]:
     """
     Run AI reasoning for every group against its current candidate.
     Builds the LLM once and reuses it across all groups.
     Enriches each group dict with 'ai_reasoning' and 'next_node'.
+
+    vertex_model: model name from VERTEX_MODEL config (e.g. gemini-2.5-flash)
+    max_tokens:   max output tokens from MAX_TOKENS config
     """
-    llm = _build_llm(gcp_project, gcp_location)
+    llm = _build_llm(gcp_project, gcp_location, model_name=vertex_model, max_output_tokens=max_tokens)
 
     enriched: list[dict] = []
 
@@ -475,6 +489,8 @@ def ai_reasoning_node(
     state: AgentState,
     gcp_project: str,
     gcp_location: str,
+    vertex_model: str = "gemini-2.5-flash",
+    max_tokens: int = 8192,
 ) -> AgentState:
     """
     LangGraph node: ai_reasoning.
@@ -482,6 +498,9 @@ def ai_reasoning_node(
     Reads:  state["_diff_groups"]
     Writes: state["_reasoned_groups"]  (groups + ai_reasoning + next_node)
             state["audit_trail"]
+
+    vertex_model: model name from VERTEX_MODEL config
+    max_tokens:   max output tokens from MAX_TOKENS config
     """
     groups: list[dict] = state.get("_diff_groups", [])  # type: ignore[attr-defined]
 
@@ -492,7 +511,10 @@ def ai_reasoning_node(
         state["audit_trail"].append({"node": "ai_reasoning", "status": "skipped"})
         return state
 
-    enriched = reason_all_groups(groups, gcp_project, gcp_location)
+    enriched = reason_all_groups(
+        groups, gcp_project, gcp_location,
+        vertex_model=vertex_model, max_tokens=max_tokens,
+    )
 
     state["_reasoned_groups"] = enriched  # type: ignore[typeddict-unknown-key]
     state["audit_trail"].append({

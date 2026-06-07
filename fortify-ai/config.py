@@ -87,6 +87,23 @@ class FortifyAIConfig(BaseSettings):
         default="us-central1",
         description="GCP region for Vertex AI endpoints",
     )
+    vertex_model: str = Field(
+        default="gemini-2.5-flash",
+        description=(
+            "Vertex AI model name used by the AI reasoning and code-fix agents. "
+            "e.g. gemini-2.5-flash, gemini-2.5-pro, claude-sonnet-4-5@20251001"
+        ),
+    )
+    max_tokens: int = Field(
+        default=8192,
+        description=(
+            "Maximum output tokens for LLM calls. "
+            "Use ≥4096 for AI Code Fix (multi-patch JSON); 1024 is sufficient for "
+            "AI Reasoning verdicts."
+        ),
+        ge=256,
+        le=65536,
+    )
 
     # ── Pipeline behaviour ───────────────────────────────────────────────────
     max_retries: int = Field(
