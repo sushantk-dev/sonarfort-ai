@@ -7,11 +7,22 @@ Copy .env.example → .env and fill in your values before running.
 
 from pathlib import Path
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 
 class FortifyAIConfig(BaseSettings):
+    # ── Pydantic v2 settings config ──────────────────────────────────────────
+    # SettingsConfigDict replaces the inner `class Config` (v1 pattern).
+    # The env_file here is just the default fallback; load_config() overrides
+    # it at runtime via _env_file= so the parent-directory .env is found first.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
     # ── Fortify SSC ──────────────────────────────────────────────────────────
     fortify_base_url: str = Field(
         default="",
@@ -111,11 +122,6 @@ class FortifyAIConfig(BaseSettings):
         description="Local directory where ADR PDF reports and logs are written",
     )
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
-
     def get_reviewers(self) -> list[str]:
         """Parse the comma-separated reviewers string into a list."""
         if not self.reviewers.strip():
@@ -124,12 +130,17 @@ class FortifyAIConfig(BaseSettings):
 
 
 def load_config() -> FortifyAIConfig:
-    """Load and validate config. Raises ValidationError on missing required vars.
+    """Load and validate config from the correct .env file.
 
-    Looks for .env in the parent directory first (../), then falls back to
-    .env in the current working directory.
+    Search order:
+      1. ../env  — one level above this file (project root when code lives in a sub-folder)
+      2. .env    — current working directory (flat layout / fallback)
+
+    Using SettingsConfigDict (pydantic-settings v2) means _env_file passed to
+    the constructor is honoured correctly, so whichever path is resolved here
+    is the one that actually gets read.
     """
-    parent_env = Path(__file__).resolve().parent.parent / ".env"
-    local_env = Path(".env")
-    env_path = str(parent_env) if parent_env.exists() else str(local_env)
+    parent_env = Path(__file__).resolve().parent / ".env"
+    local_env  = Path(".env")
+    env_path   = str(parent_env) if parent_env.exists() else str(local_env)
     return FortifyAIConfig(_env_file=env_path)
