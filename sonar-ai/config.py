@@ -1,16 +1,27 @@
 """
-SonarAI — Configuration  (Iteration 2)
+SonarAI + FortifyAI — Unified Configuration  (Iteration 2)
 All settings loaded from environment variables or .env file via Pydantic Settings.
 
 New in Iteration 2:
-  - chroma_persist_dir   : local path for ChromaDB vector store
-  - langsmith_api_key    : LangSmith tracing
-  - langsmith_project    : LangSmith project name
-  - sonar_rescan_timeout : seconds to wait for Sonar analysis after fix
-  - enable_rag           : toggle RAG retrieval
-  - enable_sonar_rescan  : toggle post-fix Sonar API verification
-  - parallel_issues      : process issues in parallel via LangGraph Send API
-  - max_parallel_workers : cap on concurrent issue pipelines
+  - chroma_persist_dir      : local path for ChromaDB vector store
+  - langsmith_api_key       : LangSmith tracing
+  - langsmith_project       : LangSmith project name
+  - sonar_rescan_timeout    : seconds to wait for Sonar analysis after fix
+  - enable_rag              : toggle RAG retrieval
+  - enable_sonar_rescan     : toggle post-fix Sonar API verification
+  - parallel_issues         : process issues in parallel via LangGraph Send API
+  - max_parallel_workers    : cap on concurrent issue pipelines
+
+Merged from FortifyAI:
+  - fortify_username/password/scope : OAuth credential flow for Fortify token refresh
+  - github_repo             : target repo in owner/repo format
+  - project_path            : local Maven project root
+  - adr_path                : path to adr.py remediation script
+  - japicmp_jar_path        : path to japicmp fat-jar
+  - max_upgrades            : cap on dependency upgrades per run
+  - jira_id_prefix          : prefix for commit/branch JIRA identifiers
+  - reviewers               : comma-separated GitHub reviewers for auto-assign
+  - adr_output_dir          : local dir for ADR PDF reports and logs
 """
 
 from pathlib import Path
@@ -54,6 +65,10 @@ class Settings(BaseSettings):
         default="https://api.github.com",
         description="GitHub API base URL (override for GHE)",
     )
+    github_repo: str = Field(
+        default="",
+        description="Target GitHub repo in owner/repo format, e.g. acme/backend",
+    )
 
     # ── Sonar ─────────────────────────────────────────────────────────────────
     sonar_token: str = Field(default="", description="SonarQube/SonarCloud API token")
@@ -63,10 +78,49 @@ class Settings(BaseSettings):
     )
 
     # ── Fortify ───────────────────────────────────────────────────────────────
-    fortify_token: str = Field(default="", description="Fortify SAST API token")
+    fortify_api_token: str = Field(
+        default="",
+        description=(
+            "Fortify Bearer token. Leave empty to have the pipeline fetch it "
+            "automatically via OAuth using fortify_username + fortify_password."
+        ),
+    )
     fortify_host_url: str = Field(
         default="https://api.ams.fortify.com",
         description="Fortify on Demand / SSC host URL",
+    )
+    fortify_username: str = Field(
+        default="",
+        description=(
+            "Fortify login username, e.g. 'equifax\\\\sushant.kumar'. "
+            "Used with POST /oauth/token (grant_type=password)."
+        ),
+    )
+    fortify_password: str = Field(
+        default="",
+        description="Fortify login password. Used with POST /oauth/token.",
+    )
+    fortify_scope: str = Field(
+        default="api-tenant",
+        description="OAuth scope sent to /oauth/token (default: api-tenant).",
+    )
+
+    # ── Project / ADR paths ───────────────────────────────────────────────────
+    project_path: str = Field(
+        default=".",
+        description="Absolute path to the Maven project root on disk",
+    )
+    adr_path: str = Field(
+        default="",
+        description="Absolute path to adr.py (Automated Dependency Remediation script)",
+    )
+    japicmp_jar_path: str = Field(
+        default="",
+        description="Absolute path to japicmp fat-jar for API diff analysis",
+    )
+    adr_output_dir: str = Field(
+        default="/tmp/fortifyai",
+        description="Local directory where ADR PDF reports and logs are written",
     )
 
     # ── Agent temperatures ────────────────────────────────────────────────────
@@ -82,6 +136,27 @@ class Settings(BaseSettings):
         description="Base dir for cloned repos",
     )
     escalation_dir: str = Field(default="escalations", description="Dir for escalation markdown files")
+    max_upgrades: int = Field(
+        default=0,
+        description=(
+            "Maximum number of dependencies to upgrade in a single pipeline run. "
+            "0 (default) means no limit — all triaged deps are processed. "
+            "When set, deps are prioritised by severity (Critical → High → Medium → Low) "
+            "and only the top N are forwarded to remediation."
+        ),
+        ge=0,
+    )
+    jira_id_prefix: str = Field(
+        default="FORTIFY",
+        description="Prefix used when generating commit/branch JIRA identifiers",
+    )
+    reviewers: str = Field(
+        default="",
+        description=(
+            "Comma-separated GitHub usernames to auto-assign on high-confidence PRs. "
+            "e.g. alice,bob,charlie"
+        ),
+    )
 
     # ── Confidence thresholds ─────────────────────────────────────────────────
     confidence_high_threshold: float = Field(default=0.8, description="Score >= this → HIGH confidence")
@@ -129,6 +204,12 @@ class Settings(BaseSettings):
         default=1,
         description="Max issues to process per run (0 = no limit)",
     )
+
+    def get_reviewers(self) -> list[str]:
+        """Parse the comma-separated reviewers string into a list."""
+        if not self.reviewers.strip():
+            return []
+        return [r.strip() for r in self.reviewers.split(",") if r.strip()]
 
 
 # Module-level singleton — import this everywhere

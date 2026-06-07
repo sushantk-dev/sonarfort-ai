@@ -77,7 +77,7 @@ class ConfigUpdateRequest(BaseModel):
     sonar_token:                 Optional[str]   = None   # empty string = clear token
     sonar_host_url:              Optional[str]   = None
     sonar_org:                   Optional[str]   = None
-    fortify_token:               Optional[str]   = None   # empty string = clear token
+    fortify_api_token:               Optional[str]   = None   # empty string = clear token
     fortify_host_url:            Optional[str]   = None
     planner_temp:                Optional[float] = None
     generator_temp:              Optional[float] = None
@@ -847,7 +847,7 @@ def get_config() -> dict:
         "github_repo":                 "",
         "sonar_token":                 mask(s.sonar_token),
         "sonar_host_url":              s.sonar_host_url,
-        "fortify_token":               mask(s.fortify_token),
+        "fortify_api_token":               mask(s.fortify_api_token),
         "fortify_host_url":            s.fortify_host_url,
         "planner_temperature":          s.planner_temperature,
         "generator_temperature":        s.generator_temperature,
@@ -890,7 +890,7 @@ def update_config(req: ConfigUpdateRequest) -> dict:
     env_path = Path(".env")
     lines: list[str] = env_path.read_text().splitlines() if env_path.exists() else []
 
-    token_fields = {"github_token", "sonar_token", "fortify_token"}
+    token_fields = {"github_token", "sonar_token", "fortify_api_token"}
 
     # Include non-None values; also include token fields even if empty string (explicit clear)
     mapping = {
@@ -908,7 +908,7 @@ def update_config(req: ConfigUpdateRequest) -> dict:
         "github_token":                "GITHUB_TOKEN",
         "sonar_token":                 "SONAR_TOKEN",
         "sonar_host_url":              "SONAR_HOST_URL",
-        "fortify_token":               "FORTIFY_TOKEN",
+        "fortify_api_token":               "FORTIFY_TOKEN",
         "fortify_host_url":            "FORTIFY_HOST_URL",
         "planner_temp":                "PLANNER_TEMPERATURE",
         "generator_temp":              "GENERATOR_TEMPERATURE",
