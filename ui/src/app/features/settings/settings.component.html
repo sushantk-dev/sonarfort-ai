@@ -263,10 +263,10 @@
               </div>
               <!-- Token status badge -->
               <div class="fortify-token-status"
-                   [class.fortify-token-status--ok]="tokenStatus.fortifyToken"
-                   [class.fortify-token-status--missing]="!tokenStatus.fortifyToken">
+                   [class.fortify-token-status--ok]="tokenStatus.fortifyApiToken"
+                   [class.fortify-token-status--missing]="!tokenStatus.fortifyApiToken">
                 <span class="fortify-token-status__dot"></span>
-                {{ tokenStatus.fortifyToken ? 'Token set' : 'Token missing' }}
+                {{ tokenStatus.fortifyApiToken ? 'Token set' : 'Token missing' }}
               </div>
             </div>
           </div>
@@ -278,7 +278,7 @@
                 Fortify API Token
                 <span class="optional">Authorization: Bearer</span>
               </label>
-              <div class="token-set" *ngIf="tokenStatus.fortifyToken && !isEditing('fortifyToken')">
+              <div class="token-set" *ngIf="tokenStatus.fortifyApiToken && !isEditing('fortifyApiToken')">
                 <div class="token-set__mask">
                   <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                     <rect x="1" y="5" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
@@ -287,17 +287,17 @@
                   Bearer ••••••••••••••••
                 </div>
                 <div class="token-set__actions">
-                  <button class="token-btn token-btn--change" (click)="startEditing('fortifyToken')">Change</button>
+                  <button class="token-btn token-btn--change" (click)="startEditing('fortifyApiToken')">Change</button>
                 </div>
               </div>
-              <div *ngIf="!tokenStatus.fortifyToken || isEditing('fortifyToken')" class="token-input-wrap">
+              <div *ngIf="!tokenStatus.fortifyApiToken || isEditing('fortifyApiToken')" class="token-input-wrap">
                 <input class="input" type="password"
-                       [value]="cfg.fortifyToken"
-                       (input)="patch('fortifyToken', $any($event.target).value)"
-                       [placeholder]="tokenStatus.fortifyToken ? 'Enter new token to replace…' : 'Bearer token…'"
+                       [value]="cfg.fortifyApiToken"
+                       (input)="patch('fortifyApiToken', $any($event.target).value)"
+                       [placeholder]="tokenStatus.fortifyApiToken ? 'Enter new token to replace…' : 'Bearer token…'"
                        autocomplete="new-password">
-                <button *ngIf="isEditing('fortifyToken')" class="token-btn token-btn--cancel"
-                        (click)="cancelEditing('fortifyToken')">Cancel</button>
+                <button *ngIf="isEditing('fortifyApiToken')" class="token-btn token-btn--cancel"
+                        (click)="cancelEditing('fortifyApiToken')">Cancel</button>
               </div>
               <span class="field__hint">
                 Paste your Fortify SSC API token. Used as

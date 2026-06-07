@@ -68,7 +68,7 @@ export class SettingsComponent implements OnInit {
 
   /**
    * POST /auth/token → fetch a fresh Fortify Bearer token.
-   * On success: updates the in-memory fortifyToken config field and
+   * On success: updates the in-memory fortifyApiToken config field and
    * shows the token expiry. On failure: surfaces the API error message.
    */
   async refreshFortifyToken(): Promise<void> {
@@ -108,8 +108,8 @@ export class SettingsComponent implements OnInit {
 
       // Mirror the new token into the settings config so the UI reflects it
       // immediately without requiring a page reload
-      this.patch('fortifyToken', result.access_token);
-      this.st.tokenStatus.update(s => ({ ...s, fortifyToken: true }));
+      this.patch('fortifyApiToken', result.access_token);
+      this.st.tokenStatus.update(s => ({ ...s, fortifyApiToken: true }));
 
     } catch (err: any) {
       this.oauthError.set(err?.message ?? 'Token refresh failed');
