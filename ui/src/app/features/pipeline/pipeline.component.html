@@ -567,6 +567,18 @@
               {{ run.confidence ?? '—' }}
             </span>
           </div>
+          <!-- Summary shortcut — appears once run is terminal -->
+          <ng-container *ngIf="run.status === 'done' || run.status === 'error'">
+            <div class="fortify-meta-bar__sep"></div>
+            <a [routerLink]="['/pipeline/summary', run.id]"
+               class="fortify-meta-bar__summary-link">
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+                <rect x="1" y="1" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.2"/>
+                <path d="M3 4h6M3 6h4M3 8h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+              </svg>
+              Summary
+            </a>
+          </ng-container>
         </div>
 
         <!-- Step trace -->
@@ -625,6 +637,16 @@
             <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank"
                class="outcome__link">{{ run.prUrl }}</a>
           </div>
+          <!-- Summary report link — Fortify runs only -->
+          <a *ngIf="run.source === 'fortify' && (run.status === 'done' || run.status === 'error')"
+             [routerLink]="['/pipeline/summary', run.id]"
+             class="outcome__summary-btn">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <rect x="1" y="1" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.2"/>
+              <path d="M3 4h6M3 6h4M3 8h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+            </svg>
+            View Summary
+          </a>
         </div>
 
       </ng-container>

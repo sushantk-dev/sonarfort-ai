@@ -2,7 +2,7 @@
 import { Component, inject, signal, computed, effect } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
 import { PipelineStateService, UiRun, RunRequest } from '../../core/pipeline-state.service';
 import { ApiConfigService } from '../../core/api-config.service';
 import { SevClassPipe }    from '../../shared/sev-class.pipe';
@@ -23,7 +23,7 @@ const ENDPOINT_MAP: Record<FortifyMode, string> = {
 @Component({
   selector: 'app-pipeline',
   standalone: true,
-  imports: [CommonModule, FormsModule, SevClassPipe, OutcomeClassPipe, OutcomeLabelPipe, ActiveStepPipe],
+  imports: [CommonModule, FormsModule, RouterLink, SevClassPipe, OutcomeClassPipe, OutcomeLabelPipe, ActiveStepPipe],
   templateUrl: './pipeline.component.html',
   styleUrl:    './pipeline.component.scss',
 })
