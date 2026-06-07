@@ -675,12 +675,16 @@ def _run_full_pipeline(
         summary = {"dry_run": True, "groups": len(reasoned)}
 
     return {
-        "release_id": release_id,
+        "release_id":   release_id,
         "groups_count": len(reasoned),
-        "adr_results": adr_results,
-        "pr_results": pr_results,
-        "summary": summary,
-        "dry_run": dry_run,
+        "groups":       reasoned,
+        "adr_results":  adr_results,
+        "pr_results":   pr_results,
+        "total_fixed":       summary.get("total_fixed",     0),
+        "total_escalated":   summary.get("total_escalated", 0),
+        "total_failed":      summary.get("total_failed",    0),
+        "summary":      summary,
+        "dry_run":      dry_run,
     }
 
 @app.on_event("startup")

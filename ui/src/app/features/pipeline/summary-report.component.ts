@@ -60,9 +60,15 @@ interface PipelineResult {
   total_escalated?: number;
   total_failed?:    number;
   release_id?:      number;
+  groups_count?:    number;
   groups?:          DepGroup[];
   adr_results?:     AdrEntry[];
   pr_results?:      PrResult[];
+  summary?: {
+    total_fixed?:     number;
+    total_escalated?: number;
+    total_failed?:    number;
+  };
 }
 
 interface PipelineStatus {
@@ -862,48 +868,71 @@ export class SummaryReportComponent implements OnInit {
 
   // ── Core derived: annotate each group with _outcome and _prUrl ────────────
   //
-  // Backend result shape:
-  //   result.groups[]        — all dependency groups (no _outcome field)
+  // Backend result shape (full pipeline):
+  //   result.groups[]        — all dependency groups (added to api_server.py return)
   //   result.adr_results[]   — [{ artifact_id, result: { success, branch_name, error_reason } }]
-  //   result.pr_results[]    — [{ pr_url, pr_number }] — one entry per SUCCESSFUL adr_result, in order
+  //   result.pr_results[]    — [{ pr_url, pr_number }] — one per successful adr_result, in order
+  //   result.total_fixed / total_escalated / total_failed  — writeback summary counts
   //
-  // Cross-reference logic (mirrors fortify_writeback.py run_all_reports):
-  //   adr_result.success === true  → fixed  (pr_results consumed in order)
-  //   group.next_node === 'escalate' OR adr has error_reason → escalated
-  //   escalation report write failed → failed
+  // Fallback: if groups[] is absent (older backend), synthesise rows from adr_results.
 
   allGroups = (): (DepGroup & { _outcome: string; _prUrl?: string; _confidence?: number })[] => {
     const result  = this.status()?.result;
     if (!result) return [];
 
-    const groups     = result.groups     ?? [];
     const adrResults = result.adr_results ?? [];
     const prResults  = result.pr_results  ?? [];
 
-    // Build artifact_id → adr result map
+    // Build artifact_id → adr result lookup
     const adrByArtifact = new Map<string, any>();
     for (const r of adrResults) {
       adrByArtifact.set(r.artifact_id, r.result ?? r);
     }
 
-    // Walk pr_results in order — they correspond to successful adr_results in group order
+    // Walk pr_results in order — they match successful adr_results positionally
     let prIdx = 0;
 
-    return groups.map(g => {
-      const artifactId = g.parsed?.artifact_id ?? g.artifact_id ?? '';
-      const adr        = adrByArtifact.get(artifactId);
-      const confidence = g.ai_reasoning?.confidence_score;
+    // Prefer the full groups array (present after api_server.py fix)
+    const groups = result.groups ?? [];
+
+    if (groups.length > 0) {
+      return groups.map(g => {
+        const artifactId = g.parsed?.artifact_id ?? g.artifact_id ?? '';
+        const adr        = adrByArtifact.get(artifactId);
+        const confidence = g.ai_reasoning?.confidence_score;
+
+        if (adr?.success === true) {
+          const pr = prResults[prIdx++];
+          return { ...g, _outcome: 'fixed', _prUrl: pr?.pr_url, _confidence: confidence };
+        }
+        const hasReason = !!(g.escalate_reason || g.ai_reasoning?.reasoning || adr?.error_reason);
+        return { ...g, _outcome: hasReason ? 'escalated' : 'failed', _confidence: confidence };
+      });
+    }
+
+    // ── Fallback: no groups array — build synthetic rows from adr_results ────
+    return adrResults.map((r: AdrEntry) => {
+      const adr        = r.result ?? r;
+      const artifactId = r.artifact_id ?? '';
 
       if (adr?.success === true) {
         const pr = prResults[prIdx++];
-        return { ...g, _outcome: 'fixed', _prUrl: pr?.pr_url, _confidence: confidence };
+        const synthetic: DepGroup & { _outcome: string; _prUrl?: string } = {
+          artifact_id:     artifactId,
+          parsed:          { artifact_id: artifactId },
+          _outcome:        'fixed',
+          _prUrl:          pr?.pr_url,
+        };
+        return synthetic;
       }
-
-      // Not fixed — determine escalated vs failed
-      // escalated = a report file was written (escalation_files present) or has escalate_reason
-      const hasReason = !!(g.escalate_reason || g.ai_reasoning?.reasoning || adr?.error_reason);
-      const outcome   = hasReason ? 'escalated' : 'failed';
-      return { ...g, _outcome: outcome, _confidence: confidence };
+      const reason = adr?.error_reason ?? '';
+      const synthetic: DepGroup & { _outcome: string } = {
+        artifact_id:     artifactId,
+        parsed:          { artifact_id: artifactId },
+        escalate_reason: reason,
+        _outcome:        reason ? 'escalated' : 'failed',
+      };
+      return synthetic;
     });
   };
 
@@ -925,11 +954,16 @@ export class SummaryReportComponent implements OnInit {
         artifact_id: g.parsed?.artifact_id ?? g.artifact_id,
       }));
 
-  // Totals — prefer backend summary values (from fortify-writeback stage),
-  // fall back to counting annotated groups
-  totalFixed     = () => this.status()?.result?.total_fixed     ?? this.fixedGroups().length;
-  totalEscalated = () => this.status()?.result?.total_escalated ?? this.escalatedGroups().length;
-  totalFailed    = () => this.status()?.result?.total_failed    ?? this.failedGroups().length;
+  // Totals — prefer top-level summary counts, then result sub-fields, then group count
+  totalFixed     = () => this.status()?.result?.total_fixed
+                      ?? this.status()?.result?.summary?.total_fixed
+                      ?? this.fixedGroups().length;
+  totalEscalated = () => this.status()?.result?.total_escalated
+                      ?? this.status()?.result?.summary?.total_escalated
+                      ?? this.escalatedGroups().length;
+  totalFailed    = () => this.status()?.result?.total_failed
+                      ?? this.status()?.result?.summary?.total_failed
+                      ?? this.failedGroups().length;
   totalDeps      = () => this.totalFixed() + this.totalEscalated() + this.totalFailed();
 
   pctFixed = () =>
