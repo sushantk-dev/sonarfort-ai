@@ -5,30 +5,28 @@
 #   cd ui
 #   npx ng build --configuration production
 #   cd ..
-# This produces ui/dist/sonarfort-ai/browser which is copied directly in.
+#
+# Also download japicmp jar to tools/japicmp.jar before building.
 #
 # Directory structure:
 #   sonarfort-ai/
-#   ├── fortify-ai/        FortifyAI Python source  (api_server.py)
-#   ├── sonar-ai/          SonarAI Python source     (api.py)
-#   ├── ui/
-#   │   └── dist/sonarfort-ai/browser/   ← built by you on host
+#   ├── fortify-ai/
+#   ├── sonar-ai/
+#   ├── tools/japicmp.jar
+#   ├── ui/dist/sonarfort-ai/browser/
 #   ├── .env
 #   ├── Dockerfile
 #   └── docker-compose.yml
-#
-# Processes (supervisord):
-#   nginx       :80   → Angular SPA
-#                       /api/     → SonarAI   :8000
-#                       /fortify/ → FortifyAI :8001
-#   sonar-api   :8000 → sonar-ai/api.py
-#   fortify-api :8001 → fortify-ai/api_server.py
 # =============================================================================
 
 FROM python:3.11-bookworm
 
+# ── Corporate SSL proxy fix — write pip.conf before any pip calls ─────────────
+RUN mkdir -p /root/.config/pip && \
+    echo "[global]" > /root/.config/pip/pip.conf && \
+    echo "trusted-host = pypi.org pypi.python.org files.pythonhosted.org" >> /root/.config/pip/pip.conf
+
 # ── System packages ───────────────────────────────────────────────────────────
-# bookworm (Debian 12) ships openjdk-17 natively — no extra repo needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jdk-headless \
         maven \
@@ -43,16 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# ── Global pip config — trust PyPI hosts (corporate SSL proxy) ───────────────
-RUN mkdir -p /root/.config/pip && printf '[global]
-trusted-host = pypi.org
-               pypi.python.org
-               files.pythonhosted.org
-' > /root/.config/pip/pip.conf
-
-# ── japicmp fat-jar — copied from host (avoids corporate SSL proxy issues) ────
-# Download on host first:
-#   curl -L https://repo1.maven.org/maven2/com/github/siom79/japicmp/japicmp/0.26.0/japicmp-0.26.0-jar-with-dependencies.jar -o tools/japicmp.jar
+# ── japicmp — copied from host (no curl/SSL needed) ──────────────────────────
 RUN mkdir -p /opt/japicmp
 COPY tools/japicmp.jar /opt/japicmp/japicmp.jar
 
@@ -62,71 +51,52 @@ WORKDIR /app
 COPY sonar-ai/requirements.txt   ./sonar-requirements.txt
 COPY fortify-ai/requirements.txt ./fortify-requirements.txt
 
-# --trusted-host flags bypass corporate SSL proxy certificate errors
-RUN pip install --no-cache-dir     --trusted-host pypi.org     --trusted-host pypi.python.org     --trusted-host files.pythonhosted.org     -r sonar-requirements.txt  && pip install --no-cache-dir     --trusted-host pypi.org     --trusted-host pypi.python.org     --trusted-host files.pythonhosted.org     -r fortify-requirements.txt
+RUN pip install --no-cache-dir -r sonar-requirements.txt
+RUN pip install --no-cache-dir -r fortify-requirements.txt
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
 COPY fortify-ai/ /app/fortify-ai/
 COPY .env*       /app/
 
-# ── Angular — copy pre-built dist from host (no npm/node needed here) ─────────
-# Run on host first:  cd ui && npx ng build --configuration production
+# ── Angular — pre-built dist copied from host ─────────────────────────────────
 RUN rm -rf /usr/share/nginx/html/*
 COPY ui/dist/sonarfort-ai/browser /usr/share/nginx/html
 
-# ── nginx — SPA + reverse proxy for both APIs ─────────────────────────────────
+# ── nginx config ──────────────────────────────────────────────────────────────
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
-RUN printf '\
-server {\n\
+RUN printf 'server {\n\
     listen 80;\n\
     server_name _;\n\
     root /usr/share/nginx/html;\n\
     index index.html;\n\
-\n\
     location /api/ {\n\
-        proxy_pass         http://127.0.0.1:8000/api/;\n\
+        proxy_pass http://127.0.0.1:8000/api/;\n\
         proxy_http_version 1.1;\n\
-        proxy_set_header   Host          $host;\n\
-        proxy_set_header   X-Real-IP     $remote_addr;\n\
+        proxy_set_header Host $host;\n\
+        proxy_set_header X-Real-IP $remote_addr;\n\
         proxy_read_timeout 300s;\n\
-        proxy_send_timeout 300s;\n\
         client_max_body_size 50M;\n\
     }\n\
-\n\
     location /fortify/ {\n\
-        proxy_pass         http://127.0.0.1:8001/;\n\
+        proxy_pass http://127.0.0.1:8001/;\n\
         proxy_http_version 1.1;\n\
-        proxy_set_header   Host          $host;\n\
-        proxy_set_header   X-Real-IP     $remote_addr;\n\
+        proxy_set_header Host $host;\n\
+        proxy_set_header X-Real-IP $remote_addr;\n\
         proxy_read_timeout 300s;\n\
-        proxy_send_timeout 300s;\n\
     }\n\
-\n\
     location = /health/sonar   { proxy_pass http://127.0.0.1:8000/api/config; access_log off; }\n\
-    location = /health/fortify { proxy_pass http://127.0.0.1:8001/health;    access_log off; }\n\
-\n\
+    location = /health/fortify { proxy_pass http://127.0.0.1:8001/health; access_log off; }\n\
     location / {\n\
         try_files $uri $uri/ /index.html;\n\
-        expires 1h;\n\
-        add_header Cache-Control "public, must-revalidate";\n\
-    }\n\
-\n\
-    location ~* \.(js|css|woff2?|ttf|eot|svg|ico|png|jpg|jpeg|gif)$ {\n\
-        expires 1y;\n\
-        add_header Cache-Control "public, immutable";\n\
-        try_files $uri =404;\n\
     }\n\
 }\n' > /etc/nginx/conf.d/sonarfort.conf
 
-# ── supervisord — nginx + sonar-api + fortify-api ─────────────────────────────
-RUN printf '\
-[supervisord]\n\
+# ── supervisord ───────────────────────────────────────────────────────────────
+RUN printf '[supervisord]\n\
 nodaemon=true\n\
 user=root\n\
 logfile=/var/log/supervisor/supervisord.log\n\
-logfile_maxbytes=10MB\n\
-pidfile=/var/run/supervisord.pid\n\
 \n\
 [program:nginx]\n\
 command=/usr/sbin/nginx -g "daemon off;"\n\
