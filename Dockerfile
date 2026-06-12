@@ -1,55 +1,36 @@
 # =============================================================================
-# SonarFort AI — Single Multi-Stage Dockerfile
+# SonarFort AI — Single-Stage Dockerfile (no npm/node inside Docker)
 #
-# Directory structure expected:
+# PRE-REQUISITE — run this on your host ONCE before docker build:
+#   cd ui
+#   npx ng build --configuration production
+#   cd ..
+# This produces ui/dist/sonarfort-ai/browser which is copied directly in.
+#
+# Directory structure:
 #   sonarfort-ai/
-#   ├── fortify-ai/        FortifyAI Python source  (api_server.py lives here)
-#   ├── sonar-ai/          SonarAI Python source    (api.py lives here)
-#   ├── ui/                Angular 17 frontend
+#   ├── fortify-ai/        FortifyAI Python source  (api_server.py)
+#   ├── sonar-ai/          SonarAI Python source     (api.py)
+#   ├── ui/
+#   │   └── dist/sonarfort-ai/browser/   ← built by you on host
 #   ├── .env
-#   ├── Dockerfile         ← this file
+#   ├── Dockerfile
 #   └── docker-compose.yml
 #
-# Processes managed by supervisord inside the single container:
-#   nginx          :80    → Angular SPA
-#                          /api/      → SonarAI   :8000
-#                          /fortify/  → FortifyAI :8001
-#   sonar-api      :8000  → SonarAI   (sonar-ai/api.py)
-#   fortify-api    :8001  → FortifyAI (fortify-ai/api_server.py)
+# Processes (supervisord):
+#   nginx       :80   → Angular SPA
+#                       /api/     → SonarAI   :8000
+#                       /fortify/ → FortifyAI :8001
+#   sonar-api   :8000 → sonar-ai/api.py
+#   fortify-api :8001 → fortify-ai/api_server.py
 # =============================================================================
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — Angular 17 production build  (source lives in ui/)
-# ─────────────────────────────────────────────────────────────────────────────
-FROM node:20-alpine AS node-builder
-
-WORKDIR /ui
-
-RUN npm install -g @angular/cli@17
-
-COPY ui/package.json ui/package-lock.json* ./
-RUN npm ci --prefer-offline
-
-COPY ui/ .
-RUN ng build --configuration production
-# Output → dist/sonarfort-ai/browser
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 2 — Runtime: Python 3.11 + Java 17 + nginx + supervisord
-# ─────────────────────────────────────────────────────────────────────────────
 FROM python:3.11-bookworm
 
 # ── System packages ───────────────────────────────────────────────────────────
-# Add Adoptium temurin repo as fallback for Java 17 on any Debian base
-RUN apt-get update && apt-get install -y --no-install-recommends wget gnupg software-properties-common \
-    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /etc/apt/trusted.gpg.d/adoptium.gpg \
-    && echo "deb https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" \
-       > /etc/apt/sources.list.d/adoptium.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        temurin-17-jdk \
+# bookworm (Debian 12) ships openjdk-17 natively — no extra repo needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openjdk-17-jdk-headless \
         maven \
         nginx \
         supervisor \
@@ -59,40 +40,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget gnupg soft
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Temurin 17 sets JAVA_HOME automatically; this ensures PATH is correct
-ENV JAVA_HOME=/opt/java/openjdk
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# ── japicmp fat-jar ───────────────────────────────────────────────────────────
+# ── japicmp fat-jar (API breaking-change diff for FortifyAI) ─────────────────
 ARG JAPICMP_VERSION=0.23.0
 RUN mkdir -p /opt/japicmp && curl -fsSL \
     "https://repo1.maven.org/maven2/com/github/siom79/japicmp/japicmp/${JAPICMP_VERSION}/japicmp-${JAPICMP_VERSION}-jar-with-dependencies.jar" \
     -o /opt/japicmp/japicmp.jar
 
-# ── Python deps — install both pipelines' requirements ───────────────────────
+# ── Python dependencies ───────────────────────────────────────────────────────
 WORKDIR /app
 
-# SonarAI requirements
-COPY sonar-ai/requirements.txt ./sonar-requirements.txt
-RUN pip install --no-cache-dir -r sonar-requirements.txt
-
-# FortifyAI requirements (pip skips already-installed packages automatically)
+COPY sonar-ai/requirements.txt   ./sonar-requirements.txt
 COPY fortify-ai/requirements.txt ./fortify-requirements.txt
-RUN pip install --no-cache-dir -r fortify-requirements.txt
+
+RUN pip install --no-cache-dir -r sonar-requirements.txt \
+ && pip install --no-cache-dir -r fortify-requirements.txt
 
 # ── Application source ────────────────────────────────────────────────────────
-# Both pipelines copied into named subdirs; supervisord launches each in its dir
 COPY sonar-ai/   /app/sonar-ai/
 COPY fortify-ai/ /app/fortify-ai/
+COPY .env*       /app/
 
-# Shared .env at project root (also readable by both servers)
-COPY .env* /app/
-
-# ── Angular static files from Stage 1 ────────────────────────────────────────
+# ── Angular — copy pre-built dist from host (no npm/node needed here) ─────────
+# Run on host first:  cd ui && npx ng build --configuration production
 RUN rm -rf /usr/share/nginx/html/*
-COPY --from=node-builder /ui/dist/sonarfort-ai/browser /usr/share/nginx/html
+COPY ui/dist/sonarfort-ai/browser /usr/share/nginx/html
 
-# ── nginx configuration ───────────────────────────────────────────────────────
+# ── nginx — SPA + reverse proxy for both APIs ─────────────────────────────────
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
 RUN printf '\
 server {\n\
@@ -101,23 +77,21 @@ server {\n\
     root /usr/share/nginx/html;\n\
     index index.html;\n\
 \n\
-    # SonarAI API  (sonar-ai/api.py — port 8000)\n\
     location /api/ {\n\
         proxy_pass         http://127.0.0.1:8000/api/;\n\
         proxy_http_version 1.1;\n\
-        proxy_set_header   Host            $host;\n\
-        proxy_set_header   X-Real-IP       $remote_addr;\n\
+        proxy_set_header   Host          $host;\n\
+        proxy_set_header   X-Real-IP     $remote_addr;\n\
         proxy_read_timeout 300s;\n\
         proxy_send_timeout 300s;\n\
         client_max_body_size 50M;\n\
     }\n\
 \n\
-    # FortifyAI API  (fortify-ai/api_server.py — port 8001)\n\
     location /fortify/ {\n\
         proxy_pass         http://127.0.0.1:8001/;\n\
         proxy_http_version 1.1;\n\
-        proxy_set_header   Host            $host;\n\
-        proxy_set_header   X-Real-IP       $remote_addr;\n\
+        proxy_set_header   Host          $host;\n\
+        proxy_set_header   X-Real-IP     $remote_addr;\n\
         proxy_read_timeout 300s;\n\
         proxy_send_timeout 300s;\n\
     }\n\
@@ -138,7 +112,7 @@ server {\n\
     }\n\
 }\n' > /etc/nginx/conf.d/sonarfort.conf
 
-# ── supervisord ───────────────────────────────────────────────────────────────
+# ── supervisord — nginx + sonar-api + fortify-api ─────────────────────────────
 RUN printf '\
 [supervisord]\n\
 nodaemon=true\n\
@@ -198,9 +172,6 @@ ENV JAPICMP_JAR_PATH=/opt/japicmp/japicmp.jar \
     MAX_UPGRADES=0 \
     PYTHONUNBUFFERED=1
 
-# 80   = nginx (Angular UI + proxy)
-# 8000 = SonarAI FastAPI (direct)
-# 8001 = FortifyAI FastAPI (direct)
 EXPOSE 80 8000 8001
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
