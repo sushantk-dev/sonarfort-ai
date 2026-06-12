@@ -1,0 +1,50 @@
+version: "3.9"
+
+# =============================================================================
+# SonarFort AI — docker-compose
+#
+# Everything runs inside a single image built from the Dockerfile.
+# Two named volumes persist data across restarts.
+#
+# Usage:
+#   cp .env.example .env        # fill in secrets
+#   docker compose up --build   # http://localhost  (UI)
+#                                # http://localhost:8000  (SonarAI API direct)
+#                                # http://localhost:8001  (FortifyAI API direct)
+# =============================================================================
+
+services:
+  sonarfort:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sonarfort-ai:latest
+    container_name: sonarfort-ai
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"       # Angular UI  (primary — use this in browser)
+      - "8000:8000"   # SonarAI API  (direct access / Swagger at :8000/docs)
+      - "8001:8001"   # FortifyAI API (direct access / Swagger at :8001/docs)
+    volumes:
+      # Your Maven project — bind-mounted so the pipeline can read/write pom.xml
+      - ${MAVEN_PROJECT_PATH:-./workspace}:/workspace
+      # GCP Application Default Credentials for local dev
+      - ${GOOGLE_APPLICATION_CREDENTIALS_DIR:-~/.config/gcloud}:/root/.config/gcloud:ro
+      # Persist FortifyAI escalation output + ADR PDFs
+      - fortifyai-output:/tmp/fortifyai
+      # Persist SonarAI uploaded reports across restarts
+      - sonar-uploads:/app/uploads
+      # Persist ChromaDB vector store (SonarAI RAG)
+      - chroma-data:/app/chroma
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health/sonar"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  fortifyai-output:
+  sonar-uploads:
+  chroma-data:

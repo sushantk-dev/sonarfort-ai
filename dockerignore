@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+htmlcov/
+coverage/
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+*.js.map
+
+# Secrets
+.env
+*.env
+secrets/
+*.pem
+*.key
+*.p12
+gcloud/
+
+# Git
+.git/
+.gitignore
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Maven workspace — mounted as volume, never baked into image
+workspace/
+
+# ChromaDB — mounted as volume
+chroma/
