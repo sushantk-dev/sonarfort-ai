@@ -55,6 +55,10 @@ RUN pip install --no-cache-dir -r requirements-merged.txt
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
 COPY fortify-ai/ /app/fortify-ai/
+# ── CORS patch — allow all origins so browser on port 80 can call 8000/8001 ──
+RUN sed -i 's|allow_origins=\["http://localhost:4200", "http://localhost:4201"\]|allow_origins=["*"]|g'         /app/sonar-ai/api.py /app/fortify-ai/api_server.py || true
+RUN sed -i 's|allow_origin_regex=.*|allow_origins=["*"],|g'         /app/fortify-ai/api_server.py || true
+
 # .env is mounted at runtime via docker-compose volumes
 # This ensures changes to .env take effect without rebuilding
 
@@ -115,7 +119,8 @@ ENV JAPICMP_JAR_PATH=/opt/japicmp/japicmp.jar \
     GCP_LOCATION=us-central1 \
     MAX_RETRIES=3 \
     MAX_UPGRADES=0 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    CORS_ORIGINS="http://localhost,http://localhost:80,http://localhost:4200,http://localhost:4201,http://localhost:8000,http://localhost:8001" 
 
 EXPOSE 80 8000 8001
 
