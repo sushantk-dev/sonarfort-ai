@@ -1,16 +1,16 @@
 # =============================================================================
-# SonarFort AI — Merged requirements (SonarAI + FortifyAI)
-# Pinned to compatible versions resolving langgraph/langchain-core conflict:
-#   langgraph 0.2.x needs langchain-core>=0.2.27,<0.3
-#   langchain 0.3.x needs langchain-core>=0.3.x
-#   Solution: use langgraph>=0.3 which is compatible with langchain 0.3
+# SonarFort AI — Merged requirements with exact compatible pins
+#
+# Compatibility matrix resolved:
+#   langchain-core 0.3.x  ←  required by langchain 0.3 + langgraph 0.3
+#   langchain-google-vertexai 2.x  ← supports langchain-core 0.3.x
 # =============================================================================
 
-# ── Agent Framework ───────────────────────────────────────────────────────────
-langgraph>=0.3,<0.4
-langchain>=0.3,<0.4
-langchain-core>=0.3,<0.4
-langchain-google-vertexai>=1.0,<2.0
+# ── Core versions pinned for compatibility ────────────────────────────────────
+langchain-core>=0.3.0,<0.4.0
+langchain>=0.3.0,<0.4.0
+langgraph>=0.3.0,<0.4.0
+langchain-google-vertexai>=2.0.0,<3.0.0
 
 # ── GCP / Vertex AI ──────────────────────────────────────────────────────────
 google-cloud-aiplatform>=1.60,<2.0
