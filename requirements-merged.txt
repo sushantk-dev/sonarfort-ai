@@ -1,0 +1,50 @@
+# =============================================================================
+# SonarFort AI — Merged requirements (SonarAI + FortifyAI)
+# Pinned to compatible versions resolving langgraph/langchain-core conflict:
+#   langgraph 0.2.x needs langchain-core>=0.2.27,<0.3
+#   langchain 0.3.x needs langchain-core>=0.3.x
+#   Solution: use langgraph>=0.3 which is compatible with langchain 0.3
+# =============================================================================
+
+# ── Agent Framework ───────────────────────────────────────────────────────────
+langgraph>=0.3,<0.4
+langchain>=0.3,<0.4
+langchain-core>=0.3,<0.4
+langchain-google-vertexai>=1.0,<2.0
+
+# ── GCP / Vertex AI ──────────────────────────────────────────────────────────
+google-cloud-aiplatform>=1.60,<2.0
+google-cloud-secret-manager>=2.0,<3.0
+
+# ── HTTP / REST ───────────────────────────────────────────────────────────────
+requests>=2.31,<3.0
+
+# ── GitHub PR delivery ────────────────────────────────────────────────────────
+PyGithub>=2.3,<3.0
+
+# ── Repository access ─────────────────────────────────────────────────────────
+gitpython>=3.1,<4.0
+
+# ── Java AST analysis ─────────────────────────────────────────────────────────
+javalang>=0.13,<0.14
+
+# ── Version comparison ────────────────────────────────────────────────────────
+packaging>=24.0,<25.0
+
+# ── Config / Settings ─────────────────────────────────────────────────────────
+pydantic-settings>=2.5,<3.0
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+loguru>=0.7,<1.0
+
+# ── API servers ───────────────────────────────────────────────────────────────
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9
+
+# ── RAG / Vector store (SonarAI) ─────────────────────────────────────────────
+chromadb>=0.5,<1.0
+numpy>=1.26
+
+# ── LangSmith tracing (optional) ─────────────────────────────────────────────
+langsmith>=0.1

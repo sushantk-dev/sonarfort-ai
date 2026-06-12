@@ -48,11 +48,9 @@ COPY tools/japicmp.jar /opt/japicmp/japicmp.jar
 # ── Python dependencies ───────────────────────────────────────────────────────
 WORKDIR /app
 
-COPY sonar-ai/requirements.txt   ./sonar-requirements.txt
-COPY fortify-ai/requirements.txt ./fortify-requirements.txt
-
-RUN pip install --no-cache-dir -r sonar-requirements.txt
-RUN pip install --no-cache-dir -r fortify-requirements.txt
+# Single merged requirements — resolves langgraph/langchain-core version conflict
+COPY requirements-merged.txt ./requirements-merged.txt
+RUN pip install --no-cache-dir -r requirements-merged.txt
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
