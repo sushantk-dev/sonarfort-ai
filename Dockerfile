@@ -39,11 +39,17 @@ RUN ng build --configuration production
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — Runtime: Python 3.11 + Java 17 + nginx + supervisord
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.11-bookworm
 
 # ── System packages ───────────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-17-jdk-headless \
+# Add Adoptium temurin repo as fallback for Java 17 on any Debian base
+RUN apt-get update && apt-get install -y --no-install-recommends wget gnupg software-properties-common \
+    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /etc/apt/trusted.gpg.d/adoptium.gpg \
+    && echo "deb https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+       > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        temurin-17-jdk \
         maven \
         nginx \
         supervisor \
@@ -53,7 +59,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+# Temurin 17 sets JAVA_HOME automatically; this ensures PATH is correct
+ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # ── japicmp fat-jar ───────────────────────────────────────────────────────────
