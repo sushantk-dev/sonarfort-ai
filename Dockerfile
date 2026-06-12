@@ -55,9 +55,25 @@ RUN pip install --no-cache-dir -r requirements-merged.txt
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
 COPY fortify-ai/ /app/fortify-ai/
-# ── CORS patch — allow all origins so browser on port 80 can call 8000/8001 ──
-RUN sed -i 's|allow_origins=\["http://localhost:4200", "http://localhost:4201"\]|allow_origins=["*"]|g'         /app/sonar-ai/api.py /app/fortify-ai/api_server.py || true
-RUN sed -i 's|allow_origin_regex=.*|allow_origins=["*"],|g'         /app/fortify-ai/api_server.py || true
+# ── CORS patch — replace entire CORSMiddleware call with wildcard version ─────
+RUN python3 - << 'PYEOF2'
+import pathlib, re
+
+for fpath in ["/app/sonar-ai/api.py", "/app/fortify-ai/api_server.py"]:
+    p = pathlib.Path(fpath)
+    if not p.exists():
+        continue
+    txt = p.read_text()
+    # Replace the entire add_middleware(...) block with a clean wildcard version
+    txt = re.sub(
+        r'app\.add_middleware\s*\(\s*CORSMiddleware.*?\)',
+        'app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])',
+        txt,
+        flags=re.DOTALL
+    )
+    p.write_text(txt)
+    print("Patched:", fpath)
+PYEOF2
 
 # .env is mounted at runtime via docker-compose volumes
 # This ensures changes to .env take effect without rebuilding
