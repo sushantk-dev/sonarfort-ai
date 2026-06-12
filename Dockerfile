@@ -43,11 +43,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# ── japicmp fat-jar (API breaking-change diff for FortifyAI) ─────────────────
-ARG JAPICMP_VERSION=0.23.0
-RUN mkdir -p /opt/japicmp && curl -fsSL \
-    "https://repo1.maven.org/maven2/com/github/siom79/japicmp/japicmp/${JAPICMP_VERSION}/japicmp-${JAPICMP_VERSION}-jar-with-dependencies.jar" \
-    -o /opt/japicmp/japicmp.jar
+# ── japicmp fat-jar — copied from host (avoids corporate SSL proxy issues) ────
+# Download on host first:
+#   curl -L https://repo1.maven.org/maven2/com/github/siom79/japicmp/japicmp/0.26.0/japicmp-0.26.0-jar-with-dependencies.jar -o tools/japicmp.jar
+RUN mkdir -p /opt/japicmp
+COPY tools/japicmp.jar /opt/japicmp/japicmp.jar
 
 # ── Python dependencies ───────────────────────────────────────────────────────
 WORKDIR /app
