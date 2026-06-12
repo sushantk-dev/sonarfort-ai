@@ -55,10 +55,8 @@ RUN pip install --no-cache-dir -r requirements-merged.txt
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
 COPY fortify-ai/ /app/fortify-ai/
-# Copy .env to all locations where both pipelines look for it
-COPY .env /app/.env
-COPY .env /app/sonar-ai/.env
-COPY .env /app/fortify-ai/.env
+# .env is mounted at runtime via docker-compose volumes
+# This ensures changes to .env take effect without rebuilding
 
 # ── Angular — pre-built dist copied from host ─────────────────────────────────
 RUN rm -rf /usr/share/nginx/html/*
