@@ -43,6 +43,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
+# ── Global pip config — trust PyPI hosts (corporate SSL proxy) ───────────────
+RUN mkdir -p /root/.config/pip && printf '[global]
+trusted-host = pypi.org
+               pypi.python.org
+               files.pythonhosted.org
+' > /root/.config/pip/pip.conf
+
 # ── japicmp fat-jar — copied from host (avoids corporate SSL proxy issues) ────
 # Download on host first:
 #   curl -L https://repo1.maven.org/maven2/com/github/siom79/japicmp/japicmp/0.26.0/japicmp-0.26.0-jar-with-dependencies.jar -o tools/japicmp.jar
@@ -55,8 +62,8 @@ WORKDIR /app
 COPY sonar-ai/requirements.txt   ./sonar-requirements.txt
 COPY fortify-ai/requirements.txt ./fortify-requirements.txt
 
-RUN pip install --no-cache-dir -r sonar-requirements.txt \
- && pip install --no-cache-dir -r fortify-requirements.txt
+# --trusted-host flags bypass corporate SSL proxy certificate errors
+RUN pip install --no-cache-dir     --trusted-host pypi.org     --trusted-host pypi.python.org     --trusted-host files.pythonhosted.org     -r sonar-requirements.txt  && pip install --no-cache-dir     --trusted-host pypi.org     --trusted-host pypi.python.org     --trusted-host files.pythonhosted.org     -r fortify-requirements.txt
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
