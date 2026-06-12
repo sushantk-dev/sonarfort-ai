@@ -1,28 +1,23 @@
-# version line removed — not needed in modern Docker Compose (avoids warning)
-
 services:
   sonarfort:
     build:
-      context: .        # root of sonarfort-ai/ — Dockerfile sees fortify-ai/ sonar-ai/ ui/
+      context: .
       dockerfile: Dockerfile
     image: sonarfort-ai:latest
     container_name: sonarfort-ai
     restart: unless-stopped
-    env_file: .env
+    # Load .env from host — injects all vars into container environment
+    env_file:
+      - .env
     ports:
-      - "80:80"       # Angular UI  — open http://localhost
-      - "8000:8000"   # SonarAI API direct  — Swagger at http://localhost:8000/docs
-      - "8001:8001"   # FortifyAI API direct — Swagger at http://localhost:8001/docs
+      - "80:80"       # Angular UI — http://localhost
+      - "8000:8000"   # SonarAI API — http://localhost:8000/docs
+      - "8001:8001"   # FortifyAI API — http://localhost:8001/docs
     volumes:
-      # Maven project the FortifyAI pipeline will remediate
       - ${MAVEN_PROJECT_PATH:-./workspace}:/workspace
-      # GCP Application Default Credentials (local dev — gcloud CLI)
       - ${GOOGLE_APPLICATION_CREDENTIALS_DIR:-~/.config/gcloud}:/root/.config/gcloud:ro
-      # Persist FortifyAI escalation .txt files + ADR PDFs
       - fortifyai-output:/tmp/fortifyai
-      # Persist SonarAI uploaded reports
       - sonar-uploads:/app/sonar-ai/uploads
-      # Persist ChromaDB RAG vector store
       - chroma-data:/app/sonar-ai/chroma
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/health/sonar"]
