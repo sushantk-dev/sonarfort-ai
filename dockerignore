@@ -1,32 +1,24 @@
 # Python
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
-env/
-*.egg-info/
-dist/
-build/
-.eggs/
-.pytest_cache/
-htmlcov/
-coverage/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.venv/
+**/venv/
+**/*.egg-info/
+**/.pytest_cache/
+**/htmlcov/
 
 # Node / Angular
-node_modules/
-dist/
-.angular/
-*.js.map
+ui/node_modules/
+ui/dist/
+ui/.angular/
+**/*.js.map
 
 # Secrets
 .env
-*.env
 secrets/
-*.pem
-*.key
-*.p12
-gcloud/
+**/*.pem
+**/*.key
 
 # Git
 .git/
@@ -35,15 +27,10 @@ gcloud/
 # IDE / OS
 .vscode/
 .idea/
-*.DS_Store
-Thumbs.db
+**/*.DS_Store
 
-# Logs
-*.log
-logs/
-
-# Maven workspace — mounted as volume, never baked into image
+# Maven workspace (mounted as volume — never bake into image)
 workspace/
 
-# ChromaDB — mounted as volume
-chroma/
+# ChromaDB (mounted as volume)
+sonar-ai/chroma/

@@ -1,42 +1,29 @@
-version: "3.9"
-
-# =============================================================================
-# SonarFort AI — docker-compose
-#
-# Everything runs inside a single image built from the Dockerfile.
-# Two named volumes persist data across restarts.
-#
-# Usage:
-#   cp .env.example .env        # fill in secrets
-#   docker compose up --build   # http://localhost  (UI)
-#                                # http://localhost:8000  (SonarAI API direct)
-#                                # http://localhost:8001  (FortifyAI API direct)
-# =============================================================================
+# version line removed — not needed in modern Docker Compose (avoids warning)
 
 services:
   sonarfort:
     build:
-      context: .
+      context: .        # root of sonarfort-ai/ — Dockerfile sees fortify-ai/ sonar-ai/ ui/
       dockerfile: Dockerfile
     image: sonarfort-ai:latest
     container_name: sonarfort-ai
     restart: unless-stopped
     env_file: .env
     ports:
-      - "80:80"       # Angular UI  (primary — use this in browser)
-      - "8000:8000"   # SonarAI API  (direct access / Swagger at :8000/docs)
-      - "8001:8001"   # FortifyAI API (direct access / Swagger at :8001/docs)
+      - "80:80"       # Angular UI  — open http://localhost
+      - "8000:8000"   # SonarAI API direct  — Swagger at http://localhost:8000/docs
+      - "8001:8001"   # FortifyAI API direct — Swagger at http://localhost:8001/docs
     volumes:
-      # Your Maven project — bind-mounted so the pipeline can read/write pom.xml
+      # Maven project the FortifyAI pipeline will remediate
       - ${MAVEN_PROJECT_PATH:-./workspace}:/workspace
-      # GCP Application Default Credentials for local dev
+      # GCP Application Default Credentials (local dev — gcloud CLI)
       - ${GOOGLE_APPLICATION_CREDENTIALS_DIR:-~/.config/gcloud}:/root/.config/gcloud:ro
-      # Persist FortifyAI escalation output + ADR PDFs
+      # Persist FortifyAI escalation .txt files + ADR PDFs
       - fortifyai-output:/tmp/fortifyai
-      # Persist SonarAI uploaded reports across restarts
-      - sonar-uploads:/app/uploads
-      # Persist ChromaDB vector store (SonarAI RAG)
-      - chroma-data:/app/chroma
+      # Persist SonarAI uploaded reports
+      - sonar-uploads:/app/sonar-ai/uploads
+      # Persist ChromaDB RAG vector store
+      - chroma-data:/app/sonar-ai/chroma
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/health/sonar"]
       interval: 30s
