@@ -91,46 +91,15 @@ RUN printf 'server {\n\
 }\n' > /etc/nginx/conf.d/sonarfort.conf
 
 # ── supervisord ───────────────────────────────────────────────────────────────
-RUN printf '[supervisord]\n\
-nodaemon=true\n\
-user=root\n\
-logfile=/var/log/supervisor/supervisord.log\n\
-\n\
-[program:nginx]\n\
-command=/usr/sbin/nginx -g "daemon off;"\n\
-autostart=true\n\
-autorestart=true\n\
-stdout_logfile=/dev/stdout\n\
-stdout_logfile_maxbytes=0\n\
-stderr_logfile=/dev/stderr\n\
-stderr_logfile_maxbytes=0\n\
-priority=10\n\
-\n\
-[program:sonar-api]\n\
-command=uvicorn api:app --host 127.0.0.1 --port 8000 --workers 2\n\
-directory=/app/sonar-ai\n\
-autostart=true\n\
-autorestart=true\n\
-startsecs=5\n\
-stdout_logfile=/dev/stdout\n\
-stdout_logfile_maxbytes=0\n\
-stderr_logfile=/dev/stderr\n\
-stderr_logfile_maxbytes=0\n\
-environment=PYTHONUNBUFFERED="1"\n\
-priority=20\n\
-\n\
-[program:fortify-api]\n\
-command=uvicorn api_server:app --host 127.0.0.1 --port 8001 --workers 2\n\
-directory=/app/fortify-ai\n\
-autostart=true\n\
-autorestart=true\n\
-startsecs=5\n\
-stdout_logfile=/dev/stdout\n\
-stdout_logfile_maxbytes=0\n\
-stderr_logfile=/dev/stderr\n\
-stderr_logfile_maxbytes=0\n\
-environment=PYTHONUNBUFFERED="1"\n\
-priority=30\n' > /etc/supervisor/conf.d/sonarfort.conf
+# Write main supervisord.conf with [include] directive
+RUN printf '[supervisord]\nnodaemon=true\nuser=root\nlogfile=/var/log/supervisor/supervisord.log\nlogfile_maxbytes=10MB\npidfile=/var/run/supervisord.pid\n\n[include]\nfiles = /etc/supervisor/conf.d/*.conf\n' > /etc/supervisor/supervisord.conf
+
+# Write individual program configs
+RUN printf '[program:nginx]\ncommand=/usr/sbin/nginx -g "daemon off;"\nautostart=true\nautorestart=true\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\npriority=10\n' > /etc/supervisor/conf.d/nginx.conf
+
+RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 127.0.0.1 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1"\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
+
+RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 127.0.0.1 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1"\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
 
 # ── Runtime directories ───────────────────────────────────────────────────────
 RUN mkdir -p /tmp/fortifyai \
@@ -149,4 +118,4 @@ ENV JAPICMP_JAR_PATH=/opt/japicmp/japicmp.jar \
 
 EXPOSE 80 8000 8001
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
