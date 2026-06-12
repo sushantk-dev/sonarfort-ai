@@ -98,9 +98,9 @@ RUN printf '[supervisord]\nnodaemon=true\nuser=root\nlogfile=/var/log/supervisor
 # Write individual program configs
 RUN printf '[program:nginx]\ncommand=/usr/sbin/nginx -g "daemon off;"\nautostart=true\nautorestart=true\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\npriority=10\n' > /etc/supervisor/conf.d/nginx.conf
 
-RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 127.0.0.1 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/sonar-ai/.env"\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
+RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/sonar-ai/.env"\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
 
-RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 127.0.0.1 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/fortify-ai/.env"\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
+RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 0.0.0.0 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/fortify-ai/.env"\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
 
 # ── Runtime directories ───────────────────────────────────────────────────────
 RUN mkdir -p /tmp/fortifyai \
