@@ -280,10 +280,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(f"[Clone] Cloning {config.github_repo} → {clone_dir}")
         try:
             import subprocess
-            result = subprocess.run(
-                ["git", "clone", "--depth", "1", repo_url, clone_dir],
-                capture_output=True, text=True, timeout=300,
-            )
+	    result = subprocess.run(
+    		["git", "-c", "http.sslVerify=false", "clone", "--depth", "1", repo_url, clone_dir],
+    		capture_output=True, text=True, timeout=300,
+	    )
             if result.returncode != 0:
                 logger.error(f"[Clone] ❌ git clone failed:\n{result.stderr[:500]}")
                 shutil.rmtree(clone_dir, ignore_errors=True)
