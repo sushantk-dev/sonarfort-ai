@@ -101,6 +101,7 @@ class FortifyClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
+	session.verify = False
 
         # Retry on 429 (rate limit) and 5xx server errors
         retry = Retry(

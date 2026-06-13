@@ -241,6 +241,7 @@ def fetch_token(
         data=payload,                          # form-encoded, NOT JSON
         headers={"Accept": "application/json"},
         timeout=_REQUEST_TIMEOUT,
+	verify=False,
     )
 
     elapsed = round(time.time() - t0, 2)
