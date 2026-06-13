@@ -41,6 +41,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
+# ── Corporate CA — Sectigo Public Server Authentication Root R46 ──────────────
+COPY certs/SecR46.crt /usr/local/share/ca-certificates/SecR46.crt
+RUN update-ca-certificates
+
+# Trust for Python requests / httpx / urllib3
+RUN cat /usr/local/share/ca-certificates/SecR46.crt >> $(python3 -c "import certifi; print(certifi.where())" 2>/dev/null || echo /etc/ssl/certs/ca-certificates.crt)
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# Trust for Java (keytool)
+RUN keytool -import -noprompt \
+      -alias sectigo-r46 \
+      -keystore "${JAVA_HOME}/lib/security/cacerts" \
+      -storepass changeit \
+      -file /usr/local/share/ca-certificates/SecR46.crt
+
 # ── japicmp — copied from host (no curl/SSL needed) ──────────────────────────
 RUN mkdir -p /opt/japicmp
 COPY tools/japicmp.jar /opt/japicmp/japicmp.jar
@@ -102,9 +118,9 @@ RUN printf '[supervisord]\nnodaemon=true\nuser=root\nlogfile=/var/log/supervisor
 # Write individual program configs
 RUN printf '[program:nginx]\ncommand=/usr/sbin/nginx -g "daemon off;"\nautostart=true\nautorestart=true\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\npriority=10\n' > /etc/supervisor/conf.d/nginx.conf
 
-RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/sonar-ai/.env"\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
+RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/sonar-ai/.env",REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt",SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
 
-RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 0.0.0.0 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/fortify-ai/.env"\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
+RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 0.0.0.0 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/fortify-ai/.env",REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt",SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
 
 # ── Runtime directories ───────────────────────────────────────────────────────
 RUN mkdir -p /tmp/fortifyai \
