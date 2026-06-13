@@ -90,3 +90,19 @@ docker build -t us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort/sona
 
 docker push us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort/sonarfort-ai:latest
 
+
+
+
+
+python -c "import certifi; print(certifi.where())"
+
+
+
+python -c "import certifi; open(certifi.where(), 'ab').write(open('C:\\\\path\\\\to\\\\SecR46.crt','rb').read())"
+
+
+
+set REQUESTS\_CA\_BUNDLE=C:\\path\\to\\SecR46.crt
+
+set SSL\_CERT\_FILE=C:\\path\\to\\SecR46.crt
+
