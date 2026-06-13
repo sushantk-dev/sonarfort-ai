@@ -45,11 +45,6 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 COPY certs/SecR46.crt /usr/local/share/ca-certificates/SecR46.crt
 RUN update-ca-certificates
 
-# Trust for Python requests / httpx / urllib3
-RUN cat /usr/local/share/ca-certificates/SecR46.crt >> $(python3 -c "import certifi; print(certifi.where())" 2>/dev/null || echo /etc/ssl/certs/ca-certificates.crt)
-ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-
 # Trust for Java (keytool)
 RUN keytool -import -noprompt \
       -alias sectigo-r46 \
@@ -67,6 +62,11 @@ WORKDIR /app
 # Single merged requirements — resolves langgraph/langchain-core version conflict
 COPY requirements-merged.txt ./requirements-merged.txt
 RUN pip install --no-cache-dir -r requirements-merged.txt
+
+# ── Trust corporate CA in Python certifi bundle (must be after pip install) ───
+RUN cat /usr/local/share/ca-certificates/SecR46.crt >> $(python3 -c "import certifi; print(certifi.where())")
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
