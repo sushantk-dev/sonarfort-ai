@@ -105,7 +105,6 @@ class FortifyClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
-        session.verify = False
 
         # Retry on 429 (rate limit) and 5xx server errors
         retry = Retry(
@@ -143,8 +142,7 @@ class FortifyClient:
         """GET a single JSON response; raise on HTTP error."""
         url = self._url(path)
         logger.debug(f"[FortifyClient] GET {url} params={params}")
-        self._session.verify = False
-        resp = self._session.get(url, params=params, timeout=self._REQUEST_TIMEOUT)
+        resp = self._session.get(url, params=params, timeout=self._REQUEST_TIMEOUT, verify=False)
         resp.raise_for_status()
         return resp.json()
 
@@ -183,7 +181,7 @@ class FortifyClient:
         """POST JSON body; raise on HTTP error."""
         url = self._url(path)
         logger.debug(f"[FortifyClient] POST {url}")
-        resp = self._session.post(url, json=body, timeout=self._REQUEST_TIMEOUT)
+        resp = self._session.post(url, json=body, timeout=self._REQUEST_TIMEOUT, verify=False)
         resp.raise_for_status()
         # Some POST endpoints return 204 No Content
         if resp.status_code == 204 or not resp.content:
