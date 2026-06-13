@@ -408,6 +408,7 @@ def get_sonar_rule(rule_key: str) -> dict:
             f"{base_url}/api/rules/show",
             auth=(s.sonar_token, ""),
             params={"key": rule_key},
+	    verify=False,
             timeout=15,
         )
     except Exception as exc:
@@ -502,6 +503,7 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
                 url,
                 auth=(s.sonar_token, ""),
                 params=params,
+		verify=False,
                 timeout=30,
             )
             if resp.status_code == 401:
