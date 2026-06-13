@@ -1,0 +1,3 @@
+docker exec sonarfort-ai bash -c "sed -i 's|REQUESTS_CA_BUNDLE=\"/etc/ssl/certs/ca-certificates.crt\"|REQUESTS_CA_BUNDLE=\"/usr/local/lib/python3.11/site-packages/certifi/cacert.pem\"|g' /etc/supervisor/conf.d/sonar-api.conf"
+
+docker exec sonarfort-ai bash -c "sed -i 's|SSL_CERT_FILE=\"/etc/ssl/certs/ca-certificates.crt\"|SSL_CERT_FILE=\"/usr/local/lib/python3.11/site-packages/certifi/cacert.pem\"|g' /etc/supervisor/conf.d/sonar-api.conf"
