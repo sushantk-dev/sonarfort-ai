@@ -143,6 +143,7 @@ class FortifyClient:
         """GET a single JSON response; raise on HTTP error."""
         url = self._url(path)
         logger.debug(f"[FortifyClient] GET {url} params={params}")
+	self._session.verify = False
         resp = self._session.get(url, params=params, timeout=self._REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
