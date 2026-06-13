@@ -6,7 +6,7 @@ SonarFort AI is an end-to-end automated security remediation platform that unifi
 
 
 
-cp .env.example .env       
+cp .env.example .env
 
 docker compose up --build
 
@@ -19,4 +19,74 @@ docker compose up --build
 \# http://localhost:8000/docs  → SonarAI Swagger
 
 \# http://localhost:8001/docs  → FortifyAI Swagger
+
+
+
+Step 1 — Authenticate with GCP:
+
+gcloud auth login
+
+
+
+gcloud config set project YOUR\_GCP\_PROJECT\_ID
+
+
+
+Step 2 — Create Artifact Registry repo (once):
+
+gcloud artifacts repositories create sonarfort --repository-format=docker --location=us-central1 --project=YOUR\_GCP\_PROJECT\_ID
+
+
+
+Step 3 — Configure Docker to use GCP registry:
+
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+
+
+Step 4 — Build Angular first (if not already done):
+
+cd ui
+
+npx ng build --configuration production
+
+cd ..
+
+
+
+Step 5 — Build Docker image with GCP tag:
+
+docker build -t us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort/sonarfort-ai:latest .
+
+
+
+Step 6 — Push to Artifact Registry:
+
+docker push us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort/sonarfort-ai:latest
+
+
+
+Step 7 — Verify it's there:
+
+gcloud artifacts docker images list us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort
+
+
+
+Replace these values:
+
+YOUR\_GCP\_PROJECT\_ID  → your actual GCP project ID
+
+us-central1          → your preferred region
+
+sonarfort            → repo name (can be anything)
+
+
+
+Subsequent pushes (after code changes):
+
+cd ui \&\& npx ng build --configuration production \&\& cd ..
+
+docker build -t us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort/sonarfort-ai:latest .
+
+docker push us-central1-docker.pkg.dev/YOUR\_GCP\_PROJECT\_ID/sonarfort/sonarfort-ai:latest
 
