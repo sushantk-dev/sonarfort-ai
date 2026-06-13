@@ -1,3 +1,7 @@
-docker exec sonarfort-ai bash -c "sed -i 's|REQUESTS_CA_BUNDLE=\"/etc/ssl/certs/ca-certificates.crt\"|REQUESTS_CA_BUNDLE=\"/usr/local/lib/python3.11/site-packages/certifi/cacert.pem\"|g' /etc/supervisor/conf.d/sonar-api.conf"
+docker exec sonarfort-ai python3 -c "import certifi; print(open(certifi.where()).read()[-500:])"
 
-docker exec sonarfort-ai bash -c "sed -i 's|SSL_CERT_FILE=\"/etc/ssl/certs/ca-certificates.crt\"|SSL_CERT_FILE=\"/usr/local/lib/python3.11/site-packages/certifi/cacert.pem\"|g' /etc/supervisor/conf.d/sonar-api.conf"
+docker exec sonarfort-ai python3 -c "import requests; r = requests.get('https://cicd-tools.us.equifax.com', verify=True, timeout=10); print(r.status_code)"
+
+docker exec sonarfort-ai python3 -c "import requests; r = requests.get('https://cicd-tools.us.equifax.com', verify='/usr/local/lib/python3.11/site-packages/certifi/cacert.pem', timeout=10); print(r.status_code)"
+
+docker exec sonarfort-ai bash -c "grep -r 'verify' /app/sonar-ai/*.py"
