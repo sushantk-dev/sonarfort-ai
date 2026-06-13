@@ -106,3 +106,15 @@ set REQUESTS\_CA\_BUNDLE=C:\\path\\to\\SecR46.crt
 
 set SSL\_CERT\_FILE=C:\\path\\to\\SecR46.crt
 
+
+
+C:\\Users\\sxk1277\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\certifi\\cacert.pem
+
+
+
+type "C:\\Work\\Special-Project-AI\\sonarfort-ai\\certs\\SecR46.crt" >> "C:\\Users\\sxk1277\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\certifi\\cacert.pem"
+
+
+
+set REQUESTS\_CA\_BUNDLE=C:\\Users\\sxk1277\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\certifi\\cacert.pem
+
