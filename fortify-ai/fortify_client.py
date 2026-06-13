@@ -31,7 +31,7 @@ from loguru import logger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-import urllib3 
+import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -105,7 +105,7 @@ class FortifyClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
-	session.verify = False
+        session.verify = False
 
         # Retry on 429 (rate limit) and 5xx server errors
         retry = Retry(
