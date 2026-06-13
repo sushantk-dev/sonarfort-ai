@@ -3,25 +3,32 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Pass proxy into build stage so pip/curl can reach internet
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     image: sonarfort-ai:latest
     container_name: sonarfort-ai
     restart: unless-stopped
-    # Load .env into container OS environment (primary method)
     env_file:
       - .env
     ports:
       - "80:80"
       - "8000:8000"
       - "8001:8001"
+    environment:
+      # Proxy vars explicitly set for runtime API calls (Fortify, Sonar, GCP)
+      HTTP_PROXY:  ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      http_proxy:  ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      NO_PROXY:    "localhost,127.0.0.1,169.254.169.254"
+      no_proxy:    "localhost,127.0.0.1,169.254.169.254"
     volumes:
-      # Mount .env directly into all locations both pipelines look for it
-      # Changes to .env take effect with just: docker compose restart
-      - ./.env:/app/.env:ro
-      - ./.env:/app/sonar-ai/.env:ro
-      - ./.env:/app/fortify-ai/.env:ro
-      # Corporate CA cert — bind-mount so it can be updated without rebuild
-      - ./certs/SecR46.crt:/usr/local/share/ca-certificates/SecR46.crt:ro
-      # Other volumes
+      - ./.env:/app/.env
+      - ./.env:/app/sonar-ai/.env
+      - ./.env:/app/fortify-ai/.env
       - ${MAVEN_PROJECT_PATH:-./workspace}:/workspace
       - fortifyai-output:/tmp/fortifyai
       - sonar-uploads:/app/sonar-ai/uploads
