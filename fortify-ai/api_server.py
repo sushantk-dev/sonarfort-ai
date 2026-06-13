@@ -513,7 +513,7 @@ def _clone_repo_if_needed(cfg: FortifyAIConfig, repo: str | None) -> tuple[Forti
     clone_dir = tempfile.mkdtemp(prefix="fortifyai_clone_")
     try:
         result = _sp.run(
-            ["git", "clone", "--depth", "1", repo_url, clone_dir],
+            ["git", "-c", "http.sslVerify=false", "clone", "--depth", "1", repo_url, clone_dir],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
