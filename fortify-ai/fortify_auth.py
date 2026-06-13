@@ -47,6 +47,10 @@ from typing import Optional
 import requests
 from loguru import logger
 
+import urllib3 
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning) 
+
 from config import FortifyAIConfig
 
 # Fortify OAuth endpoint path (relative to fortify_base_url)
