@@ -12,3 +12,18 @@ gcloud auth configure-docker REGION-docker.pkg.dev
 
 # 4. Push
 docker push REGION-docker.pkg.dev/YOUR_PROJECT_ID/YOUR_REPO/sonarfort-ai:latest
+
+
+Supervisord (Supervisor) is a process control system for Linux. In simple terms, it's a program that starts, monitors, and restarts other programs automatically.
+In your Dockerfile, it's used because a single Docker container normally runs one process, but your container needs to run three things simultaneously:
+
+nginx (serves the Angular UI)
+sonar-api (uvicorn on port 8000)
+fortify-api (uvicorn on port 8001)
+
+So supervisord acts as the container's single entrypoint (CMD) and is responsible for launching and keeping all three alive. If any of them crashes, supervisord restarts it automatically (autorestart=true).
+Your config in the Dockerfile sets this up like:
+[program:nginx]       → starts nginx
+[program:sonar-api]   → starts uvicorn on port 8000
+[program:fortify-api] → starts uvicorn on port 8001
+Without supervisord, you'd need to either run three separate containers (the typical Docker approach with docker-compose) or write a custom shell script to manage the processes yourself. Since your setup bundles everything into a single container, supervisord is the clean way to handle it.

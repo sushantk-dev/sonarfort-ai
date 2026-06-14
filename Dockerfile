@@ -21,7 +21,6 @@
 
 FROM python:3.11-bookworm
 
-# ── Corporate SSL proxy fix — write pip.conf before any pip calls ─────────────
 RUN mkdir -p /root/.config/pip && \
     echo "[global]" > /root/.config/pip/pip.conf && \
     echo "trusted-host = pypi.org pypi.python.org files.pythonhosted.org" >> /root/.config/pip/pip.conf
@@ -34,23 +33,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         supervisor \
         git \
         curl \
-        ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# ── Corporate CA — Sectigo Public Server Authentication Root R46 ──────────────
-COPY certs/SecR46.crt /usr/local/share/ca-certificates/SecR46.crt
-RUN update-ca-certificates
-
-# Trust for Java (keytool)
-RUN keytool -import -noprompt \
-      -alias sectigo-r46 \
-      -keystore "${JAVA_HOME}/lib/security/cacerts" \
-      -storepass changeit \
-      -file /usr/local/share/ca-certificates/SecR46.crt
+ENV MAVEN_OPTS="-Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true -Dmaven.wagon.http.ssl.ignore.validity.dates=true"
 
 # ── japicmp — copied from host (no curl/SSL needed) ──────────────────────────
 RUN mkdir -p /opt/japicmp
@@ -63,10 +52,9 @@ WORKDIR /app
 COPY requirements-merged.txt ./requirements-merged.txt
 RUN pip install --no-cache-dir -r requirements-merged.txt
 
-# ── Trust corporate CA in Python certifi bundle (must be after pip install) ───
-RUN cat /usr/local/share/ca-certificates/SecR46.crt >> $(python3 -c "import certifi; print(certifi.where())")
-ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV PYTHONHTTPSVERIFY=0 \
+    CURL_CA_BUNDLE="" \
+    REQUESTS_CA_BUNDLE=""
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY sonar-ai/   /app/sonar-ai/
@@ -118,9 +106,9 @@ RUN printf '[supervisord]\nnodaemon=true\nuser=root\nlogfile=/var/log/supervisor
 # Write individual program configs
 RUN printf '[program:nginx]\ncommand=/usr/sbin/nginx -g "daemon off;"\nautostart=true\nautorestart=true\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\npriority=10\n' > /etc/supervisor/conf.d/nginx.conf
 
-RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/sonar-ai/.env",REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt",SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
+RUN printf '[program:sonar-api]\ncommand=uvicorn api:app --host 0.0.0.0 --port 8000 --workers 2\ndirectory=/app/sonar-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/sonar-ai/.env",PYTHONHTTPSVERIFY="0",REQUESTS_CA_BUNDLE="",CURL_CA_BUNDLE=""\npriority=20\n' > /etc/supervisor/conf.d/sonar-api.conf
 
-RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 0.0.0.0 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/fortify-ai/.env",REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt",SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
+RUN printf '[program:fortify-api]\ncommand=uvicorn api_server:app --host 0.0.0.0 --port 8001 --workers 2\ndirectory=/app/fortify-ai\nautostart=true\nautorestart=true\nstartsecs=5\nstdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\nstderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\nenvironment=PYTHONUNBUFFERED="1",ENV_FILE="/app/fortify-ai/.env",PYTHONHTTPSVERIFY="0",REQUESTS_CA_BUNDLE="",CURL_CA_BUNDLE=""\npriority=30\n' > /etc/supervisor/conf.d/fortify-api.conf
 
 # ── Runtime directories ───────────────────────────────────────────────────────
 RUN mkdir -p /tmp/fortifyai \
@@ -129,14 +117,15 @@ RUN mkdir -p /tmp/fortifyai \
              /var/log/supervisor \
              /var/run
 
-ENV JAPICMP_JAR_PATH=/opt/japicmp/japicmp.jar \
+ENV JAPICMP_JAR=/opt/japicmp/japicmp.jar \
+    JAPICMP_JAR_PATH=/opt/japicmp/japicmp.jar \
     ADR_PATH=/app/fortify-ai/adr.py \
     PROJECT_PATH=/workspace \
     GCP_LOCATION=us-central1 \
     MAX_RETRIES=3 \
     MAX_UPGRADES=0 \
     PYTHONUNBUFFERED=1 \
-    CORS_ORIGINS="http://localhost,http://localhost:80,http://localhost:4200,http://localhost:4201,http://localhost:8000,http://localhost:8001" 
+    CORS_ORIGINS="http://localhost,http://localhost:80,http://localhost:4200,http://localhost:4201,http://localhost:8000,http://localhost:8001"
 
 EXPOSE 80 8000 8001
 

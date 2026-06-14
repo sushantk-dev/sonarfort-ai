@@ -25,6 +25,9 @@ services:
       https_proxy: ${HTTPS_PROXY:-}
       NO_PROXY:    "localhost,127.0.0.1,169.254.169.254"
       no_proxy:    "localhost,127.0.0.1,169.254.169.254"
+      PYTHONHTTPSVERIFY: "0"
+      REQUESTS_CA_BUNDLE: ""
+      CURL_CA_BUNDLE: ""
     volumes:
       - ./.env:/app/.env
       - ./.env:/app/sonar-ai/.env
