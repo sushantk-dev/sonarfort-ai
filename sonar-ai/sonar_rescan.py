@@ -106,6 +106,7 @@ def _base() -> str:
     return settings.sonar_host_url.rstrip("/")
 
 
+
 def _project_key_from_component(component: str) -> str:
     """Extract project key from 'project-key:path/to/File.java'."""
     return component.split(":")[0] if ":" in component else component
@@ -123,6 +124,7 @@ def _trigger_analysis(project_key: str) -> None:
             auth=_auth(),
             data={"projectKey": project_key},
             timeout=15,
+            verify=False,
         )
         if resp.status_code == 200:
             task_id = resp.json().get("taskId", "?")
@@ -151,7 +153,7 @@ def _wait_for_analysis(project_key: str, timeout: Optional[int] = None) -> bool:
 
     while time.time() < deadline:
         try:
-            resp = requests.get(url, auth=_auth(), params=params, timeout=15)
+            resp = requests.get(url, auth=_auth(), params=params, timeout=15, verify=False)
             if resp.status_code != 200:
                 logger.debug(f"[Rescan] CE activity poll: status={resp.status_code}")
                 time.sleep(interval)
@@ -185,7 +187,7 @@ def _issue_still_open(issue_key: str) -> Optional[bool]:
     params = {"issues": issue_key, "resolved": "false"}
 
     try:
-        resp = requests.get(url, auth=_auth(), params=params, timeout=15)
+        resp = requests.get(url, auth=_auth(), params=params, timeout=15, verify=False)
         if resp.status_code != 200:
             logger.warning(f"[Rescan] Issues search returned {resp.status_code}")
             return None

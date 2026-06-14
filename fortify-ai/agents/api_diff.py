@@ -37,8 +37,11 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+import urllib3
 import requests as http_requests
 from loguru import logger
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from state import AgentState, ApiDiffResult
 
@@ -97,7 +100,7 @@ def _download_jar(
 
     logger.debug(f"[API Diff] Downloading {url}")
     try:
-        resp = http_requests.get(url, timeout=timeout, stream=True)
+        resp = http_requests.get(url, timeout=timeout, stream=True, verify=False)
         if resp.status_code == 404:
             logger.warning(f"[API Diff] JAR not found on Maven Central: {url}")
             return None

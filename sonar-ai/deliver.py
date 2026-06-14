@@ -362,7 +362,7 @@ def _find_existing_pr(state: AgentState) -> Optional[str]:
     if not fix_branch or not repo_url:
         return None
 
-    gh = Github(settings.github_token, base_url=settings.github_base_url)
+    gh = Github(settings.github_token, base_url=settings.github_base_url, verify=False)
     repo_name = _repo_name_from_url(repo_url)
     gh_repo = gh.get_repo(repo_name)
 
@@ -399,7 +399,7 @@ def _open_pr(
     sonar_rescan_message: str = "",
 ) -> str:
     """Open a GitHub PR and return the PR URL."""
-    gh = Github(settings.github_token, base_url=settings.github_base_url)
+    gh = Github(settings.github_token, base_url=settings.github_base_url, verify=False)
 
     repo_url = state["repo_url"]
     repo_name = _repo_name_from_url(repo_url)
