@@ -1,12 +1,14 @@
-docker exec sonarfort-ai python3 -c "import certifi; print(open(certifi.where()).read()[-500:])"
+# 1. Build (docker-compose or plain docker)
+docker compose build
+# or
+docker build -t sonarfort-ai:latest .
 
-docker exec sonarfort-ai python3 -c "import requests; r = requests.get('https://cicd-tools.us.equifax.com', verify=True, timeout=10); print(r.status_code)"
+# 2. Tag for Artifact Registry
+docker tag sonarfort-ai:latest \
+  REGION-docker.pkg.dev/YOUR_PROJECT_ID/YOUR_REPO/sonarfort-ai:latest
 
-docker exec sonarfort-ai python3 -c "import requests; r = requests.get('https://cicd-tools.us.equifax.com', verify='/usr/local/lib/python3.11/site-packages/certifi/cacert.pem', timeout=10); print(r.status_code)"
+# 3. Authenticate to Artifact Registry
+gcloud auth configure-docker REGION-docker.pkg.dev
 
-docker exec sonarfort-ai bash -c "grep -r 'verify' /app/sonar-ai/*.py"
-
-docker exec sonarfort-ai bash -c "unset REQUESTS_CA_BUNDLE && unset SSL_CERT_FILE && python3 -c \"import requests; r = requests.get('https://cicd-tools.us.equifax.com', timeout=10); print(r.status_code)\""
-
-REQUESTS_CA_BUNDLE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
-SSL_CERT_FILE=/usr/local/lib/python3.11/site-packages/certifi/cacert.pem
+# 4. Push
+docker push REGION-docker.pkg.dev/YOUR_PROJECT_ID/YOUR_REPO/sonarfort-ai:latest
