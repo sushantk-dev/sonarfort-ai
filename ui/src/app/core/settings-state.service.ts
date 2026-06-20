@@ -260,21 +260,21 @@ export class SettingsStateService {
         this.editingTokens.set(new Set());
         this.cfg.update(cc => ({ ...cc, githubToken: '', sonarToken: '', fortifyApiToken: '' }));
 
-        // Reload backend config so new .env values take effect immediately
-        // without needing a uvicorn restart
-        this.apiSvc.reloadConfig().subscribe({
-          next: (r) => {
-            
-          },
-          error: () => {
-            // Non-fatal — settings are saved, reload just failed
-            // The user can restart uvicorn manually if needed
-          },
-        });
-
         this.saving.set(false);
         this.saved.set(true);
-        setTimeout(() => this.saved.set(false), 2500);
+
+        // Reload the page so every view re-fetches fresh config from the
+        // backend on init. A brief delay lets the "Saved" confirmation
+        // flash before the reload happens.
+        //
+        // Note: this only refreshes what the *browser* shows. It does NOT
+        // reach into the backend process — if you rotated the Fortify
+        // token/password without changing the host URL or username, the
+        // backend's in-memory token cache can still serve the old token
+        // until it naturally expires. POST /api/reload on the backend is
+        // the only thing that forces that specific case to take effect
+        // immediately.
+        setTimeout(() => window.location.reload(), 800);
       },
       error: (err: Error) => {
         this.saving.set(false);
