@@ -2,74 +2,56 @@
 //
 // Single source of truth for backend base URLs.
 //
-// Both Sonar and Fortify share one server (port 8000) by default.
-// If they are split into separate processes, set fortifyPort to the
-// Fortify server's port — all Fortify API calls will route there
-// automatically while Sonar calls continue using sonarBaseUrl.
+// Sonar and Fortify now share one fixed host with no port. Sonar calls
+// go straight to the host; Fortify calls go to the same host under the
+// /fortify path.
 //
 import { Injectable, signal, computed, effect } from '@angular/core';
 
-const STORAGE_KEY    = 'sonarfort_api';
-const DEFAULT_HOST   = 'localhost';
-const DEFAULT_PORT   = 8000;  // shared / Sonar port
-const DEFAULT_F_PORT = 8001;  // Fortify port — separate by default
+const STORAGE_KEY   = 'sonarfort_api';
+const DEFAULT_HOST  = 'https://sonarfort-ai.use1.npe.usis.gcp.efx';
+const FORTIFY_PATH  = '/fortify';
 
 @Injectable({ providedIn: 'root' })
 export class ApiConfigService {
 
-  // ── Shared / Sonar server ─────────────────────────────────────────────────
+  // ── Shared host — no port required ────────────────────────────────────────
   apiHost = signal<string>(this._load('host') ?? DEFAULT_HOST);
-  apiPort = signal<number>(Number(this._load('port') ?? DEFAULT_PORT));
 
-  // ── Fortify server — optional separate port ───────────────────────────────
-  /** When null/undefined, Fortify falls back to the shared apiPort */
-  fortifyPort = signal<number | null>(this._loadFortifyPort());
+  // ── Legacy port signals — kept only so existing callers (e.g.
+  //    SettingsStateService) that still read/pass apiPort / fortifyPort
+  //    keep compiling. They no longer affect URL construction. ─────────────
+  apiPort = signal<number>(0);
+  fortifyPort = signal<number | null>(null);
 
   // ── Derived URLs ──────────────────────────────────────────────────────────
   /** Base URL for Sonar + shared API calls */
-  sonarBaseUrl = computed(() =>
-    `http://${this.apiHost()}:${this.apiPort()}`
-  );
+  sonarBaseUrl = computed(() => this._normalize(this.apiHost()));
 
-  /** Base URL for Fortify API calls — uses fortifyPort when set */
-  fortifyBaseUrl = computed(() => {
-    const fp = this.fortifyPort();
-    const port = (fp !== null && fp > 0) ? fp : this.apiPort();
-    return `http://${this.apiHost()}:${port}`;
-  });
+  /** Base URL for Fortify API calls — same host, under /fortify, no port */
+  fortifyBaseUrl = computed(() => `${this._normalize(this.apiHost())}${FORTIFY_PATH}`);
 
   /** Convenience alias — same as sonarBaseUrl, used by ApiService */
   baseUrl = this.sonarBaseUrl;
 
-  /** True when Fortify is running on a different port from Sonar */
-  isSplit = computed(() => {
-    const fp = this.fortifyPort();
-    return fp !== null && fp > 0 && fp !== this.apiPort();
-  });
+  /** Always false now — Sonar and Fortify always share the same host */
+  isSplit = computed(() => false);
 
   constructor() {
-    effect(() => this._save('host',         this.apiHost()));
-    effect(() => this._save('port',         String(this.apiPort())));
-    effect(() => this._save('fortify_port', this.fortifyPort() !== null ? String(this.fortifyPort()) : ''));
+    effect(() => this._save('host', this.apiHost()));
   }
 
-  /** Called by SettingsStateService.save() */
-  apply(host: string, port: number, fortifyPort: number | null) {
+  /**
+   * Called by SettingsStateService.save(). Port args are accepted for
+   * backward compatibility but ignored — no port is needed.
+   */
+  apply(host: string, _port?: number, _fortifyPort?: number | null) {
     this.apiHost.set(host?.trim() || DEFAULT_HOST);
-    this.apiPort.set(port > 0 ? port : DEFAULT_PORT);
-    // Store fortifyPort as-is; null means fall back to shared port
-    this.fortifyPort.set(
-      fortifyPort !== null && fortifyPort > 0 ? fortifyPort : 8001
-    );
   }
 
-  private _loadFortifyPort(): number | null {
-    try {
-      const raw = localStorage.getItem(`${STORAGE_KEY}_fortify_port`);
-      if (!raw) return 8001;   // default Fortify port
-      const n = Number(raw);
-      return n > 0 ? n : 8001;
-    } catch { return 8001; }
+  private _normalize(host: string): string {
+    // Strip trailing slash(es) so paths can be appended safely
+    return host.replace(/\/+$/, '');
   }
 
   private _load(key: string): string | null {

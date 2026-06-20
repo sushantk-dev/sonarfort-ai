@@ -1,12 +1,11 @@
 // src/app/core/settings-state.service.ts
 import { Injectable, inject, signal, computed } from '@angular/core';
+import { forkJoin, of } from 'rxjs';
 import { ApiService } from './api.service';
 import { ApiConfigService } from './api-config.service';
 
 export interface AppConfig {
-  apiHost:        string;
-  apiPort:        number;
-  fortifyPort:    number | null;  // null = share Sonar port
+  apiHost:        string;  // fixed base host — no port, Fortify shares it under /fortify
   gcpProject:     string;
   gcpLocation:    string;
   model:          string;
@@ -58,9 +57,7 @@ export class SettingsStateService {
   private apiCfg  = inject(ApiConfigService);
 
   cfg = signal<AppConfig>({
-    apiHost:        'localhost',
-    apiPort:        8000,
-    fortifyPort:    8001,
+    apiHost:        'https://sonarfort-ai.use1.npe.usis.gcp.efx',
     gcpProject:     '',
     gcpLocation:    'us-central1',
     model:          'gemini-2.5-flash',
@@ -161,9 +158,7 @@ export class SettingsStateService {
         // Sync UI fields from live apiCfg (may differ if loaded from localStorage)
         this.cfg.update(cc => ({
           ...cc,
-          apiHost:     this.apiCfg.apiHost(),
-          apiPort:     this.apiCfg.apiPort(),
-          fortifyPort: this.apiCfg.fortifyPort(),
+          apiHost: this.apiCfg.apiHost(),
         }));
         this.loaded.set(true);
         this.loadErr.set('');
@@ -185,10 +180,8 @@ export class SettingsStateService {
 
     const c = this.cfg();
 
-    // Build payload — always include token fields so the backend can:
-    // - Write a new value if the user typed one
-    // - Leave unchanged if we send null (not editing)
-    // - Clear if we send "" (user explicitly blanked it)
+    // General payload — everything except Fortify token/host URL.
+    // Sent to the shared root /api/config.
     const payload: any = {
       gcp_project:                 c.gcpProject     || undefined,
       vertex_model:                c.model,
@@ -215,31 +208,40 @@ export class SettingsStateService {
     if (editing.has('sonarToken') || (!this.tokenStatus().sonarToken && c.sonarToken)) {
       payload['sonar_token'] = c.sonarToken;
     }
-    if (editing.has('fortifyApiToken') || (!this.tokenStatus().fortifyApiToken && c.fortifyApiToken)) {
-      payload['fortify_api_token'] = c.fortifyApiToken;
-    }
 
     // Always send sonar_host_url when it has a value
     if (c.sonarOrg) {
       payload['sonar_host_url'] = c.sonarOrg;
     }
 
-    // Always send fortify_host_url when it has a value
+    // Fortify payload — fortify_api_token + fortify_host_url, sent
+    // separately to /fortify/api/config so writes for Fortify go through
+    // the dedicated Fortify path, same as the OAuth refresh-token call.
+    const fortifyPayload: any = {};
+
+    if (editing.has('fortifyApiToken') || (!this.tokenStatus().fortifyApiToken && c.fortifyApiToken)) {
+      fortifyPayload['fortify_api_token'] = c.fortifyApiToken;
+    }
     if (c.fortifyHostUrl) {
-      payload['fortify_host_url'] = c.fortifyHostUrl;
+      fortifyPayload['fortify_host_url'] = c.fortifyHostUrl;
     }
 
-    // Apply host+port to ApiConfigService immediately — no backend round-trip needed
-    this.apiCfg.apply(c.apiHost, c.apiPort, c.fortifyPort);
+    // Apply host to ApiConfigService immediately — no backend round-trip needed
+    this.apiCfg.apply(c.apiHost);
 
-    this.apiSvc.saveConfig(payload).subscribe({
+    const saveGeneral$ = this.apiSvc.saveConfig(payload);
+    const saveFortify$ = Object.keys(fortifyPayload).length
+      ? this.apiSvc.saveFortifyConfig(fortifyPayload)
+      : of(null);
+
+    forkJoin([saveGeneral$, saveFortify$]).subscribe({
       next: () => {
         // Update tokenStatus based on what was saved
         this.tokenStatus.update(ts => ({
           ...ts,
           ...(payload['github_token']  !== undefined ? { githubToken:  !!c.githubToken  } : {}),
           ...(payload['sonar_token']   !== undefined ? { sonarToken:   !!c.sonarToken   } : {}),
-          ...(payload['fortify_api_token'] !== undefined ? { fortifyApiToken: !!c.fortifyApiToken } : {}),
+          ...(fortifyPayload['fortify_api_token'] !== undefined ? { fortifyApiToken: !!c.fortifyApiToken } : {}),
         }));
 
         // Clear editing state and token values after save

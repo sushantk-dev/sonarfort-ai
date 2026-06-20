@@ -125,8 +125,11 @@ export class ApiService {
   private http   = inject(HttpClient);
   private apiCfg = inject(ApiConfigService);
 
-  /** Always reflects the current host:port from Settings */
+  /** Always reflects the current host from Settings */
   get base() { return this.apiCfg.baseUrl(); }
+
+  /** Fortify-specific base — same host, under /fortify */
+  get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
 
   // ── Health ────────────────────────────────────────────────────────────────
 
@@ -216,6 +219,15 @@ export class ApiService {
 
   saveConfig(cfg: Partial<BackendConfig>): Observable<{ message: string }> {
     return this.http.post<any>(`${this.base}/api/config`, cfg);
+  }
+
+  /**
+   * Same /api/config endpoint, but routed through fortifyBase (/fortify).
+   * Used for Fortify-specific fields (fortify_api_token, fortify_host_url)
+   * so they travel through the Fortify path, matching the OAuth refresh call.
+   */
+  saveFortifyConfig(cfg: Partial<BackendConfig>): Observable<{ message: string }> {
+    return this.http.post<any>(`${this.fortifyBase}/api/config`, cfg);
   }
 
   reloadConfig(): Observable<{ message: string; sonar_token_set: boolean; sonar_host_url: string }> {
