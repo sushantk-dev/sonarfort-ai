@@ -15,7 +15,7 @@ Endpoints:
     POST /api/sonar/fetch           — live-fetch issues from SonarQube API
     GET  /api/sonar/report          — structured summary report of loaded issues
     GET  /api/config                — read current settings
-    POST /api/config                — update settings (writes .env)
+    POST /api/config                — update settings (in-memory only, no .env file)
 """
 
 from __future__ import annotations
@@ -73,12 +73,9 @@ class ConfigUpdateRequest(BaseModel):
     confidence_high_threshold:   Optional[float] = None
     confidence_medium_threshold: Optional[float] = None
     github_token:                Optional[str]   = None   # empty string = clear token
-    github_repo:                 Optional[str]   = None
     sonar_token:                 Optional[str]   = None   # empty string = clear token
     sonar_host_url:              Optional[str]   = None
     sonar_org:                   Optional[str]   = None
-    fortify_api_token:               Optional[str]   = None   # empty string = clear token
-    fortify_host_url:            Optional[str]   = None
     planner_temp:                Optional[float] = None
     generator_temp:              Optional[float] = None
     max_critic_retries:          Optional[int]   = None
@@ -846,11 +843,8 @@ def get_config() -> dict:
         "confidence_high_threshold":   s.confidence_high_threshold,
         "confidence_medium_threshold": s.confidence_medium_threshold,
         "github_token":                mask(s.github_token),
-        "github_repo":                 "",
         "sonar_token":                 mask(s.sonar_token),
         "sonar_host_url":              s.sonar_host_url,
-        "fortify_api_token":               mask(s.fortify_api_token),
-        "fortify_host_url":            s.fortify_host_url,
         "planner_temperature":          s.planner_temperature,
         "generator_temperature":        s.generator_temperature,
         "max_critic_retries":          s.max_critic_retries,
@@ -866,9 +860,11 @@ def get_config() -> dict:
 @app.post("/api/reload")
 def reload_config() -> dict:
     """
-    Re-import the config module so updated .env values are picked up
-    without restarting uvicorn. Called automatically by the UI after
-    saving settings.
+    Re-import the config module so a fresh Settings() picks up the current
+    process environment (os.environ) without restarting uvicorn. There's no
+    .env file involved — this just re-reads real env vars. Called
+    automatically by the UI after saving settings; mostly a no-op safety
+    net since POST /api/config already updates the live singleton directly.
     """
     import importlib
     try:
@@ -876,7 +872,7 @@ def reload_config() -> dict:
         importlib.reload(_config_module)
         # Reassign the module-level singleton so all subsequent imports see the new values
         _config_module.settings = _config_module.Settings()
-        logger.info("[Reload] Config reloaded from .env")
+        logger.info("[Reload] Config reloaded from process environment")
         return {
             "message":       "Config reloaded successfully",
             "sonar_host_url": _config_module.settings.sonar_host_url,
@@ -889,10 +885,18 @@ def reload_config() -> dict:
 
 @app.post("/api/config")
 def update_config(req: ConfigUpdateRequest) -> dict:
-    env_path = Path(".env")
-    lines: list[str] = env_path.read_text().splitlines() if env_path.exists() else []
+    """
+    Apply settings changes to the running process only.
 
-    token_fields = {"github_token", "sonar_token", "fortify_api_token"}
+    There is no .env file to write to or read from. This updates the
+    process environment (os.environ) and the live `config.settings`
+    singleton in place, so the change takes effect immediately and
+    survives a later /api/reload. Restarting the process will fall back
+    to whatever is in the real (deploy-managed) shell/container env.
+    """
+    from config import settings as s
+
+    token_fields = {"github_token", "sonar_token"}
 
     # Include non-None values; also include token fields even if empty string (explicit clear)
     mapping = {
@@ -910,8 +914,6 @@ def update_config(req: ConfigUpdateRequest) -> dict:
         "github_token":                "GITHUB_TOKEN",
         "sonar_token":                 "SONAR_TOKEN",
         "sonar_host_url":              "SONAR_HOST_URL",
-        "fortify_api_token":               "FORTIFY_TOKEN",
-        "fortify_host_url":            "FORTIFY_HOST_URL",
         "planner_temp":                "PLANNER_TEMPERATURE",
         "generator_temp":              "GENERATOR_TEMPERATURE",
         "max_critic_retries":          "MAX_CRITIC_RETRIES",
@@ -920,33 +922,42 @@ def update_config(req: ConfigUpdateRequest) -> dict:
         "rag_top_k":                   "RAG_TOP_K",
     }
 
-    updated:   set[str]   = set()
-    new_lines: list[str]  = []
+    # Request field name -> Settings attribute name, only where it differs
+    # (e.g. *_temp request fields map to *_temperature on the Settings model).
+    settings_attr_map = {
+        "planner_temp":      "planner_temperature",
+        "generator_temp":    "generator_temperature",
+    }
 
-    for line in lines:
-        written = False
-        for field, env_key in env_key_map.items():
-            if field in mapping and line.startswith(f"{env_key}="):
-                val = ("true"  if mapping[field] is True  else
-                       "false" if mapping[field] is False else
-                       str(mapping[field]))
-                new_lines.append(f"{env_key}={val}")
-                updated.add(field)
-                written = True
-                break
-        if not written:
-            new_lines.append(line)
+    updated: list[str] = []
 
-    # Append any keys not already present in the file
     for field, env_key in env_key_map.items():
-        if field in mapping and field not in updated:
-            val = ("true"  if mapping[field] is True  else
-                   "false" if mapping[field] is False else
-                   str(mapping[field]))
-            new_lines.append(f"{env_key}={val}")
+        if field not in mapping:
+            continue
 
-    env_path.write_text("\n".join(new_lines) + "\n")
-    return {"message": "Config saved", "updated_fields": list(mapping.keys())}
+        value = mapping[field]
+        val_str = ("true"  if value is True  else
+                   "false" if value is False else
+                   str(value))
+
+        # 1) Update the process environment so it's picked up by anything
+        #    that reads os.environ directly, and so /api/reload (which
+        #    rebuilds Settings() from the process env) still sees it.
+        os.environ[env_key] = val_str
+
+        # 2) Update the live settings singleton in place so the change is
+        #    effective immediately — no restart needed.
+        attr = settings_attr_map.get(field, field)
+        if hasattr(s, attr):
+            setattr(s, attr, value)
+
+        updated.append(field)
+
+    logger.info(f"[Config] Applied in-memory settings update: {updated}")
+    return {
+        "message":        "Config updated in memory (no .env file involved)",
+        "updated_fields": updated,
+    }
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
