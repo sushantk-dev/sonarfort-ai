@@ -202,7 +202,8 @@ export class SettingsStateService {
     //   - token field has a value typed directly (first-time entry, editingTokens not set)
     const editing = this.editingTokens();
 
-    if (editing.has('githubToken') || (!this.tokenStatus().githubToken && c.githubToken)) {
+    const sendGithubToken = editing.has('githubToken') || (!this.tokenStatus().githubToken && c.githubToken);
+    if (sendGithubToken) {
       payload['github_token'] = c.githubToken;
     }
     if (editing.has('sonarToken') || (!this.tokenStatus().sonarToken && c.sonarToken)) {
@@ -217,8 +218,19 @@ export class SettingsStateService {
     // Fortify payload — fortify_api_token + fortify_host_url, sent
     // separately to /fortify/api/config so writes for Fortify go through
     // the dedicated Fortify path, same as the OAuth refresh-token call.
-    const fortifyPayload: any = {};
+    // github_token, gcp_project, vertex_model, and max_tokens are mirrored
+    // here too, since the Fortify side may be a separate backend instance
+    // and needs these same values available locally (GitHub access for
+    // writeback flows, and the GCP/Vertex settings used for its own LLM calls).
+    const fortifyPayload: any = {
+      gcp_project:  c.gcpProject || undefined,
+      vertex_model: c.model,
+      max_tokens:   c.maxTokens,
+    };
 
+    if (sendGithubToken) {
+      fortifyPayload['github_token'] = c.githubToken;
+    }
     if (editing.has('fortifyApiToken') || (!this.tokenStatus().fortifyApiToken && c.fortifyApiToken)) {
       fortifyPayload['fortify_api_token'] = c.fortifyApiToken;
     }
