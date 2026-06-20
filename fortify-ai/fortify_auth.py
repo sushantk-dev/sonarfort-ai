@@ -37,7 +37,7 @@ one-off CLI / script usage that wants to manage the token manually.
 
 from __future__ import annotations
 
-import re
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -131,7 +131,7 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
        -> return a copy with the cached token injected.
     3. Cache miss or token within ``_EXPIRY_BUFFER_SECS`` of expiry
        -> fetch a fresh token, update the cache, return a copy with the new
-       token injected and write it back to .env.
+       token injected and set it in the process environment.
     4. OAuth credentials missing **and** ``fortify_api_token`` is already set
        -> assume the caller manages the token manually; return ``cfg`` unchanged.
 
@@ -169,7 +169,8 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
     token_data   = fetch_token(cfg)
     access_token = _store_token(cfg, token_data)
 
-    # Write the new token back to .env so the next process start is pre-seeded
+    # Set the new token in the process environment so the next fresh
+    # FortifyAIConfig() read (e.g. a future load_config() call) sees it too
     write_token_to_env(access_token)
 
     return cfg.model_copy(update={"fortify_api_token": access_token})
@@ -188,8 +189,8 @@ def fetch_token(
     """
     POST /oauth/token with password grant.
 
-    Parameters override .env values when provided -- useful for one-off
-    token requests without modifying config.
+    Parameters override environment-variable values when provided -- useful
+    for one-off token requests without modifying config.
 
     Returns the full token response dict:
         {
@@ -211,16 +212,16 @@ def fetch_token(
     if not resolved_username:
         raise ValueError(
             "FORTIFY_USERNAME is required for OAuth token fetch. "
-            "Set it in .env or pass as a request parameter."
+            "Set it as an environment variable or pass as a request parameter."
         )
     if not resolved_password:
         raise ValueError(
             "FORTIFY_PASSWORD is required for OAuth token fetch. "
-            "Set it in .env or pass as a request parameter."
+            "Set it as an environment variable or pass as a request parameter."
         )
     if not cfg.fortify_base_url:
         raise ValueError(
-            "FORTIFY_BASE_URL is required. Set it in .env."
+            "FORTIFY_BASE_URL is required. Set it as an environment variable."
         )
 
     url = cfg.fortify_base_url.rstrip("/") + _OAUTH_PATH
@@ -271,53 +272,48 @@ def fetch_token(
 
 
 # ===============================================================================
-# .env writeback
+# Environment-variable writeback
 # ===============================================================================
 
-def write_token_to_env(token: str, env_path: str | Path = ".env") -> None:
+def write_token_to_env(token: str, env_path: str | Path | None = None) -> None:
     """
-    Update FORTIFY_API_TOKEN in the .env file in-place.
+    Set FORTIFY_API_TOKEN in the current process's environment.
 
-    - If the key already exists, the value is replaced on that line.
-    - If the key is absent, a new line is appended.
-    - A relative env_path is resolved against the directory containing
-      this file (fortify_auth.py), so it works regardless of the cwd
-      uvicorn was launched from.
+    This no longer writes to a .env file on disk -- config.py reads
+    FortifyAIConfig fields straight from the process environment, so a
+    value written only to a .env file would never be picked back up.
 
-    The file is read and written as UTF-8; all other lines are untouched.
+    ``env_path`` is accepted (and ignored) purely for backward
+    compatibility with older callers that still pass it; it has no effect.
+
+    Note: this only affects the *current process's* environment. It does
+    NOT persist across a server restart -- set FORTIFY_API_TOKEN at the
+    container / orchestrator level if you need it to survive a restart.
     """
-    env_file = Path(env_path)
-    if not env_file.is_absolute():
-        # Resolve relative to the project root (same dir as this module)
-        env_file = (Path(__file__).parent / env_path).resolve()
-    original = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
-
-    key = "FORTIFY_API_TOKEN"
-    new_line = f'{key}={token}'
-    pattern = re.compile(rf"^{key}\s*=.*$", re.MULTILINE)
-
-    if pattern.search(original):
-        updated = pattern.sub(new_line, original)
-    else:
-        # Append -- ensure there's a trailing newline before the new line
-        updated = original.rstrip("\n") + "\n" + new_line + "\n"
-
-    env_file.write_text(updated, encoding="utf-8")
+    if env_path is not None:
+        logger.debug(
+            "[FortifyAuth] write_token_to_env: env_path is ignored -- the "
+            "token is set directly in the process environment instead."
+        )
+    os.environ["FORTIFY_API_TOKEN"] = token
     logger.info(
-        f"[FortifyAuth] OK FORTIFY_API_TOKEN written to {env_file.resolve()} "
+        f"[FortifyAuth] OK FORTIFY_API_TOKEN set in process environment "
         f"(preview: {token[:12]}...)"
     )
 
 
 def refresh_token_in_env(
     cfg: FortifyAIConfig,
-    env_path: str | Path = ".env",
+    env_path: str | Path | None = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
     scope: Optional[str] = None,
 ) -> dict:
     """
-    Convenience: fetch a fresh token and write it to .env in one call.
+    Convenience: fetch a fresh token and set it as FORTIFY_API_TOKEN in the
+    process environment in one call.
+
+    ``env_path`` is accepted (and ignored) for backward compatibility.
 
     Returns the full token response dict (same as fetch_token).
     """

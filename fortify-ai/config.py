@@ -1,11 +1,10 @@
 """
 FortifyAI Configuration
 -----------------------
-All environment variables loaded via Pydantic BaseSettings.
-Copy .env.example → .env and fill in your values before running.
+All environment variables loaded via Pydantic BaseSettings, directly from
+the process environment. No .env file is read — set the variables in the
+shell, container, or orchestrator running this service.
 """
-
-from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
@@ -13,13 +12,11 @@ from pydantic import Field
 
 class FortifyAIConfig(BaseSettings):
     # ── Pydantic v2 settings config ──────────────────────────────────────────
-    # Replaces the inner `class Config` (v1 pattern) so that _env_file passed
-    # in load_config() is actually honoured instead of silently ignored.
+    # env_file is intentionally omitted: values come from the real process
+    # environment only, never from a .env file on disk.
     # extra="allow" preserves the original behaviour — any additional env vars
     # not declared as fields are still accessible on the config object.
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
         case_sensitive=False,
         extra="allow",
     )
@@ -148,17 +145,10 @@ class FortifyAIConfig(BaseSettings):
 
 
 def load_config() -> FortifyAIConfig:
-    """Load and validate config from the correct .env file.
+    """Load and validate config from the process environment only.
 
-    Search order:
-      1. .env in the same directory as this file (alongside config.py)
-      2. .env in the current working directory (fallback)
-
-    Using SettingsConfigDict (pydantic-settings v2) means _env_file passed
-    to the constructor is honoured correctly, so the resolved path is the
-    one that actually gets read.
+    No .env file is read or searched for — every field (and any extra
+    `extra="allow"` vars) must be set as a real environment variable on
+    the process running this service.
     """
-    parent_env = Path(__file__).resolve().parent.parent / ".env"
-    local_env  = Path(".env")
-    env_path   = str(parent_env) if parent_env.exists() else str(local_env)
-    return FortifyAIConfig(_env_file=env_path)
+    return FortifyAIConfig()

@@ -96,7 +96,7 @@ Examples:
   # Application name with repo override
   python fortifyai.py --app-name 1038_US_D360-Citi-Triggers-on-Cloud_USIS --repo acme/backend
 
-  # Override repo at runtime (no need to edit .env)
+  # Override repo at runtime (no need to edit environment variables)
   python fortifyai.py --release 1723380 --repo acme/backend
 
   # Offline mode with repo override
@@ -133,7 +133,7 @@ Examples:
         default=None,
         help=(
             "GitHub repository in owner/repo format (e.g. acme/backend). "
-            "Overrides GITHUB_REPO from .env when provided."
+            "Overrides the GITHUB_REPO environment variable when provided."
         ),
     )
     parser.add_argument(
@@ -173,7 +173,7 @@ Examples:
             "Maximum number of dependencies to upgrade in this run. "
             "Deps are prioritised by severity (Critical first). "
             "0 (default) means no limit. "
-            "Overrides MAX_UPGRADES from .env when provided."
+            "Overrides the MAX_UPGRADES environment variable when provided."
         ),
     )
     return parser.parse_args(argv)
@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error(f"[Config] ❌ Failed to load configuration: {exc}")
         return 1
 
-    # ── CLI overrides (take priority over .env) ───────────────────────────────
+    # ── CLI overrides (take priority over environment variables) ──────────────
     if args.repo:
         object.__setattr__(config, "github_repo", args.repo)
         logger.info(f"[Config] github_repo overridden by --repo: {args.repo}")
@@ -280,10 +280,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(f"[Clone] Cloning {config.github_repo} → {clone_dir}")
         try:
             import subprocess
-	    result = subprocess.run(
-    		["git", "-c", "http.sslVerify=false", "clone", "--depth", "1", repo_url, clone_dir],
-    		capture_output=True, text=True, timeout=300,
-	    )
+            result = subprocess.run(
+                ["git", "-c", "http.sslVerify=false", "clone", "--depth", "1", repo_url, clone_dir],
+                capture_output=True, text=True, timeout=300,
+            )
             if result.returncode != 0:
                 logger.error(f"[Clone] ❌ git clone failed:\n{result.stderr[:500]}")
                 shutil.rmtree(clone_dir, ignore_errors=True)
@@ -375,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info(f"Fetched {len(raw_vulns)} vulnerabilities")
         except Exception as exc:
             logger.error(f"[Client] ❌ API call failed: {exc}")
-            logger.error("Check FORTIFY_BASE_URL and FORTIFY_API_TOKEN in your .env")
+            logger.error("Check FORTIFY_BASE_URL and FORTIFY_API_TOKEN environment variables")
             return 1
 
     # ── Triage ────────────────────────────────────────────────────────────────

@@ -41,9 +41,9 @@ Execution Modes:
 
   UTILITY
     GET  /health                   — liveness probe
-    GET  /api/config               — read current .env config (tokens masked)
-    POST /api/config               — write fields back to .env
-    GET  /config/validate          — validate current .env config
+    GET  /api/config               — read current config (env vars; tokens masked)
+    POST /api/config               — update process environment variables only
+    GET  /config/validate          — validate current config (from environment)
     GET  /releases                 — list releases for an app name
 
 Run:
@@ -73,17 +73,6 @@ from state import AgentState
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _resolve_env_path() -> Path:
-    """
-    Return the same .env path that load_config() resolves:
-      1. One level above this file (project root when code lives in a sub-folder)
-      2. Fallback: .env in the current working directory
-    Used by auth_token and save_config so token writes land in the right file.
-    """
-    parent_env = Path(__file__).resolve().parent.parent / ".env"
-    local_env  = Path(".env")
-    return parent_env if parent_env.exists() else local_env
 
 # ── Pipeline job store ────────────────────────────────────────────────────────
 # Keyed by pipeline_id (str UUID).  Each entry:
@@ -219,7 +208,7 @@ class LivePipelineRequest(BaseModel):
         default=None,
         description=(
             "GitHub repository in 'owner/repo' format. "
-            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "Overrides the GITHUB_REPO environment variable and triggers an automatic shallow clone so "
             "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
         ),
     )
@@ -237,7 +226,7 @@ class AppNamePipelineRequest(BaseModel):
         default=None,
         description=(
             "GitHub repository in 'owner/repo' format. "
-            "Mirrors the --repo CLI flag: overrides GITHUB_REPO in .env and triggers an "
+            "Mirrors the --repo CLI flag: overrides the GITHUB_REPO environment variable and triggers an "
             "automatic clone so no local PROJECT_PATH is needed. "
             "e.g. \"acme/backend\""
         ),
@@ -256,7 +245,7 @@ class AppIdPipelineRequest(BaseModel):
         default=None,
         description=(
             "GitHub repository in 'owner/repo' format. "
-            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "Overrides the GITHUB_REPO environment variable and triggers an automatic shallow clone so "
             "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
         ),
     )
@@ -275,7 +264,7 @@ class OfflinePipelineRequest(BaseModel):
         default=None,
         description=(
             "GitHub repository in 'owner/repo' format. "
-            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "Overrides the GITHUB_REPO environment variable and triggers an automatic shallow clone so "
             "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
         ),
     )
@@ -297,7 +286,7 @@ class DryRunRequest(BaseModel):
         default=None,
         description=(
             "GitHub repository in 'owner/repo' format. "
-            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "Overrides the GITHUB_REPO environment variable and triggers an automatic shallow clone so "
             "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
         ),
     )
@@ -313,14 +302,14 @@ class DryRunRequest(BaseModel):
 
 class AuthTokenRequest(BaseModel):
     """
-    Override credentials per-request. Leave all fields empty to use values from .env.
-    Useful for testing a different account without editing config.
+    Override credentials per-request. Leave all fields empty to use values
+    from the process environment. Useful for testing a different account
+    without editing config.
     """
     username: Optional[str] = Field(default=None, description="Fortify login username (overrides FORTIFY_USERNAME)")
     password: Optional[str] = Field(default=None, description="Fortify login password (overrides FORTIFY_PASSWORD)")
     scope: Optional[str]    = Field(default=None, description="OAuth scope (default: api-tenant)")
-    write_to_env: bool       = Field(default=True, description="Persist the new token to FORTIFY_API_TOKEN in .env")
-    env_path: str            = Field(default=".env", description="Path to the .env file to update")
+    write_to_env: bool       = Field(default=True, description="Persist the new token to the FORTIFY_API_TOKEN process environment variable")
 
 
 # ── Individual stages ─────────────────────────────────────────────────────────
@@ -385,7 +374,7 @@ class FortifyWritebackRequest(BaseModel):
     groups: list[dict] = Field(..., description="Reasoned groups")
     adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix")
     pr_results: list[dict] = Field(default_factory=list)
-    output_dir: str = Field(default="")  # empty = read ADR_OUTPUT_DIR from .env at runtime
+    output_dir: str = Field(default="")  # empty = read ADR_OUTPUT_DIR from the environment at runtime
 
 
 # ── Partial pipeline ──────────────────────────────────────────────────────────
@@ -399,7 +388,7 @@ class PartialPipelineRequest(BaseModel):
         default=None,
         description=(
             "GitHub repository in 'owner/repo' format. "
-            "Overrides GITHUB_REPO in .env and triggers an automatic shallow clone so "
+            "Overrides the GITHUB_REPO environment variable and triggers an automatic shallow clone so "
             "no local PROJECT_PATH is needed. e.g. \"acme/backend\""
         ),
     )
@@ -709,12 +698,12 @@ def _run_full_pipeline(
 
 @app.on_event("startup")
 async def startup_event():
-    """Fetch a fresh Fortify Bearer token at boot and write it to the parent .env."""
+    """Fetch a fresh Fortify Bearer token at boot and set it in the process environment."""
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(_EXECUTOR, auth_token)
         if isinstance(result, dict) and result.get("ok"):
-            print("[Startup] Fortify token fetched and written to .env")
+            print("[Startup] Fortify token fetched and set in process environment")
         else:
             print(f"[Startup] Fortify token fetch skipped or failed: {result}")
     except Exception as exc:
@@ -762,10 +751,10 @@ def _mask(val: str) -> str:
 @app.get("/api/config", tags=["Utility"])
 def get_config():
     """
-    Return current .env config values for the UI Settings page.
-    Secret tokens are masked as '***' (never returned in plain text).
-    adr_output_dir is always included so the UI knows where escalation
-    files are written without needing to hardcode the path.
+    Return current config values (read from the process environment) for
+    the UI Settings page. Secret tokens are masked as '***' (never returned
+    in plain text). adr_output_dir is always included so the UI knows where
+    escalation files are written without needing to hardcode the path.
     """
     try:
         cfg = load_config()
@@ -797,18 +786,22 @@ def get_config():
 @app.post("/api/config", tags=["Utility"])
 def save_config(req: ConfigUpdateRequest):
     """
-    Persist Settings-page fields to .env.
-    Only non-None fields are written; existing keys not in the request
-    are left untouched. Tokens are only written when a non-empty string
-    is supplied (empty string or None = leave unchanged).
+    Apply Settings-page fields to the running process's environment variables.
+
+    No file is read or written — each field is set via `os.environ[...]`,
+    so the next `load_config()` call (which reads BaseSettings straight from
+    the process environment) immediately picks up the new value. Only
+    non-None fields are applied; fields omitted from the request are left
+    untouched. Tokens are only applied when a non-empty string is supplied
+    (empty string or None = leave unchanged).
+
+    Note: these changes live only in this process's environment. They do
+    NOT persist across a server restart — set them at the container /
+    orchestrator level for that.
     """
-    import re as _re
+    import os as _os
 
-    env_path = _resolve_env_path()
-    # Read existing .env content, or start fresh
-    lines: list[str] = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-
-    # Map from request field → .env key name
+    # Map from request field → environment variable name
     field_map: dict[str, str] = {
         "gcp_project":                 "GCP_PROJECT",
         "vertex_model":                "VERTEX_MODEL",
@@ -843,36 +836,20 @@ def save_config(req: ConfigUpdateRequest):
     if not updates:
         return {"message": "No fields to update"}
 
-    # Update existing lines in-place, collect keys already handled
-    handled: set[str] = set()
-    new_lines: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            new_lines.append(line)
-            continue
-        match = _re.match(r"^([A-Z0-9_]+)\s*=", stripped)
-        if match:
-            key = match.group(1)
-            if key in updates:
-                new_lines.append(f"{key}={updates[key]}")
-                handled.add(key)
-                continue
-        new_lines.append(line)
-
-    # Append keys that didn't exist yet
     for key, val in updates.items():
-        if key not in handled:
-            new_lines.append(f"{key}={val}")
+        _os.environ[key] = val
 
-    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    return {"message": f"Saved {len(updates)} field(s) to .env", "updated": list(updates.keys())}
+    return {
+        "message": f"Applied {len(updates)} field(s) to the process environment",
+        "updated": list(updates.keys()),
+        "persisted": False,
+    }
 
 
 @app.get("/config/validate", tags=["Utility"])
 def config_validate():
     """
-    Load and validate the current .env config.
+    Load and validate the current config from the process environment.
     Returns which required fields are present/missing.
     """
     try:
@@ -898,7 +875,7 @@ def config_validate():
 def auth_token(req: Optional[AuthTokenRequest] = None):
     """
     Fetch a fresh Fortify Bearer token via OAuth2 password grant and
-    optionally write it back to `FORTIFY_API_TOKEN` in `.env`.
+    optionally set it as `FORTIFY_API_TOKEN` in the process environment.
 
     Send as **JSON body** (`Content-Type: application/json`):
 
@@ -906,19 +883,22 @@ def auth_token(req: Optional[AuthTokenRequest] = None):
           "username":     null,
           "password":     null,
           "scope":        null,
-          "write_to_env": true,
-          "env_path":     ".env"
+          "write_to_env": true
         }
 
-    All fields are optional — null values fall back to .env values
-    (FORTIFY_USERNAME, FORTIFY_PASSWORD, FORTIFY_SCOPE).
+    All fields are optional — null values fall back to environment-variable
+    values (FORTIFY_USERNAME, FORTIFY_PASSWORD, FORTIFY_SCOPE).
 
     Flow:
       POST {FORTIFY_BASE_URL}/oauth/token   (form-encoded internally)
         grant_type=password  scope=api-tenant
         username=<FORTIFY_USERNAME>  password=<FORTIFY_PASSWORD>
         security_code=  do_totp=false
-      → access_token written to FORTIFY_API_TOKEN in .env (if write_to_env=true)
+      → access_token set as FORTIFY_API_TOKEN in the process environment
+        (if write_to_env=true)
+
+    Note: this only updates the current process's environment — it does
+    NOT persist across a server restart.
 
     Returns:
       access_token, token_type, expires_in, scope
@@ -927,16 +907,9 @@ def auth_token(req: Optional[AuthTokenRequest] = None):
     t0 = _time.time()
     try:
         from fortify_auth import fetch_token, write_token_to_env
-        # req is fully optional — all fields fall back to .env values when absent
+        # req is fully optional — all fields fall back to environment values when absent
         _req = req or AuthTokenRequest()
         cfg  = load_config()
-
-        # Resolve the same .env that load_config() uses so the token is written
-        # to the correct file (parent dir), not a bare ".env" in the cwd.
-        if _req.env_path == ".env":
-            resolved_env_path = str(_resolve_env_path())
-        else:
-            resolved_env_path = _req.env_path  # honour explicit caller override
 
         token_data = fetch_token(
             cfg,
@@ -945,14 +918,13 @@ def auth_token(req: Optional[AuthTokenRequest] = None):
             scope=_req.scope,
         )
         if _req.write_to_env and token_data.get("access_token"):
-            write_token_to_env(token_data["access_token"], env_path=resolved_env_path)
+            write_token_to_env(token_data["access_token"])
         return ok({
             "access_token":   token_data.get("access_token"),
             "token_type":     token_data.get("token_type", "Bearer"),
             "expires_in":     token_data.get("expires_in"),
             "scope":          token_data.get("scope"),
             "written_to_env": _req.write_to_env,
-            "env_path":       resolved_env_path,
         }, _time.time() - t0)
     except Exception as exc:
         return err(str(exc), exc)
@@ -1899,7 +1871,7 @@ if __name__ == "__main__":
 @app.get("/escalations", tags=["Escalations"])
 def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) -> dict:
     """List all Fortify escalation .txt files.
-    Reads output directory from ADR_OUTPUT_DIR in .env; override via ?output_dir=.
+    Reads output directory from the ADR_OUTPUT_DIR environment variable; override via ?output_dir=.
     """
     from pathlib import Path
     resolved_dir = output_dir or load_config().adr_output_dir
@@ -1956,7 +1928,7 @@ def get_fortify_escalation(
     output_dir: Optional[str] = Query(default=None)
 ) -> dict:
     """Return the full text content of one Fortify escalation file.
-    Reads output directory from ADR_OUTPUT_DIR in .env; override via ?output_dir=.
+    Reads output directory from the ADR_OUTPUT_DIR environment variable; override via ?output_dir=.
     """
     from pathlib import Path
     if "/" in filename or ".." in filename:
@@ -1981,7 +1953,7 @@ def delete_fortify_escalation(
     output_dir: Optional[str] = Query(default=None)
 ) -> dict:
     """Delete a Fortify escalation file.
-    Reads output directory from ADR_OUTPUT_DIR in .env; override via ?output_dir=.
+    Reads output directory from the ADR_OUTPUT_DIR environment variable; override via ?output_dir=.
     """
     from pathlib import Path
     if "/" in filename or ".." in filename:
