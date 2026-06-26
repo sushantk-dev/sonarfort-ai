@@ -7,6 +7,10 @@ langchain-google-vertexai>=1.0,<2.0
 google-cloud-aiplatform>=1.60,<2.0
 google-cloud-secret-manager>=2.0,<3.0
 
+# ── GCP stateless infrastructure ─────────────────────────────────────────────
+redis>=5.0,<6.0                    # job store → Memorystore for Redis
+google-cloud-storage>=2.18,<3.0    # escalation files / PDFs → Cloud Storage
+
 # ── Fortify + HTTP ───────────────────────────────────────────────────────────
 requests>=2.32,<3.0
 

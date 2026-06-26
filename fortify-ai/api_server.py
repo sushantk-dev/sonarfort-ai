@@ -53,6 +53,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import traceback
 import uuid
@@ -69,42 +70,20 @@ from pydantic import BaseModel, Field
 
 # ── Internal imports ──────────────────────────────────────────────────────────
 from config import FortifyAIConfig, load_config
+from job_store import create_job_store, ALL_STAGE_NAMES
 from state import AgentState
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 # ── Pipeline job store ────────────────────────────────────────────────────────
-# Keyed by pipeline_id (str UUID).  Each entry:
-#   {
-#     "pipeline_id": str,
-#     "status": "queued" | "running" | "completed" | "failed",
-#     "started_at": ISO-8601 str,
-#     "finished_at": ISO-8601 str | None,
-#     "elapsed_seconds": float | None,
-#     "error": str | None,
-#     "result": dict | None,
-#     "stages": {
-#       stage_name: {
-#         "status": "pending" | "running" | "completed" | "skipped" | "failed",
-#         "started_at": str | None,
-#         "finished_at": str | None,
-#         "elapsed_seconds": float | None,
-#         "error": str | None,
-#         "output_summary": dict | None,   # lightweight excerpt, not full data
-#       }
-#     }
-#   }
-_JOBS: Dict[str, dict] = {}
-_JOBS_LOCK = Lock()
+# Redis-backed when REDIS_URL is set; falls back to in-process dict otherwise.
+# Any uvicorn worker or GKE pod can look up any pipeline_id — eliminates the
+# 404-on-poll race that occurs with multi-worker / multi-replica deployments.
+_store = create_job_store()
 
-# Shared executor so all pipeline jobs share a bounded thread pool
-_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pipeline-worker")
-
-ALL_STAGE_NAMES = [
-    "triage", "version-resolver", "context", "api-diff",
-    "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback",
-]
+# Shared executor — bounded thread pool for heavy pipeline work.
+# Override MAX_PIPELINE_WORKERS env var to tune for your pod's CPU limit.
+_MAX_WORKERS = int(os.environ.get("MAX_PIPELINE_WORKERS", 8))
+_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="pipeline-worker")
 
 
 def _now() -> str:
@@ -112,42 +91,17 @@ def _now() -> str:
 
 
 def _new_job(stages: list[str] | None = None) -> dict:
-    """Create and register a fresh job record; return it."""
-    pipeline_id = str(uuid.uuid4())
-    stages_map = {
-        s: {"status": "pending", "started_at": None, "finished_at": None,
-            "elapsed_seconds": None, "error": None, "output_summary": None}
-        for s in (stages or ALL_STAGE_NAMES)
-    }
-    job: dict = {
-        "pipeline_id": pipeline_id,
-        "status": "queued",
-        "started_at": _now(),
-        "finished_at": None,
-        "elapsed_seconds": None,
-        "error": None,
-        "result": None,
-        "stages": stages_map,
-    }
-    with _JOBS_LOCK:
-        _JOBS[pipeline_id] = job
-    return job
+    """Create and persist a fresh job record via the shared store; return it."""
+    return _store.new_job(stages)
 
 
 def _update_stage(pipeline_id: str, stage: str, **kwargs) -> None:
-    with _JOBS_LOCK:
-        _JOBS[pipeline_id]["stages"][stage].update(kwargs)
+    _store.update_stage(pipeline_id, stage, **kwargs)
 
 
 def _finish_job(pipeline_id: str, status: str, result: dict | None = None,
                 error: str | None = None, t0: float | None = None) -> None:
-    with _JOBS_LOCK:
-        j = _JOBS[pipeline_id]
-        j["status"] = status
-        j["finished_at"] = _now()
-        j["elapsed_seconds"] = round(time.time() - t0, 3) if t0 else None
-        j["result"] = result
-        j["error"] = error
+    _store.finish_job(pipeline_id, status, result=result, error=error, t0=t0)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -1015,8 +969,7 @@ async def pipeline_live(req: LivePipelineRequest):
         t0 = time.time()
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
-        with _JOBS_LOCK:
-            _JOBS[pid]["status"] = "running"
+        _store.update_job(pid, status="running")
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1065,8 +1018,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
         t0 = time.time()
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
-        with _JOBS_LOCK:
-            _JOBS[pid]["status"] = "running"
+        _store.update_job(pid, status="running")
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1126,8 +1078,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
         t0 = time.time()
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
-        with _JOBS_LOCK:
-            _JOBS[pid]["status"] = "running"
+        _store.update_job(pid, status="running")
         try:
             cfg = _apply_overrides(load_config(), req.config)
 
@@ -1184,8 +1135,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
         t0 = time.time()
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
-        with _JOBS_LOCK:
-            _JOBS[pid]["status"] = "running"
+        _store.update_job(pid, status="running")
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1236,8 +1186,7 @@ async def pipeline_dry_run(req: DryRunRequest):
         t0 = time.time()
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
-        with _JOBS_LOCK:
-            _JOBS[pid]["status"] = "running"
+        _store.update_job(pid, status="running")
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1296,15 +1245,10 @@ def pipeline_status(pipeline_id: str):
     - `output_summary` — lightweight excerpt (counts, verdicts), not full payload
     - `error` — set only when status is `failed`
     """
-    import copy
-    with _JOBS_LOCK:
-        job = _JOBS.get(pipeline_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-        # Deep-copy while holding the lock so the snapshot is consistent —
-        # the worker thread mutates stages dicts in-place via _update_stage.
-        snapshot = copy.deepcopy(job)
-    return ok(snapshot)
+    job = _store.get_job(pipeline_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+    return ok(job)
 
 
 @app.get("/pipeline/status/{pipeline_id}/{stage_name}", tags=["Pipeline Status"])
@@ -1319,21 +1263,18 @@ def pipeline_stage_status(pipeline_id: str, stage_name: str):
     Returns the same stage object as the full `/pipeline/status/{pipeline_id}` response
     but scoped to the requested stage only.
     """
-    import copy
-    with _JOBS_LOCK:
-        job = _JOBS.get(pipeline_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-        stage = job["stages"].get(stage_name)
-        if stage is None:
-            valid = ", ".join(job["stages"].keys())
-            raise HTTPException(
-                status_code=404,
-                detail=f"Stage '{stage_name}' not found in pipeline '{pipeline_id}'. "
-                       f"Valid stages: {valid}",
-            )
-        snapshot = copy.deepcopy(stage)
-    return ok({"pipeline_id": pipeline_id, "stage": stage_name, **snapshot})
+    job = _store.get_job(pipeline_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+    stage = job["stages"].get(stage_name)
+    if stage is None:
+        valid = ", ".join(job["stages"].keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Stage '{stage_name}' not found in pipeline '{pipeline_id}'. "
+                   f"Valid stages: {valid}",
+        )
+    return ok({"pipeline_id": pipeline_id, "stage": stage_name, **stage})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1654,12 +1595,12 @@ def _run_until(
 
     def _s_start(name: str) -> float:
         t = time.time()
-        if pipeline_id and name in _JOBS.get(pipeline_id, {}).get("stages", {}):
+        if pipeline_id:
             _update_stage(pipeline_id, name, status="running", started_at=_now())
         return t
 
     def _s_done(name: str, t: float, summary: dict | None = None) -> None:
-        if pipeline_id and name in _JOBS.get(pipeline_id, {}).get("stages", {}):
+        if pipeline_id:
             _update_stage(pipeline_id, name,
                           status="completed",
                           finished_at=_now(),
@@ -1667,7 +1608,7 @@ def _run_until(
                           output_summary=summary)
 
     def _s_skip(name: str) -> None:
-        if pipeline_id and name in _JOBS.get(pipeline_id, {}).get("stages", {}):
+        if pipeline_id:
             _update_stage(pipeline_id, name, status="skipped")
 
     idx = STAGE_ORDER.index(stop_after)
@@ -1796,8 +1737,7 @@ def _make_partial_endpoint(stop_after: StageLabel):
             t0 = time.time()
             loop = asyncio.get_event_loop()
             clone_dir: str | None = None
-            with _JOBS_LOCK:
-                _JOBS[pid]["status"] = "running"
+            _store.update_job(pid, status="running")
             try:
                 cfg = _apply_overrides(load_config(), req.config)
                 cfg, clone_dir = await loop.run_in_executor(
