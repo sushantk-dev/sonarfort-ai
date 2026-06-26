@@ -1,37 +1,54 @@
 """
-SonarAI — FastAPI Bridge Server
-Exposes the pipeline as an HTTP API for the Angular UI.
+SonarAI — FastAPI Bridge Server  (GCS + Memorystore Redis — Stateless)
+=======================================================================
+All mutable state is moved out of the process so any number of Kubernetes
+pod replicas can serve any request without sticky sessions.
 
-Run:
-    uvicorn api:app --reload --port 8000
+  Was stateful                →  Replaced by
+  ────────────────────────────────────────────────────────────────────
+  _runs / _processes dicts    →  Redis Hash  key: run:{run_id}
+  multiprocessing.Process     →  Redis List  key: sonar:jobs  (LPUSH)
+  multiprocessing.Queue       →    worker.py does BRPOP + writes Redis
+  _last_report_issues list    →  Redis String key: sonar:issues (JSON)
+  local uploads/*.json        →  GCS bucket  blob: reports/sonar-ai-last-report.json
+  local escalations/*.md      →  GCS bucket  prefix: escalations/
+  os.environ config mutation  →  Redis Hash  key: sonar:config
 
-Endpoints:
-    POST /api/pipeline/run          — start a pipeline run
-    POST /api/pipeline/cancel/{id}  — hard-kill a running run
-    GET  /api/pipeline/status/{id}  — poll run status + live step events
-    GET  /api/issues                — list issues from the last loaded report
-    DELETE /api/issues/{key}        — remove one issue
-    POST /api/report/upload         — upload a sonar-report.json
+Required env vars (K8s ConfigMap / Secret):
+  REDIS_URL   — redis://<memorystore-ip>:6379
+  GCS_BUCKET  — GCS bucket name
+  GCP_PROJECT — GCP project ID
+
+Run API:
+    uvicorn api:app --host 0.0.0.0 --port 8080
+Run Worker (separate Deployment):
+    python worker.py
+
+Endpoints (unchanged from v2):
+    POST /api/pipeline/run          — enqueue a pipeline run
+    POST /api/pipeline/cancel/{id}  — mark run cancelled in Redis
+    GET  /api/pipeline/status/{id}  — poll run status (reads Redis)
+    GET  /api/issues                — list issues (reads Redis)
+    DELETE /api/issues/{key}        — remove one issue (Redis + GCS)
+    POST /api/report/upload         — upload sonar-report.json → GCS + Redis
     POST /api/sonar/fetch           — live-fetch issues from SonarQube API
-    GET  /api/sonar/report          — structured summary report of loaded issues
+    GET  /api/sonar/report          — structured summary of loaded issues
     GET  /api/config                — read current settings
-    POST /api/config                — update settings (in-memory only, no .env file)
+    POST /api/config                — persist settings to Redis (all pods updated)
 """
 
 from __future__ import annotations
 
 import json
-import multiprocessing
 import os
-import queue
-import signal
 import tempfile
 import time
 import uuid
-from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import Any, Optional
 
+import redis as _redis_lib
+from google.cloud import storage as _gcs_lib
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
@@ -46,10 +63,123 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory stores ──────────────────────────────────────────────────────────
-_runs:                dict[str, dict[str, Any]] = {}
-_processes:           dict[str, Process]        = {}   # run_id → live Process
-_last_report_issues:  list[dict]                = []
+# ── GCS + Redis singletons ────────────────────────────────────────────────────
+
+_redis_client: _redis_lib.Redis | None = None
+_gcs_client:   _gcs_lib.Client | None = None
+
+
+def _redis() -> _redis_lib.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = _redis_lib.from_url(
+            os.environ.get("REDIS_URL", "redis://localhost:6379"),
+            decode_responses=True,
+        )
+    return _redis_client
+
+
+def _gcs() -> _gcs_lib.Client:
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = _gcs_lib.Client(project=os.environ.get("GCP_PROJECT"))
+    return _gcs_client
+
+
+def _bucket() -> str:
+    return os.environ["GCS_BUCKET"]
+
+
+# ── Redis key schema ──────────────────────────────────────────────────────────
+# run:{run_id}   HASH  "data" field → JSON run document
+# sonar:jobs     LIST  job payloads (LPUSH enqueue / worker BRPOP)
+# sonar:issues   STRING  JSON list of current issues
+# sonar:config   HASH  config override key/value pairs (non-token fields)
+# sonar:run_ids  LIST  run IDs newest-first (capped at 200)
+
+_KEY_JOBS    = "sonar:jobs"
+_KEY_ISSUES  = "sonar:issues"
+_KEY_CONFIG  = "sonar:config"
+_KEY_RUN_IDS = "sonar:run_ids"
+_RUN_TTL     = 60 * 60 * 24 * 7   # 7 days
+
+# ── GCS blob paths ────────────────────────────────────────────────────────────
+_GCS_REPORT    = "reports/sonar-ai-last-report.json"
+_GCS_ESC_PFX   = "escalations/"
+
+
+def _run_key(run_id: str) -> str:
+    return f"run:{run_id}"
+
+
+# ── Redis run helpers ─────────────────────────────────────────────────────────
+
+def _get_run(run_id: str) -> dict | None:
+    raw = _redis().hget(_run_key(run_id), "data")
+    return json.loads(raw) if raw else None
+
+
+def _set_run(run_id: str, data: dict) -> None:
+    r = _redis()
+    r.hset(_run_key(run_id), "data", json.dumps(data))
+    r.expire(_run_key(run_id), _RUN_TTL)
+
+
+def _update_run(run_id: str, updates: dict) -> None:
+    """Merge updates into the existing Redis run document."""
+    r   = _redis()
+    raw = r.hget(_run_key(run_id), "data")
+    doc = json.loads(raw) if raw else {}
+    doc.update(updates)
+    r.hset(_run_key(run_id), "data", json.dumps(doc))
+    r.expire(_run_key(run_id), _RUN_TTL)
+
+
+# ── Issues helpers ────────────────────────────────────────────────────────────
+
+def _get_issues() -> list[dict]:
+    raw = _redis().get(_KEY_ISSUES)
+    return json.loads(raw) if raw else []
+
+
+def _set_issues(issues: list[dict]) -> None:
+    _redis().set(_KEY_ISSUES, json.dumps(issues))
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def _redis_cfg_get(key: str) -> str:
+    """Read a single non-token config value from the Redis sonar:config hash."""
+    try:
+        return _redis().hget(_KEY_CONFIG, key) or ""
+    except Exception:
+        return ""
+
+
+# ── GCS helpers ───────────────────────────────────────────────────────────────
+
+def _gcs_upload(blob: str, data: bytes, ct: str = "application/octet-stream") -> None:
+    _gcs().bucket(_bucket()).blob(blob).upload_from_string(data, content_type=ct)
+
+
+def _gcs_download_bytes(blob: str) -> bytes:
+    return _gcs().bucket(_bucket()).blob(blob).download_as_bytes()
+
+
+def _gcs_download_text(blob: str) -> str:
+    return _gcs_download_bytes(blob).decode("utf-8")
+
+
+def _gcs_exists(blob: str) -> bool:
+    return _gcs().bucket(_bucket()).blob(blob).exists()
+
+
+def _gcs_delete(blob: str) -> None:
+    _gcs().bucket(_bucket()).blob(blob).delete()
+
+
+def _gcs_list(prefix: str) -> list[str]:
+    return [b.name for b in _gcs().bucket(_bucket()).list_blobs(prefix=prefix)]
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -94,186 +224,28 @@ class SonarFetchRequest(BaseModel):
     ps:             int  = 500
 
 
-# ── Worker process function ───────────────────────────────────────────────────
-# Runs in a SEPARATE PROCESS — can be hard-killed via process.terminate()
+# ── Pipeline step helper (called by worker.py via Redis) ─────────────────────
+# The API no longer spawns child processes. It enqueues a JSON job onto
+# sonar:jobs. A separate worker pod (worker.py) BRPOPs that list, runs the
+# pipeline, and calls _push_step to update the shared Redis run document so
+# any API pod can serve GET /api/pipeline/status/{run_id}.
 
-def _pipeline_worker(
-    run_id: str,
-    req_dict: dict,
-    report_path: str,
-    event_queue: Queue,  # type: ignore[type-arg]
-) -> None:
-    """
-    Runs inside a child process. Sends step events through a Queue so the
-    parent process can update _runs without shared memory.
-    """
-
-    def push(label: str, status: str, detail: str = "", ms: int = 0) -> None:
-        event_queue.put({"type": "step", "label": label,
-                         "status": status, "detail": detail, "ms": ms})
-
-    def set_status(status: str, error: str = "") -> None:
-        event_queue.put({"type": "status", "status": status, "error": error})
-
-    step_labels = ["Ingest","Load Repo","RAG Fetch","Rule Fetch",
-                   "Planner","Generator","Critic","Validate","Deliver"]
-    for label in step_labels:
-        push(label, "pending")
-
+def _push_step(run_id: str, label: str, status: str, detail: str = "", ms: int = 0) -> None:
+    """Upsert a single pipeline step in the Redis run document."""
     try:
-        # Apply env overrides
-        if req_dict.get("dry_run"):
-            os.environ["SONAR_AI_DRY_RUN"] = "1"
-        if req_dict.get("parallel"):
-            os.environ["PARALLEL_ISSUES"] = "true"
-        if req_dict.get("rescan"):
-            os.environ["ENABLE_SONAR_RESCAN"] = "true"
-        if req_dict.get("no_rag"):
-            os.environ["ENABLE_RAG"] = "false"
-
-        from graph import run_pipeline
-        from loguru import logger as _log
-
-        # Intercept loguru INFO to drive step state
-        _orig_info = _log.info
-
-        # Per-step detail accumulator — appends lines instead of overwriting
-        _step_details: dict[str, list[str]] = {label: [] for label in step_labels}
-
-        def _clean(msg: str, prefix: str) -> str:
-            """Strip the [Tag] prefix and leading whitespace to get human-readable detail."""
-            import re as _re
-            # Remove leading [Tag] bracket token
-            cleaned = _re.sub(r"^\[" + _re.escape(prefix.strip("[]")) + r"\]\s*", "", msg).strip()
-            return cleaned or msg.strip()
-
-        def _push_detail(label: str, msg: str, tag: str) -> None:
-            """Accumulate detail lines for a step and push the joined result."""
-            line = _clean(msg, tag)
-            if line and (not _step_details[label] or _step_details[label][-1] != line):
-                _step_details[label].append(line)
-            # Keep only last 3 lines to avoid overflow
-            detail = " · ".join(_step_details[label][-3:])
-            push(label, "running", detail)
-
-        def _intercepting_info(msg: str, *a, **kw):  # type: ignore[misc]
-            _orig_info(msg, *a, **kw)
-            m = str(msg)
-            if   "[Ingest]"    in m: _push_detail("Ingest",     m, "[Ingest]")
-            elif "[LoadRepo]"  in m: _push_detail("Load Repo",  m, "[LoadRepo]")
-            elif "[RAG]"       in m: _push_detail("RAG Fetch",  m, "[RAG]")
-            elif "[RuleFetch]" in m: _push_detail("Rule Fetch", m, "[RuleFetch]")
-            elif "[Planner]"   in m: _push_detail("Planner",    m, "[Planner]")
-            elif "[Generator]" in m: _push_detail("Generator",  m, "[Generator]")
-            elif "[Critic]"    in m: _push_detail("Critic",     m, "[Critic]")
-            elif "[Validator]" in m: _push_detail("Validate",   m, "[Validator]")
-            elif "[Deliver]"   in m: _push_detail("Deliver",    m, "[Deliver]")
-
-        _log.info = _intercepting_info  # type: ignore[method-assign]
-
-        # Resolve HEAD / empty commit_sha to the actual SHA
-        commit_sha = req_dict.get("commit_sha", "").strip()
-        if not commit_sha or commit_sha.upper() in ("HEAD", "LATEST", ""):
-            try:
-                import subprocess, tempfile as _tmp
-                from config import settings as _cfg
-                from repo_loader import _inject_token, _repo_name_from_url
-                _auth_url   = _inject_token(req_dict["repo_url"], _cfg.github_token)
-                _repo_name  = _repo_name_from_url(req_dict["repo_url"])
-                _local_path = Path(_cfg.clone_dir) / _repo_name
-                if _local_path.exists():
-                    import git as _git
-                    _repo      = _git.Repo(_local_path)
-                    commit_sha = _repo.head.commit.hexsha
-                else:
-                    result = subprocess.run(
-                        ["git", "ls-remote", _auth_url, "HEAD"],
-                        capture_output=True, text=True, timeout=30
-                    )
-                    if result.returncode == 0 and result.stdout:
-                        commit_sha = result.stdout.split()[0]
-                    else:
-                        commit_sha = "HEAD"
-                logger.info(f"[API] Resolved HEAD → {commit_sha[:12]}")
-            except Exception as _exc:
-                logger.warning(f"[API] Could not resolve HEAD SHA: {_exc} — using HEAD")
-                commit_sha = "HEAD"
-
-        t0 = time.time()
-        final_state = run_pipeline(
-            sonar_report_path=report_path,
-            repo_url=req_dict["repo_url"],
-            commit_sha=commit_sha,
-            max_issues=req_dict.get("max_issues", 0),
-            severities=req_dict.get("severities", "BLOCKER,CRITICAL,MAJOR,MINOR,INFO"),  # ← NEW
-        )
-        elapsed_ms = int((time.time() - t0) * 1000)
-
-        _log.info = _orig_info
-
-        results: list[dict] = final_state.get("pipeline_results", [])
-        event_queue.put({
-            "type":       "done",
-            "results":    results,
-            "elapsed_ms": elapsed_ms,
-        })
-
-    except Exception as exc:  # noqa: BLE001
-        event_queue.put({
-            "type":   "error",
-            "error":  str(exc),
-        })
-
-
-# ── Event queue drainer (runs in parent, called on each status poll) ──────────
-
-def _drain_queue(run_id: str, q: Queue) -> None:  # type: ignore[type-arg]
-    """Pull all pending events from the child queue and apply to _runs."""
-    run = _runs.get(run_id)
-    if not run:
-        return
-
-    steps: list[dict] = run.setdefault("steps", [])
-
-    try:
-        while True:
-            event = q.get_nowait()
-
-            if event["type"] == "step":
-                label, status = event["label"], event["status"]
-                detail, ms = event.get("detail", ""), event.get("ms", 0)
-                matched = False
-                for s in steps:
-                    if s["label"] == label:
-                        s["status"] = status
-                        if detail: s["detail"] = detail
-                        if ms:     s["ms"]     = ms
-                        matched = True
-                        break
-                if not matched:
-                    steps.append({"label": label, "status": status,
-                                  "detail": detail, "ms": ms})
-
-            elif event["type"] == "done":
-                run["status"]     = "done"
-                run["results"]    = event.get("results", [])
-                run["elapsed_ms"] = event.get("elapsed_ms", 0)
-                for s in steps:
-                    if s["status"] == "running":
-                        s["status"] = "done"
-                _processes.pop(run_id, None)
-
-            elif event["type"] == "error":
-                run["status"] = "error"
-                run["error"]  = event.get("error", "Unknown error")
-                for s in steps:
-                    if s["status"] == "running":
-                        s["status"] = "error"
-                        s["detail"] = run["error"]
-                _processes.pop(run_id, None)
-
-    except queue.Empty:
-        pass
+        doc   = _get_run(run_id) or {}
+        steps: list[dict] = doc.get("steps", [])
+        for s in steps:
+            if s["label"] == label:
+                s["status"] = status
+                if detail: s["detail"] = detail
+                if ms:     s["ms"]     = ms
+                break
+        else:
+            steps.append({"label": label, "status": status, "detail": detail, "ms": ms})
+        _update_run(run_id, {"steps": steps})
+    except Exception as exc:
+        logger.warning(f"[API] _push_step failed for run {run_id}: {exc}")
 
 
 # ── SonarQube issue normaliser ────────────────────────────────────────────────
@@ -308,15 +280,18 @@ def _normalize_sonar_issue(raw: dict) -> dict:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "version": "2.0.0"}
+    try:
+        _redis().ping()
+        redis_ok = True
+    except Exception:
+        redis_ok = False
+    return {"status": "ok", "version": "2.0.0", "redis": redis_ok}
 
 
 # ── Report upload ─────────────────────────────────────────────────────────────
 
 @app.post("/api/report/upload")
 async def upload_report(file: UploadFile = File(...)) -> dict:
-    global _last_report_issues
-
     if not file.filename or not file.filename.endswith(".json"):
         raise HTTPException(400, "Only .json files are accepted")
 
@@ -326,19 +301,23 @@ async def upload_report(file: UploadFile = File(...)) -> dict:
     except json.JSONDecodeError as exc:
         raise HTTPException(400, f"Invalid JSON: {exc}") from exc
 
-    uploads_dir = Path(__file__).parent / "uploads"
-    uploads_dir.mkdir(exist_ok=True)
-    report_path = uploads_dir / "sonar-ai-last-report.json"
-    report_path.write_bytes(content)
+    # ── GCS: durable store shared across all pods ─────────────────────────
+    _gcs_upload(_GCS_REPORT, content, "application/json")
 
+    # ── Parse issues and cache in Redis for fast reads ────────────────────
     from parser import parse_sonar_report
-    issues = parse_sonar_report(str(report_path))
-    _last_report_issues = [dict(i) for i in issues]
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+        tf.write(content)
+        local_path = tf.name
+
+    issues = parse_sonar_report(local_path)
+    issues_list = [dict(i) for i in issues]
+    _set_issues(issues_list)
 
     return {
         "message":     f"Uploaded {file.filename}",
-        "issue_count": len(issues),
-        "path":        str(report_path),
+        "issue_count": len(issues_list),
+        "path":        f"gs://{_bucket()}/{_GCS_REPORT}",
     }
 
 
@@ -346,34 +325,35 @@ async def upload_report(file: UploadFile = File(...)) -> dict:
 
 @app.get("/api/issues")
 def get_issues() -> dict:
-    return {"issues": _last_report_issues, "total": len(_last_report_issues)}
+    issues = _get_issues()   # reads from Redis
+    return {"issues": issues, "total": len(issues)}
 
 
 @app.delete("/api/issues/{key}")
 def delete_issue(key: str) -> dict:
-    """Remove an issue from memory and rewrite the saved report file."""
-    global _last_report_issues
-
-    before = len(_last_report_issues)
-    _last_report_issues = [i for i in _last_report_issues if i.get("key") != key]
-    after  = len(_last_report_issues)
+    """Remove an issue from the Redis cache and patch the GCS report blob."""
+    issues = _get_issues()
+    before = len(issues)
+    issues = [i for i in issues if i.get("key") != key]
+    after  = len(issues)
 
     if before == after:
         raise HTTPException(404, f"Issue {key} not found")
 
-    report_path = Path(__file__).parent / "uploads" / "sonar-ai-last-report.json"
-    if report_path.exists():
-        try:
-            existing = json.loads(report_path.read_text())
-            if isinstance(existing, dict) and "issues" in existing:
-                existing["issues"] = [i for i in existing["issues"] if i.get("key") != key]
-                report_path.write_text(json.dumps(existing, indent=2))
-            elif isinstance(existing, list):
-                filtered = [i for i in existing if i.get("key") != key]
-                report_path.write_text(json.dumps(filtered, indent=2))
-            logger.info(f"[Delete] Removed issue {key} — {after} issues remain in file")
-        except Exception as exc:
-            logger.warning(f"[Delete] Could not rewrite report file: {exc}")
+    _set_issues(issues)
+
+    # Patch GCS blob so it stays in sync with Redis
+    try:
+        existing = json.loads(_gcs_download_text(_GCS_REPORT))
+        if isinstance(existing, dict) and "issues" in existing:
+            existing["issues"] = [i for i in existing["issues"] if i.get("key") != key]
+            _gcs_upload(_GCS_REPORT, json.dumps(existing, indent=2).encode(), "application/json")
+        elif isinstance(existing, list):
+            filtered = [i for i in existing if i.get("key") != key]
+            _gcs_upload(_GCS_REPORT, json.dumps(filtered, indent=2).encode(), "application/json")
+        logger.info(f"[Delete] Removed issue {key} — {after} issues remain")
+    except Exception as exc:
+        logger.warning(f"[Delete] Could not patch GCS report: {exc}")
 
     return {"message": f"Issue {key} deleted", "remaining": after}
 
@@ -394,16 +374,20 @@ def get_sonar_rule(rule_key: str) -> dict:
     import re as _re
     from config import settings as s
 
-    if not s.sonar_token:
+    # Redis config overlay takes priority over env-var defaults
+    sonar_token    = _redis_cfg_get("sonar_token")    or s.sonar_token
+    sonar_host_url = _redis_cfg_get("sonar_host_url") or s.sonar_host_url
+
+    if not sonar_token:
         raise HTTPException(400, "SONAR_TOKEN is not configured. Add it in Settings.")
-    if not s.sonar_host_url:
+    if not sonar_host_url:
         raise HTTPException(400, "SONAR_HOST_URL is not configured. Add it in Settings.")
 
-    base_url = s.sonar_host_url.rstrip("/")
+    base_url = sonar_host_url.rstrip("/")
     try:
         resp = _requests.get(
             f"{base_url}/api/rules/show",
-            auth=(s.sonar_token, ""),
+            auth=(sonar_token, ""),
             params={"key": rule_key},
 	    verify=False,
             timeout=15,
@@ -467,20 +451,21 @@ def get_sonar_rule(rule_key: str) -> dict:
 def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
     """
     Proxy a live SonarQube /api/issues/search call using the configured
-    SONAR_TOKEN and SONAR_HOST_URL, then store results in the shared
-    _last_report_issues store so the issues table and pipeline can use them.
+    SONAR_TOKEN and SONAR_HOST_URL, then store results in Redis (fast reads)
+    and GCS (durable across Redis restarts).
     """
-    global _last_report_issues
-
     import requests as _requests
     from config import settings as s
 
-    if not s.sonar_token:
+    sonar_token    = _redis_cfg_get("sonar_token")    or s.sonar_token
+    sonar_host_url = _redis_cfg_get("sonar_host_url") or s.sonar_host_url
+
+    if not sonar_token:
         raise HTTPException(400, "SONAR_TOKEN is not configured. Add it in Settings.")
-    if not s.sonar_host_url:
+    if not sonar_host_url:
         raise HTTPException(400, "SONAR_HOST_URL is not configured. Add it in Settings.")
 
-    base_url = s.sonar_host_url.rstrip("/")
+    base_url = sonar_host_url.rstrip("/")
     url      = f"{base_url}/api/issues/search"
     params: dict = {
         "componentKeys": req.component_keys,
@@ -498,7 +483,7 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
         while True:
             resp = _requests.get(
                 url,
-                auth=(s.sonar_token, ""),
+                auth=(sonar_token, ""),
                 params=params,
 		verify=False,
                 timeout=30,
@@ -530,14 +515,9 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
         logger.error(f"[SonarFetch] Error: {exc}")
         raise HTTPException(500, f"Failed to reach SonarQube: {exc}") from exc
 
-    _last_report_issues = all_issues
-
-    # Persist fetched issues to disk — survives backend restart,
-    # available to the pipeline exactly like an uploaded report
+    # ── Store in Redis (fast) and GCS (durable across Redis restarts) ─────
+    _set_issues(all_issues)
     try:
-        uploads_dir = Path(__file__).parent / "uploads"
-        uploads_dir.mkdir(exist_ok=True)
-        report_path = uploads_dir / "sonar-ai-last-report.json"
         report_data = {
             "source":       "sonarqube_live_fetch",
             "component":    req.component_keys,
@@ -546,10 +526,10 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
             "effort_total": effort_total,
             "issues":       all_issues,
         }
-        report_path.write_text(json.dumps(report_data, indent=2))
-        logger.info(f"[SonarFetch] Saved {len(all_issues)} issues to {report_path}")
+        _gcs_upload(_GCS_REPORT, json.dumps(report_data, indent=2).encode(), "application/json")
+        logger.info(f"[SonarFetch] Saved {len(all_issues)} issues to GCS")
     except Exception as exc:
-        logger.warning(f"[SonarFetch] Could not save report to disk: {exc}")
+        logger.warning(f"[SonarFetch] Could not save report to GCS: {exc}")
 
     logger.info(
         f"[SonarFetch] Fetched {len(all_issues)} issues "
@@ -571,7 +551,7 @@ def get_structured_report() -> dict:
     Return a structured summary of the currently loaded issues,
     grouped by severity and rule, ready to download as a JSON report.
     """
-    issues = _last_report_issues
+    issues = _get_issues()   # reads from Redis
 
     if not issues:
         return {
@@ -618,132 +598,99 @@ def get_structured_report() -> dict:
 
 @app.post("/api/pipeline/run")
 def start_run(req: PipelineRunRequest) -> dict:
-    report_path = str(Path(__file__).parent / "uploads" / "sonar-ai-last-report.json")
-    if not Path(report_path).exists():
+    if not _gcs_exists(_GCS_REPORT):
         raise HTTPException(400, "No sonar report uploaded yet.")
 
     run_id = str(uuid.uuid4())
-    _runs[run_id] = {
-        "id":      run_id,
-        "status":  "queued",
-        "steps":   [],
-        "results": [],
-        "error":   None,
-        "request": req.model_dump(),
-    }
 
-    q: Queue = multiprocessing.Queue()  # type: ignore[type-arg]
+    # Initialise run document in Redis
+    _set_run(run_id, {
+        "id":         run_id,
+        "status":     "queued",
+        "steps":      [],
+        "results":    [],
+        "error":      None,
+        "request":    req.model_dump(),
+        "created_at": time.time(),
+    })
 
-    proc = Process(
-        target=_pipeline_worker,
-        args=(run_id, req.model_dump(), report_path, q),
-        daemon=True,
-    )
-    proc.start()
+    # Track insertion order (newest first), capped at 200
+    _redis().lpush(_KEY_RUN_IDS, run_id)
+    _redis().ltrim(_KEY_RUN_IDS, 0, 199)
 
-    _processes[run_id]      = proc
-    _runs[run_id]["_queue"] = q
-    _runs[run_id]["status"] = "running"
+    # Enqueue job — worker pod picks it up via BRPOP sonar:jobs
+    _redis().lpush(_KEY_JOBS, json.dumps({
+        "run_id":      run_id,
+        "req":         req.model_dump(),
+        "report_blob": _GCS_REPORT,
+    }))
 
-    logger.info(
-        f"[API] Started pipeline worker PID={proc.pid} run_id={run_id} "
-        f"sev={req.severities}"
-    )
-    return {"run_id": run_id, "status": "running"}
+    logger.info(f"[API] Enqueued pipeline job run_id={run_id} sev={req.severities}")
+    return {"run_id": run_id, "status": "queued"}
 
 
 @app.get("/api/pipeline/status/{run_id}")
 def get_run_status(run_id: str) -> dict:
-    if run_id not in _runs:
+    run = _get_run(run_id)
+    if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
-
-    q = _runs[run_id].get("_queue")
-    if q:
-        _drain_queue(run_id, q)
-
-    proc = _processes.get(run_id)
-    if proc and not proc.is_alive() and _runs[run_id]["status"] == "running":
-        exit_code = proc.exitcode
-        if exit_code and exit_code < 0:
-            _runs[run_id]["status"] = "cancelled"
-        else:
-            _runs[run_id]["status"] = "error"
-            _runs[run_id]["error"]  = f"Worker exited unexpectedly (code {exit_code})"
-        _processes.pop(run_id, None)
-
-    return {k: v for k, v in _runs[run_id].items() if k != "_queue"}
+    # Worker writes step updates directly to Redis — no draining needed here
+    return run
 
 
 @app.post("/api/pipeline/cancel/{run_id}")
 def cancel_run(run_id: str) -> dict:
-    """Hard-kill the pipeline worker process immediately."""
-    if run_id not in _runs:
+    """
+    Mark the run as cancelled in Redis. The worker pod checks the run status
+    between pipeline steps and exits cleanly when it sees 'cancelled'.
+    """
+    run = _get_run(run_id)
+    if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
 
-    proc = _processes.get(run_id)
+    steps = run.get("steps", [])
+    for s in steps:
+        if s["status"] in ("running", "pending"):
+            was_running = s["status"] == "running"
+            s["status"] = "cancelled"
+            if was_running:
+                s["detail"] = "Cancelled by user"
 
-    if proc and proc.is_alive():
-        logger.warning(f"[API] Terminating pipeline PID={proc.pid} run_id={run_id}")
-        proc.terminate()
-        proc.join(timeout=3)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=2)
-        _processes.pop(run_id, None)
-        logger.warning(f"[API] Pipeline PID={proc.pid} terminated")
-    else:
-        logger.info(f"[API] Cancel called but run {run_id} is not running")
-
-    if run_id in _runs:
-        run = _runs[run_id]
-        run["status"] = "cancelled"
-        run["error"]  = "Cancelled by user"
-        for s in run.get("steps", []):
-            if s["status"] in ("running", "pending"):
-                was_running = s["status"] == "running"
-                s["status"] = "cancelled"
-                if was_running:
-                    s["detail"] = "Cancelled by user"
-
+    _update_run(run_id, {
+        "status": "cancelled",
+        "error":  "Cancelled by user",
+        "steps":  steps,
+    })
+    logger.info(f"[API] Marked run {run_id} as cancelled in Redis")
     return {"message": f"Run {run_id} cancelled", "run_id": run_id}
 
 
 @app.get("/api/pipeline/runs")
 def list_runs() -> dict:
     """
-    Return full run data for every run in memory so the Angular UI can
-    rehydrate its pipeline history after a page reload.
-    Each entry mirrors GET /api/pipeline/status/{run_id} (minus _queue).
-    Most-recent runs are returned first.
+    Return full run data for every run so the Angular UI can rehydrate its
+    pipeline history after a page reload. Reads from Redis — newest first.
     """
-    runs_out = []
-    for run_id, run in _runs.items():
-        # Drain any pending queue events so the snapshot is as fresh as possible
-        q = run.get("_queue")
-        if q:
-            _drain_queue(run_id, q)
-        runs_out.append({k: v for k, v in run.items() if k != "_queue"})
-
-    runs_out.reverse()   # newest first (dict preserves insertion order in Py 3.7+)
+    run_ids  = _redis().lrange(_KEY_RUN_IDS, 0, 99)
+    runs_out = [run for rid in run_ids if (run := _get_run(rid))]
     return {"runs": runs_out}
 
 
 @app.delete("/api/pipeline/runs/{run_id}")
 def delete_run(run_id: str) -> dict:
     """
-    Remove a finished run from the in-memory store so it won't reappear
-    after the UI reloads. Returns 409 if the run is still active.
+    Remove a finished run from Redis so it won't reappear after the UI reloads.
+    Returns 409 if the run is still active.
     """
-    if run_id not in _runs:
+    run = _get_run(run_id)
+    if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
-
-    proc = _processes.get(run_id)
-    if proc and proc.is_alive():
+    if run.get("status") == "running":
         raise HTTPException(409, f"Run {run_id} is still active — cancel it first")
 
-    _runs.pop(run_id, None)
-    _processes.pop(run_id, None)
-    logger.info(f"[API] Deleted run {run_id}")
+    _redis().delete(_run_key(run_id))
+    _redis().lrem(_KEY_RUN_IDS, 0, run_id)
+    logger.info(f"[API] Deleted run {run_id} from Redis")
     return {"message": f"Run {run_id} deleted"}
 
 
@@ -751,78 +698,75 @@ def delete_run(run_id: str) -> dict:
 
 @app.get("/api/escalations")
 def list_escalations() -> dict:
-    """List all escalation markdown files from the escalations/ directory."""
-    from config import settings as s
-    esc_dir = Path(s.escalation_dir)
-    if not esc_dir.exists():
-        return {"escalations": [], "total": 0}
-
+    """List all escalation markdown files from GCS."""
+    blobs = _gcs_list(_GCS_ESC_PFX)
     items = []
-    for md_file in sorted(esc_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True):
-        stat = md_file.stat()
-        name  = md_file.stem
-        parts = name.split("_", 1)
+
+    for blob_name in sorted(blobs, reverse=True):
+        if not blob_name.endswith(".md"):
+            continue
+        filename  = blob_name[len(_GCS_ESC_PFX):]
+        name      = Path(filename).stem
+        parts     = name.split("_", 1)
         issue_key  = parts[0] if parts else name
         rule_short = parts[1] if len(parts) > 1 else ""
 
-        content   = md_file.read_text(encoding="utf-8", errors="replace")
-        severity  = "UNKNOWN"
-        file_name = ""
-        rule_key  = ""
-        for line in content.splitlines():
-            if "| Severity |" in line:
-                severity = line.split("|")[2].strip().strip("`")
-            if "| File |" in line:
-                file_name = line.split("|")[2].strip().strip("`")
-            if "| Rule |" in line:
-                rule_key = line.split("|")[2].strip().strip("`")
-            if severity != "UNKNOWN" and file_name and rule_key:
-                break
+        try:
+            content   = _gcs_download_text(blob_name)
+            severity  = "UNKNOWN"
+            file_name = ""
+            rule_key  = ""
+            for line in content.splitlines():
+                if "| Severity |" in line:
+                    severity = line.split("|")[2].strip().strip("`")
+                if "| File |" in line:
+                    file_name = line.split("|")[2].strip().strip("`")
+                if "| Rule |" in line:
+                    rule_key = line.split("|")[2].strip().strip("`")
+                if severity != "UNKNOWN" and file_name and rule_key:
+                    break
 
-        items.append({
-            "filename":    md_file.name,
-            "issue_key":   issue_key,
-            "rule_key":    rule_key or rule_short,
-            "severity":    severity,
-            "file_name":   file_name,
-            "size_bytes":  stat.st_size,
-            "modified_at": stat.st_mtime,
-        })
+            items.append({
+                "filename":  filename,
+                "issue_key": issue_key,
+                "rule_key":  rule_key or rule_short,
+                "severity":  severity,
+                "file_name": file_name,
+            })
+        except Exception as exc:
+            logger.warning(f"[Escalations] Could not read {blob_name}: {exc}")
 
     return {"escalations": items, "total": len(items)}
 
 
 @app.get("/api/escalations/{filename}")
 def get_escalation(filename: str) -> dict:
-    """Return the full markdown content of one escalation file."""
-    from config import settings as s
+    """Return the full markdown content of one escalation file from GCS."""
     if not filename.endswith(".md") or "/" in filename or ".." in filename:
         raise HTTPException(400, "Invalid filename")
 
-    esc_path = Path(s.escalation_dir) / filename
-    if not esc_path.exists():
+    blob_name = f"{_GCS_ESC_PFX}{filename}"
+    if not _gcs_exists(blob_name):
         raise HTTPException(404, f"Escalation {filename} not found")
 
     return {
-        "filename":    filename,
-        "content":     esc_path.read_text(encoding="utf-8", errors="replace"),
-        "modified_at": esc_path.stat().st_mtime,
+        "filename": filename,
+        "content":  _gcs_download_text(blob_name),
     }
 
 
 @app.delete("/api/escalations/{filename}")
 def delete_escalation(filename: str) -> dict:
-    """Delete an escalation file."""
-    from config import settings as s
+    """Delete an escalation file from GCS."""
     if not filename.endswith(".md") or "/" in filename or ".." in filename:
         raise HTTPException(400, "Invalid filename")
 
-    esc_path = Path(s.escalation_dir) / filename
-    if not esc_path.exists():
+    blob_name = f"{_GCS_ESC_PFX}{filename}"
+    if not _gcs_exists(blob_name):
         raise HTTPException(404, f"Escalation {filename} not found")
 
-    esc_path.unlink()
-    logger.info(f"[API] Deleted escalation: {filename}")
+    _gcs_delete(blob_name)
+    logger.info(f"[API] Deleted escalation from GCS: {filename}")
     return {"message": f"Deleted {filename}"}
 
 
@@ -835,22 +779,27 @@ def get_config() -> dict:
     def mask(v: str) -> str:
         return "***" if v else ""
 
+    # Redis config hash overrides env-var defaults (non-token fields only)
+    def _ov(key: str, default: Any) -> Any:
+        v = _redis_cfg_get(key)
+        return v if v != "" else default
+
     return {
-        "gcp_project":                 s.gcp_project,
-        "vertex_model":                s.vertex_model,
-        "max_issues":                  s.max_issues,
-        "max_tokens":                  s.max_tokens,
-        "confidence_high_threshold":   s.confidence_high_threshold,
-        "confidence_medium_threshold": s.confidence_medium_threshold,
+        "gcp_project":                 _ov("gcp_project",                 s.gcp_project),
+        "vertex_model":                _ov("vertex_model",                 s.vertex_model),
+        "max_issues":                  int(_ov("max_issues",               s.max_issues)),
+        "max_tokens":                  int(_ov("max_tokens",               s.max_tokens)),
+        "confidence_high_threshold":   float(_ov("confidence_high_threshold",   s.confidence_high_threshold)),
+        "confidence_medium_threshold": float(_ov("confidence_medium_threshold", s.confidence_medium_threshold)),
         "github_token":                mask(s.github_token),
         "sonar_token":                 mask(s.sonar_token),
-        "sonar_host_url":              s.sonar_host_url,
-        "planner_temperature":          s.planner_temperature,
-        "generator_temperature":        s.generator_temperature,
-        "max_critic_retries":          s.max_critic_retries,
+        "sonar_host_url":              _ov("sonar_host_url",               s.sonar_host_url),
+        "planner_temperature":          float(_ov("planner_temperature",    s.planner_temperature)),
+        "generator_temperature":        float(_ov("generator_temperature",  s.generator_temperature)),
+        "max_critic_retries":          int(_ov("max_critic_retries",        s.max_critic_retries)),
         "chroma_persist_dir":          s.chroma_persist_dir,
-        "embedding_model":             s.embedding_model,
-        "rag_top_k":                   s.rag_top_k,
+        "embedding_model":             _ov("embedding_model",               s.embedding_model),
+        "rag_top_k":                   int(_ov("rag_top_k",                 s.rag_top_k)),
         "enable_rag":                  s.enable_rag,
         "parallel_issues":             s.parallel_issues,
         "enable_sonar_rescan":         s.enable_sonar_rescan,
@@ -860,45 +809,32 @@ def get_config() -> dict:
 @app.post("/api/reload")
 def reload_config() -> dict:
     """
-    Re-import the config module so a fresh Settings() picks up the current
-    process environment (os.environ) without restarting uvicorn. There's no
-    .env file involved — this just re-reads real env vars. Called
-    automatically by the UI after saving settings; mostly a no-op safety
-    net since POST /api/config already updates the live singleton directly.
+    No-op in stateless mode: every request reads live config from Redis.
+    Kept for UI compatibility — the Angular settings page calls this after saving.
     """
-    import importlib
-    try:
-        import config as _config_module
-        importlib.reload(_config_module)
-        # Reassign the module-level singleton so all subsequent imports see the new values
-        _config_module.settings = _config_module.Settings()
-        logger.info("[Reload] Config reloaded from process environment")
-        return {
-            "message":       "Config reloaded successfully",
-            "sonar_host_url": _config_module.settings.sonar_host_url,
-            "sonar_token_set": bool(_config_module.settings.sonar_token),
-        }
-    except Exception as exc:
-        logger.error(f"[Reload] Failed to reload config: {exc}")
-        raise HTTPException(500, f"Config reload failed: {exc}") from exc
+    from config import settings as s
+    return {
+        "message":         "Stateless mode — config is read live from Redis on every request.",
+        "sonar_host_url":  _redis_cfg_get("sonar_host_url") or s.sonar_host_url,
+        "sonar_token_set": bool(s.sonar_token or _redis_cfg_get("sonar_token")),
+    }
 
 
 @app.post("/api/config")
 def update_config(req: ConfigUpdateRequest) -> dict:
     """
-    Apply settings changes to the running process only.
+    Persist settings changes to Redis Hash (sonar:config) so every pod sees
+    the change immediately without a restart.
 
-    There is no .env file to write to or read from. This updates the
-    process environment (os.environ) and the live `config.settings`
-    singleton in place, so the change takes effect immediately and
-    survives a later /api/reload. Restarting the process will fall back
-    to whatever is in the real (deploy-managed) shell/container env.
+    Token fields (github_token, sonar_token) are NOT stored in Redis —
+    set them as K8s Secret env vars for persistence across pod restarts.
+    They can still be updated here; the change applies to this pod's
+    os.environ for the current session.
     """
     from config import settings as s
 
     token_fields = {"github_token", "sonar_token"}
 
-    # Include non-None values; also include token fields even if empty string (explicit clear)
     mapping = {
         k: v for k, v in req.model_dump().items()
         if v is not None or (k in token_fields and v == "")
@@ -922,40 +858,43 @@ def update_config(req: ConfigUpdateRequest) -> dict:
         "rag_top_k":                   "RAG_TOP_K",
     }
 
-    # Request field name -> Settings attribute name, only where it differs
-    # (e.g. *_temp request fields map to *_temperature on the Settings model).
     settings_attr_map = {
-        "planner_temp":      "planner_temperature",
-        "generator_temp":    "generator_temperature",
+        "planner_temp":  "planner_temperature",
+        "generator_temp": "generator_temperature",
     }
 
     updated: list[str] = []
+    redis_updates: dict[str, str] = {}
 
     for field, env_key in env_key_map.items():
         if field not in mapping:
             continue
 
-        value = mapping[field]
-        val_str = ("true"  if value is True  else
-                   "false" if value is False else
-                   str(value))
+        value   = mapping[field]
+        val_str = ("true" if value is True else "false" if value is False else str(value))
+        attr    = settings_attr_map.get(field, field)
 
-        # 1) Update the process environment so it's picked up by anything
-        #    that reads os.environ directly, and so /api/reload (which
-        #    rebuilds Settings() from the process env) still sees it.
+        # Always keep local env + settings singleton in sync
         os.environ[env_key] = val_str
-
-        # 2) Update the live settings singleton in place so the change is
-        #    effective immediately — no restart needed.
-        attr = settings_attr_map.get(field, field)
         if hasattr(s, attr):
             setattr(s, attr, value)
 
+        if field in token_fields:
+            # Tokens: local env only — never written to Redis
+            pass
+        else:
+            # Non-secret: persist to Redis so all pods see the change
+            redis_updates[attr] = val_str
+
         updated.append(field)
 
-    logger.info(f"[Config] Applied in-memory settings update: {updated}")
+    if redis_updates:
+        _redis().hset(_KEY_CONFIG, mapping=redis_updates)
+
+    logger.info(f"[Config] Redis-persisted: {list(redis_updates)}, "
+                f"env-only (tokens): {[f for f in updated if f in token_fields]}")
     return {
-        "message":        "Config updated in memory (no .env file involved)",
+        "message":        "Config updated — non-token fields persisted to Redis (all pods updated instantly)",
         "updated_fields": updated,
     }
 
@@ -964,25 +903,36 @@ def update_config(req: ConfigUpdateRequest) -> dict:
 
 @app.on_event("startup")
 def _startup() -> None:
-    global _last_report_issues
-    multiprocessing.set_start_method("spawn", force=True)
+    logger.info("[Startup] SonarAI API — GCS + Memorystore Redis stateless mode")
+    logger.info(f"[Startup] REDIS_URL  : {os.environ.get('REDIS_URL', 'redis://localhost:6379')}")
+    logger.info(f"[Startup] GCS_BUCKET : {os.environ.get('GCS_BUCKET', '(not set)')}")
 
-    report_path = Path(__file__).parent / "uploads" / "sonar-ai-last-report.json"
-    if report_path.exists():
+    # Warm Redis connection
+    try:
+        _redis().ping()
+        logger.info("[Startup] Redis connection OK")
+    except Exception as exc:
+        logger.error(f"[Startup] Redis connection FAILED: {exc}")
+
+    # Warm GCS connection
+    try:
+        _gcs()
+        logger.info("[Startup] GCS client ready")
+    except Exception as exc:
+        logger.warning(f"[Startup] GCS init warning: {exc}")
+
+    # Re-hydrate issues cache from GCS if Redis was restarted cold
+    if not _redis().exists(_KEY_ISSUES):
         try:
-            from parser import parse_sonar_report
-            issues = parse_sonar_report(str(report_path))
-            _last_report_issues = [dict(i) for i in issues]
-            logger.info(f"[Startup] Loaded {len(_last_report_issues)} issues from {report_path}")
+            raw    = json.loads(_gcs_download_text(_GCS_REPORT))
+            issues = raw.get("issues", raw) if isinstance(raw, dict) else raw
+            _set_issues(issues)
+            logger.info(f"[Startup] Re-hydrated {len(issues)} issues from GCS into Redis")
         except Exception as exc:
-            logger.warning(f"[Startup] Could not load saved report: {exc}")
+            logger.info(f"[Startup] No GCS report to re-hydrate ({exc})")
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    """Kill all child processes when uvicorn stops."""
-    for run_id, proc in list(_processes.items()):
-        if proc.is_alive():
-            logger.warning(f"[API] Shutdown: terminating PID={proc.pid}")
-            proc.terminate()
-            proc.join(timeout=2)
+    """Nothing to clean up — all state lives in Redis and GCS."""
+    logger.info("[Shutdown] SonarAI API stopping — no child processes to terminate")
