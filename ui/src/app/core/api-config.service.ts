@@ -9,8 +9,14 @@
 import { Injectable, signal, computed, effect } from '@angular/core';
 
 const STORAGE_KEY   = 'sonarfort_api';
-const DEFAULT_HOST  = 'https://sonarfort-ai.use1.npe.usis.gcp.efx';
-const FORTIFY_PATH  = '/fortify';
+// DEFAULT_HOST resolved at runtime so the same Angular build works in every
+// environment without a rebuild. Precedence:
+//   1. window.__FORTIFYAI_API_HOST__  — injected by nginx entrypoint in GKE
+//   2. localStorage                   — saved from a prior Settings change
+//   3. Hardcoded fallback             — for local dev
+const _w = (typeof window !== 'undefined' ? window : {}) as any;
+const DEFAULT_HOST  = _w.__FORTIFYAI_API_HOST__ ?? 'https://sonarfort-ai.use1.npe.usis.gcp.efx';
+const FORTIFY_PATH  = (_w.__FORTIFYAI_FORTIFY_PATH__ ?? '/fortify') as string;
 
 @Injectable({ providedIn: 'root' })
 export class ApiConfigService {

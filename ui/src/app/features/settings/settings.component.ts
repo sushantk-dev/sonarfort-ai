@@ -61,7 +61,7 @@ export class SettingsComponent implements OnInit {
   oauthUsername  = signal('');
   oauthPassword  = signal('');
   oauthScope     = signal('api-tenant');
-  oauthWriteToEnv = signal(true);
+  oauthApplyToEnv = signal(true);   // sets token in pod env — use Secret Manager to persist
   oauthLoading   = signal(false);
   oauthResult    = signal<OAuthTokenResult | null>(null);
   oauthError     = signal('');
@@ -80,7 +80,7 @@ export class SettingsComponent implements OnInit {
       username:     this.oauthUsername()   || null,
       password:     this.oauthPassword()   || null,
       scope:        this.oauthScope()      || null,
-      write_to_env: this.oauthWriteToEnv(),
+      write_to_env: this.oauthApplyToEnv(),
     };
 
     try {
