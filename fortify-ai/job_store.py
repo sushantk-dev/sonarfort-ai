@@ -1,29 +1,42 @@
 """
 FortifyAI — Job Store
 ----------------------
-Stateless, Redis-backed replacement for the in-memory ``_JOBS`` dict in
-``api_server.py``.  All pipeline state is persisted in Redis so any pod in
-a Kubernetes deployment can serve status queries for a job started by another
-pod.
+Stateless, GCS-backed replacement for the in-memory ``_JOBS`` dict in
+``api_server.py``.  All pipeline state is persisted in a Cloud Storage bucket
+so any pod in a Kubernetes deployment can serve status queries for a job
+started by another pod.
 
 Configuration
 ~~~~~~~~~~~~~
-Set the ``REDIS_URL`` environment variable (default: ``redis://localhost:6379/0``).
-All other settings come from ``FortifyAIConfig`` / environment variables.
+``GCS_BUCKET``       — bucket name (same bucket used for escalation reports).
+``GCS_JOB_PREFIX``   — object prefix for job docs (default ``fortifyai/jobs/``).
+``JOB_TTL_SECONDS``  — lazy-purge age for old jobs (default 24 h).
+
+Auth uses Application Default Credentials / Workload Identity on GKE —
+no key file needed (same as fortify_writeback.py).
 
 Key design
 ~~~~~~~~~~
-- Each job is stored as a Redis hash at key ``fortifyai:job:<pipeline_id>``.
-- Stage maps are stored as a nested JSON string inside the ``stages`` hash field.
-- A sorted set ``fortifyai:jobs`` tracks pipeline_id → started_at (epoch) so
-  ``/pipeline/runs`` can paginate without scanning all keys.
-- TTL defaults to 24 hours so Redis does not grow unboundedly.
-- A ``NullJobStore`` (in-process dict) is used as fallback when Redis is
+- Each job is stored as a JSON object at
+  ``gs://{GCS_BUCKET}/{GCS_JOB_PREFIX}{pipeline_id}.json``.
+- The (potentially large) ``result`` payload is stored separately at
+  ``{pipeline_id}.result.json`` so status polling and ``/pipeline/runs``
+  listings never download the full result blob.
+- ``started_at`` is mirrored into custom blob metadata so ``list_jobs`` can
+  sort newest-first from the listing alone, without downloading every doc.
+- Read-modify-write updates use GCS generation preconditions
+  (``if_generation_match``) with a small retry loop, so concurrent stage
+  updates from different threads/pods never silently overwrite each other.
+- TTL: unlike Redis, GCS objects can't expire client-side. Configure a
+  bucket lifecycle rule (age > 1 day, prefix ``fortifyai/jobs/``) for real
+  cleanup. A lazy in-process purge also runs opportunistically as a backstop.
+- A ``NullJobStore`` (in-process dict) is used as fallback when GCS is
   unavailable, so the service still works in local / single-pod mode.
 
 Thread safety
 ~~~~~~~~~~~~~
-redis-py's connection pool is thread-safe; no additional locking is required.
+google-cloud-storage clients are thread-safe for concurrent requests.
+Generation preconditions provide cross-thread / cross-pod write safety.
 ``NullJobStore`` uses a threading.Lock to match the original behaviour.
 """
 
@@ -42,10 +55,12 @@ from loguru import logger
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_KEY_PREFIX  = "fortifyai:job:"
-_INDEX_KEY   = "fortifyai:jobs"
-_JOB_TTL_SEC = int(os.environ.get("JOB_TTL_SECONDS", 86400))   # 24 h default
-_REDIS_URL   = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_GCS_BUCKET   = os.environ.get("GCS_BUCKET", "").strip()
+_JOB_PREFIX   = os.environ.get("GCS_JOB_PREFIX", "fortifyai/jobs/").rstrip("/") + "/"
+_JOB_TTL_SEC  = int(os.environ.get("JOB_TTL_SECONDS", 86400))   # 24 h default
+
+_SAVE_RETRIES = 4          # optimistic-concurrency retry attempts
+_PURGE_EVERY  = 600        # lazy purge at most once per 10 min per process
 
 ALL_STAGE_NAMES = [
     "triage", "version-resolver", "context", "api-diff",
@@ -124,97 +139,145 @@ class JobStore(ABC):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Redis implementation
+# GCS implementation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class RedisJobStore(JobStore):
+class GcsJobStore(JobStore):
     """
-    Each job is stored as a Redis hash.  The ``stages`` field is a JSON string
-    because Redis hashes only support flat string values.
+    Objects
+    ~~~~~~~
+    ``{prefix}{pid}.json``          — job doc WITHOUT the ``result`` field
+                                      (small; safe to poll every 1.5 s)
+    ``{prefix}{pid}.result.json``   — result payload, written once at finish
 
-    Keys
-    ~~~~
-    ``fortifyai:job:<uuid>``   — hash with all job fields
-    ``fortifyai:jobs``         — sorted set: score = started_at epoch, member = pipeline_id
+    Custom metadata on the job doc:
+      ``started_at_epoch`` — float string, used to sort listings newest-first
+      ``status``           — mirrored for cheap future filtering
     """
 
-    def __init__(self, redis_url: str = _REDIS_URL, ttl: int = _JOB_TTL_SEC):
-        import redis  # imported lazily so the module loads without redis installed
-        self._r = redis.from_url(redis_url, decode_responses=True)
+    def __init__(self, bucket_name: str = _GCS_BUCKET, prefix: str = _JOB_PREFIX,
+                 ttl: int = _JOB_TTL_SEC):
+        from google.cloud import storage  # lazy import — module loads without lib
+        self._client = storage.Client()
+        self._bucket = self._client.bucket(bucket_name)
+        self._bucket_name = bucket_name
+        self._prefix = prefix
         self._ttl = ttl
-        logger.info(f"[JobStore] Using Redis at {redis_url} (TTL={ttl}s)")
+        self._last_purge = 0.0
+        self._purge_lock = threading.Lock()
+        logger.info(
+            f"[JobStore] Using GCS bucket gs://{bucket_name}/{prefix} "
+            f"(TTL={ttl}s — configure a bucket lifecycle rule for hard cleanup)"
+        )
 
-    def _key(self, pid: str) -> str:
-        return _KEY_PREFIX + pid
+    # ── Blob helpers ──────────────────────────────────────────────────────────
 
-    def _save(self, job: dict) -> None:
-        """Serialise the job dict to the Redis hash."""
-        pid = job["pipeline_id"]
-        key = self._key(pid)
-        flat: dict[str, str] = {}
-        for field, value in job.items():
-            if field == "stages":
-                flat["stages"] = json.dumps(value)
-            elif field == "result":
-                flat["result"] = json.dumps(value) if value is not None else ""
-            elif value is None:
-                flat[field] = ""
-            else:
-                flat[field] = str(value)
-        pipe = self._r.pipeline()
-        pipe.hset(key, mapping=flat)
-        pipe.expire(key, self._ttl)
-        # Index for listing: score = started_at as epoch float
+    def _doc_blob_name(self, pid: str) -> str:
+        return f"{self._prefix}{pid}.json"
+
+    def _result_blob_name(self, pid: str) -> str:
+        return f"{self._prefix}{pid}.result.json"
+
+    def _epoch(self, iso_ts: str) -> float:
         try:
-            score = datetime.fromisoformat(job["started_at"]).timestamp()
+            return datetime.fromisoformat(iso_ts).timestamp()
         except Exception:
-            score = time.time()
-        pipe.zadd(_INDEX_KEY, {pid: score})
-        pipe.expire(_INDEX_KEY, self._ttl)
-        pipe.execute()
+            return time.time()
 
-    def _load(self, pid: str) -> dict | None:
-        raw = self._r.hgetall(self._key(pid))
-        if not raw:
+    def _write_doc(self, job: dict, if_generation_match: int | None = None) -> None:
+        """
+        Upload the job doc (result stripped). ``if_generation_match=0`` means
+        create-only; a concrete generation means compare-and-swap; ``None``
+        means unconditional overwrite (used only after retries are exhausted).
+        """
+        doc = {k: v for k, v in job.items() if k != "result"}
+        blob = self._bucket.blob(self._doc_blob_name(job["pipeline_id"]))
+        blob.metadata = {
+            "started_at_epoch": str(self._epoch(job.get("started_at") or _now())),
+            "status": str(job.get("status", "")),
+        }
+        blob.upload_from_string(
+            json.dumps(doc).encode("utf-8"),
+            content_type="application/json",
+            if_generation_match=if_generation_match,
+        )
+
+    def _read_doc(self, pid: str) -> tuple[dict | None, int | None]:
+        """Return (doc, generation) or (None, None) if the job doesn't exist."""
+        from google.api_core import exceptions as gexc
+        blob = self._bucket.blob(self._doc_blob_name(pid))
+        try:
+            data = blob.download_as_bytes()
+        except gexc.NotFound:
+            return None, None
+        # download_as_bytes populates blob.generation from response headers,
+        # so no extra reload() round-trip is needed for the CAS precondition.
+        return json.loads(data.decode("utf-8")), blob.generation
+
+    def _read_result(self, pid: str) -> Any:
+        from google.api_core import exceptions as gexc
+        blob = self._bucket.blob(self._result_blob_name(pid))
+        try:
+            raw = blob.download_as_bytes()
+        except gexc.NotFound:
             return None
-        job: dict = {}
-        for field, value in raw.items():
-            if field == "stages":
-                job["stages"] = json.loads(value) if value else {}
-            elif field == "result":
-                job["result"] = json.loads(value) if value else None
-            elif value == "":
-                job[field] = None
-            else:
-                job[field] = value
-        return job
+        return json.loads(raw.decode("utf-8")) if raw else None
+
+    def _mutate(self, pid: str, fn, op_name: str) -> None:
+        """
+        Read-modify-write with generation precondition + retry.
+        ``fn(doc)`` mutates the doc in place.
+        """
+        from google.api_core import exceptions as gexc
+        for attempt in range(_SAVE_RETRIES):
+            doc, gen = self._read_doc(pid)
+            if doc is None:
+                logger.warning(f"[JobStore] {op_name}: unknown pipeline_id {pid}")
+                return
+            fn(doc)
+            try:
+                self._write_doc(doc, if_generation_match=gen)
+                return
+            except gexc.PreconditionFailed:
+                # Someone else wrote between our read and write — re-read & retry
+                time.sleep(0.1 * (attempt + 1))
+        # Last resort: unconditional write so progress isn't lost entirely
+        logger.warning(f"[JobStore] {op_name}: CAS retries exhausted for {pid} — "
+                       f"forcing unconditional write")
+        doc, _ = self._read_doc(pid)
+        if doc is not None:
+            fn(doc)
+            self._write_doc(doc)
+
+    # ── Interface implementation ─────────────────────────────────────────────
 
     def new_job(self, stages: list[str] | None = None) -> dict:
+        from google.api_core import exceptions as gexc
         pid = str(uuid.uuid4())
         job = _blank_job(pid, stages)
-        self._save(job)
+        try:
+            self._write_doc(job, if_generation_match=0)   # create-only
+        except gexc.PreconditionFailed:                   # UUID collision — absurd, but safe
+            return self.new_job(stages)
+        self._maybe_purge()
         return job
 
     def get_job(self, pipeline_id: str) -> dict | None:
-        return self._load(pipeline_id)
+        doc, _ = self._read_doc(pipeline_id)
+        if doc is None:
+            return None
+        # Reattach the result payload only for direct single-job reads
+        doc["result"] = self._read_result(pipeline_id)
+        return doc
 
     def update_job(self, pipeline_id: str, **fields) -> None:
-        job = self._load(pipeline_id)
-        if job is None:
-            logger.warning(f"[JobStore] update_job: unknown pipeline_id {pipeline_id}")
-            return
-        job.update(fields)
-        self._save(job)
+        fields.pop("result", None)  # result is written only via finish_job
+        self._mutate(pipeline_id, lambda d: d.update(fields), "update_job")
 
     def update_stage(self, pipeline_id: str, stage: str, **fields) -> None:
-        job = self._load(pipeline_id)
-        if job is None:
-            logger.warning(f"[JobStore] update_stage: unknown pipeline_id {pipeline_id}")
-            return
-        if stage not in job.get("stages", {}):
-            job.setdefault("stages", {})[stage] = {}
-        job["stages"][stage].update(fields)
-        self._save(job)
+        def _apply(doc: dict) -> None:
+            doc.setdefault("stages", {}).setdefault(stage, {}).update(fields)
+        self._mutate(pipeline_id, _apply, "update_stage")
 
     def finish_job(
         self,
@@ -224,27 +287,73 @@ class RedisJobStore(JobStore):
         error: str | None = None,
         t0: float | None = None,
     ) -> None:
-        job = self._load(pipeline_id)
-        if job is None:
-            logger.warning(f"[JobStore] finish_job: unknown pipeline_id {pipeline_id}")
-            return
-        job["status"]          = status
-        job["finished_at"]     = _now()
-        job["elapsed_seconds"] = round(time.time() - t0, 3) if t0 else None
-        job["result"]          = result
-        job["error"]           = error
-        self._save(job)
+        # Write the heavy result blob first (idempotent overwrite is fine)
+        if result is not None:
+            try:
+                blob = self._bucket.blob(self._result_blob_name(pipeline_id))
+                blob.upload_from_string(
+                    json.dumps(result).encode("utf-8"),
+                    content_type="application/json",
+                )
+            except Exception as exc:
+                logger.error(f"[JobStore] finish_job: result upload failed for "
+                             f"{pipeline_id}: {exc}")
+
+        def _apply(doc: dict) -> None:
+            doc["status"]          = status
+            doc["finished_at"]     = _now()
+            doc["elapsed_seconds"] = round(time.time() - t0, 3) if t0 else None
+            doc["error"]           = error
+
+        self._mutate(pipeline_id, _apply, "finish_job")
 
     def list_jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
-        # Sorted set is scored by started_at epoch; newest first = ZREVRANGE
-        pids = self._r.zrevrange(_INDEX_KEY, offset, offset + limit - 1)
-        jobs = []
-        for pid in pids:
-            job = self._load(pid)
-            if job:
-                # Return a lightweight summary (no full result blob)
-                jobs.append({k: v for k, v in job.items() if k != "result"})
+        # 1. List job-doc blobs (skip .result.json), sort by started_at metadata
+        entries: list[tuple[float, str]] = []   # (epoch, pid)
+        for blob in self._client.list_blobs(self._bucket_name, prefix=self._prefix):
+            name = blob.name
+            if not name.endswith(".json") or name.endswith(".result.json"):
+                continue
+            pid = name[len(self._prefix):-len(".json")]
+            meta = blob.metadata or {}
+            try:
+                epoch = float(meta.get("started_at_epoch", ""))
+            except (TypeError, ValueError):
+                epoch = blob.time_created.timestamp() if blob.time_created else 0.0
+            entries.append((epoch, pid))
+
+        entries.sort(key=lambda e: e[0], reverse=True)   # newest first
+        page = entries[offset: offset + limit]
+
+        # 2. Download only the docs in the requested page (small blobs, no result)
+        jobs: list[dict] = []
+        for _, pid in page:
+            doc, _gen = self._read_doc(pid)
+            if doc:
+                doc.pop("result", None)   # defensive — doc never contains it
+                jobs.append(doc)
         return jobs
+
+    # ── Lazy TTL purge (backstop — prefer a bucket lifecycle rule) ───────────
+
+    def _maybe_purge(self) -> None:
+        now = time.time()
+        with self._purge_lock:
+            if now - self._last_purge < _PURGE_EVERY:
+                return
+            self._last_purge = now
+        try:
+            cutoff = now - self._ttl
+            for blob in self._client.list_blobs(self._bucket_name, prefix=self._prefix):
+                meta = blob.metadata or {}
+                try:
+                    epoch = float(meta.get("started_at_epoch", ""))
+                except (TypeError, ValueError):
+                    epoch = blob.time_created.timestamp() if blob.time_created else now
+                if epoch < cutoff:
+                    blob.delete()
+        except Exception as exc:
+            logger.debug(f"[JobStore] lazy purge skipped: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -254,17 +363,17 @@ class RedisJobStore(JobStore):
 class NullJobStore(JobStore):
     """
     In-process dict store — identical to the original ``_JOBS`` behaviour.
-    Used automatically when Redis is not reachable.  NOT safe for multi-pod
-    deployments — set ``REDIS_URL`` in production.
+    Used automatically when GCS is not reachable.  NOT safe for multi-pod
+    deployments — set ``GCS_BUCKET`` in production.
     """
 
     def __init__(self) -> None:
         self._jobs: Dict[str, dict] = {}
         self._lock = threading.Lock()
         logger.warning(
-            "[JobStore] Redis unavailable — using in-process NullJobStore. "
+            "[JobStore] GCS unavailable — using in-process NullJobStore. "
             "Pipeline status will NOT survive pod restarts or be visible across replicas. "
-            "Set REDIS_URL to enable shared state."
+            "Set GCS_BUCKET to enable shared state."
         )
 
     def new_job(self, stages: list[str] | None = None) -> dict:
@@ -325,19 +434,20 @@ class NullJobStore(JobStore):
 
 def create_job_store() -> JobStore:
     """
-    Return a ``RedisJobStore`` if Redis is reachable, else ``NullJobStore``.
+    Return a ``GcsJobStore`` if GCS_BUCKET is set and reachable, else
+    ``NullJobStore``.
 
-    The probe is a single PING with a 2-second timeout so startup is not
-    blocked when Redis is optional (e.g. local development).
+    The probe is a single metadata GET with a short timeout so startup is
+    not blocked when GCS is optional (e.g. local development).
     """
-    redis_url = os.environ.get("REDIS_URL", "").strip()
-    if not redis_url:
+    bucket_name = os.environ.get("GCS_BUCKET", "").strip()
+    if not bucket_name:
         return NullJobStore()
     try:
-        import redis
-        r = redis.from_url(redis_url, socket_connect_timeout=2, decode_responses=True)
-        r.ping()
-        return RedisJobStore(redis_url)
+        from google.cloud import storage
+        client = storage.Client()
+        client.get_bucket(bucket_name, timeout=5)   # probe: existence + IAM
+        return GcsJobStore(bucket_name)
     except Exception as exc:
-        logger.warning(f"[JobStore] Redis probe failed ({exc}) — falling back to NullJobStore")
+        logger.warning(f"[JobStore] GCS probe failed ({exc}) — falling back to NullJobStore")
         return NullJobStore()

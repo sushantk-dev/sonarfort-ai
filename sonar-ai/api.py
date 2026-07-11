@@ -1,21 +1,21 @@
 """
-SonarAI — FastAPI Bridge Server  (GCS + Memorystore Redis — Stateless)
-=======================================================================
-All mutable state is moved out of the process so any number of Kubernetes
-pod replicas can serve any request without sticky sessions.
+SonarAI — FastAPI Bridge Server  (GCS-only — Stateless)
+========================================================
+All mutable state lives in a single GCS bucket so any number of Kubernetes
+pod replicas can serve any request without sticky sessions. No Redis.
 
-  Was stateful                →  Replaced by
+  Was stateful                →  Replaced by (GCS blob)
   ────────────────────────────────────────────────────────────────────
-  _runs / _processes dicts    →  Redis Hash  key: run:{run_id}
-  multiprocessing.Process     →  Redis List  key: sonar:jobs  (LPUSH)
-  multiprocessing.Queue       →    worker.py does BRPOP + writes Redis
-  _last_report_issues list    →  Redis String key: sonar:issues (JSON)
-  local uploads/*.json        →  GCS bucket  blob: reports/sonar-ai-last-report.json
-  local escalations/*.md      →  GCS bucket  prefix: escalations/
-  os.environ config mutation  →  Redis Hash  key: sonar:config
+  _runs / _processes dicts    →  runs/{run_id}.json
+  multiprocessing.Queue       →  jobs/pending/{run_id}.json
+                                 (worker.py polls prefix + claims via
+                                  delete with if_generation_match)
+  _last_report_issues list    →  state/issues.json
+  local uploads/*.json        →  reports/sonar-ai-last-report.json
+  local escalations/*.md      →  escalations/ prefix
+  os.environ config mutation  →  state/config.json
 
 Required env vars (K8s ConfigMap / Secret):
-  REDIS_URL   — redis://<memorystore-ip>:6379
   GCS_BUCKET  — GCS bucket name
   GCP_PROJECT — GCP project ID
 
@@ -26,15 +26,15 @@ Run Worker (separate Deployment):
 
 Endpoints (unchanged from v2):
     POST /api/pipeline/run          — enqueue a pipeline run
-    POST /api/pipeline/cancel/{id}  — mark run cancelled in Redis
-    GET  /api/pipeline/status/{id}  — poll run status (reads Redis)
-    GET  /api/issues                — list issues (reads Redis)
-    DELETE /api/issues/{key}        — remove one issue (Redis + GCS)
-    POST /api/report/upload         — upload sonar-report.json → GCS + Redis
+    POST /api/pipeline/cancel/{id}  — mark run cancelled in GCS
+    GET  /api/pipeline/status/{id}  — poll run status (reads GCS)
+    GET  /api/issues                — list issues (reads GCS)
+    DELETE /api/issues/{key}        — remove one issue (GCS)
+    POST /api/report/upload         — upload sonar-report.json → GCS
     POST /api/sonar/fetch           — live-fetch issues from SonarQube API
     GET  /api/sonar/report          — structured summary of loaded issues
     GET  /api/config                — read current settings
-    POST /api/config                — persist settings to Redis (all pods updated)
+    POST /api/config                — persist settings to GCS (all pods updated)
 """
 
 from __future__ import annotations
@@ -47,14 +47,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-import redis as _redis_lib
 from google.cloud import storage as _gcs_lib
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
 
-app = FastAPI(title="SonarAI API", version="2.0.0")
+app = FastAPI(title="SonarAI API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,20 +62,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── GCS + Redis singletons ────────────────────────────────────────────────────
+# ── GCS singleton ─────────────────────────────────────────────────────────────
 
-_redis_client: _redis_lib.Redis | None = None
-_gcs_client:   _gcs_lib.Client | None = None
-
-
-def _redis() -> _redis_lib.Redis:
-    global _redis_client
-    if _redis_client is None:
-        _redis_client = _redis_lib.from_url(
-            os.environ.get("REDIS_URL", "redis://localhost:6379"),
-            decode_responses=True,
-        )
-    return _redis_client
+_gcs_client: _gcs_lib.Client | None = None
 
 
 def _gcs() -> _gcs_lib.Client:
@@ -90,70 +78,30 @@ def _bucket() -> str:
     return os.environ["GCS_BUCKET"]
 
 
-# ── Redis key schema ──────────────────────────────────────────────────────────
-# run:{run_id}   HASH  "data" field → JSON run document
-# sonar:jobs     LIST  job payloads (LPUSH enqueue / worker BRPOP)
-# sonar:issues   STRING  JSON list of current issues
-# sonar:config   HASH  config override key/value pairs (non-token fields)
-# sonar:run_ids  LIST  run IDs newest-first (capped at 200)
+# ── GCS blob schema ───────────────────────────────────────────────────────────
+# runs/{run_id}.json          — JSON run document (status, steps, results)
+# jobs/pending/{run_id}.json  — queued job payload; worker claims + deletes
+# state/issues.json           — JSON list of current issues
+# state/config.json           — config override key/value pairs (non-token)
+# reports/…                   — uploaded sonar report (durable source of truth)
+# escalations/…               — escalation markdown files
 
-_KEY_JOBS    = "sonar:jobs"
-_KEY_ISSUES  = "sonar:issues"
-_KEY_CONFIG  = "sonar:config"
-_KEY_RUN_IDS = "sonar:run_ids"
-_RUN_TTL     = 60 * 60 * 24 * 7   # 7 days
+_GCS_REPORT   = "reports/sonar-ai-last-report.json"
+_GCS_ESC_PFX  = "escalations/"
+_GCS_RUNS_PFX = "runs/"
+_GCS_JOBS_PFX = "jobs/pending/"
+_GCS_ISSUES   = "state/issues.json"
+_GCS_CONFIG   = "state/config.json"
 
-# ── GCS blob paths ────────────────────────────────────────────────────────────
-_GCS_REPORT    = "reports/sonar-ai-last-report.json"
-_GCS_ESC_PFX   = "escalations/"
-
-
-def _run_key(run_id: str) -> str:
-    return f"run:{run_id}"
+_MAX_RUNS_KEPT = 200   # oldest run blobs beyond this are pruned on enqueue
 
 
-# ── Redis run helpers ─────────────────────────────────────────────────────────
-
-def _get_run(run_id: str) -> dict | None:
-    raw = _redis().hget(_run_key(run_id), "data")
-    return json.loads(raw) if raw else None
+def _run_blob(run_id: str) -> str:
+    return f"{_GCS_RUNS_PFX}{run_id}.json"
 
 
-def _set_run(run_id: str, data: dict) -> None:
-    r = _redis()
-    r.hset(_run_key(run_id), "data", json.dumps(data))
-    r.expire(_run_key(run_id), _RUN_TTL)
-
-
-def _update_run(run_id: str, updates: dict) -> None:
-    """Merge updates into the existing Redis run document."""
-    r   = _redis()
-    raw = r.hget(_run_key(run_id), "data")
-    doc = json.loads(raw) if raw else {}
-    doc.update(updates)
-    r.hset(_run_key(run_id), "data", json.dumps(doc))
-    r.expire(_run_key(run_id), _RUN_TTL)
-
-
-# ── Issues helpers ────────────────────────────────────────────────────────────
-
-def _get_issues() -> list[dict]:
-    raw = _redis().get(_KEY_ISSUES)
-    return json.loads(raw) if raw else []
-
-
-def _set_issues(issues: list[dict]) -> None:
-    _redis().set(_KEY_ISSUES, json.dumps(issues))
-
-
-# ── Config helpers ────────────────────────────────────────────────────────────
-
-def _redis_cfg_get(key: str) -> str:
-    """Read a single non-token config value from the Redis sonar:config hash."""
-    try:
-        return _redis().hget(_KEY_CONFIG, key) or ""
-    except Exception:
-        return ""
+def _job_blob(run_id: str) -> str:
+    return f"{_GCS_JOBS_PFX}{run_id}.json"
 
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
@@ -182,6 +130,63 @@ def _gcs_list(prefix: str) -> list[str]:
     return [b.name for b in _gcs().bucket(_bucket()).list_blobs(prefix=prefix)]
 
 
+def _gcs_read_json(blob: str, default: Any = None) -> Any:
+    """Read a JSON blob; return `default` if the blob does not exist."""
+    try:
+        return json.loads(_gcs_download_text(blob))
+    except Exception:
+        return default
+
+
+def _gcs_write_json(blob: str, data: Any) -> None:
+    _gcs_upload(blob, json.dumps(data).encode("utf-8"), "application/json")
+
+
+# ── Run helpers (GCS-backed) ──────────────────────────────────────────────────
+
+def _get_run(run_id: str) -> dict | None:
+    return _gcs_read_json(_run_blob(run_id), default=None)
+
+
+def _set_run(run_id: str, data: dict) -> None:
+    _gcs_write_json(_run_blob(run_id), data)
+
+
+def _update_run(run_id: str, updates: dict) -> None:
+    """Merge updates into the existing GCS run document."""
+    doc = _get_run(run_id) or {}
+    doc.update(updates)
+    _set_run(run_id, doc)
+
+
+# ── Issues helpers ────────────────────────────────────────────────────────────
+
+def _get_issues() -> list[dict]:
+    return _gcs_read_json(_GCS_ISSUES, default=[]) or []
+
+
+def _set_issues(issues: list[dict]) -> None:
+    _gcs_write_json(_GCS_ISSUES, issues)
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def _cfg_overrides() -> dict[str, str]:
+    """Read the full non-token config override map from GCS."""
+    try:
+        data = _gcs_read_json(_GCS_CONFIG, default={})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cfg_get(key: str, overrides: dict[str, str] | None = None) -> str:
+    """Read a single non-token config value from the GCS config blob."""
+    if overrides is None:
+        overrides = _cfg_overrides()
+    return overrides.get(key, "") or ""
+
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
 class PipelineRunRequest(BaseModel):
@@ -192,7 +197,7 @@ class PipelineRunRequest(BaseModel):
     rescan:     bool = False
     no_rag:     bool = False
     dry_run:    bool = False
-    severities: str  = "BLOCKER,CRITICAL,MAJOR,MINOR,INFO"   # ← NEW
+    severities: str  = "BLOCKER,CRITICAL,MAJOR,MINOR,INFO"
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -224,14 +229,15 @@ class SonarFetchRequest(BaseModel):
     ps:             int  = 500
 
 
-# ── Pipeline step helper (called by worker.py via Redis) ─────────────────────
-# The API no longer spawns child processes. It enqueues a JSON job onto
-# sonar:jobs. A separate worker pod (worker.py) BRPOPs that list, runs the
-# pipeline, and calls _push_step to update the shared Redis run document so
-# any API pod can serve GET /api/pipeline/status/{run_id}.
+# ── Pipeline step helper (worker.py owns step updates via GCS) ───────────────
+# The API no longer spawns child processes. It writes a job blob under
+# jobs/pending/. A separate worker pod (worker.py) polls that prefix, claims
+# the job by deleting the blob with a generation precondition, runs the
+# pipeline, and updates the shared GCS run document so any API pod can serve
+# GET /api/pipeline/status/{run_id}.
 
 def _push_step(run_id: str, label: str, status: str, detail: str = "", ms: int = 0) -> None:
-    """Upsert a single pipeline step in the Redis run document."""
+    """Upsert a single pipeline step in the GCS run document."""
     try:
         doc   = _get_run(run_id) or {}
         steps: list[dict] = doc.get("steps", [])
@@ -281,11 +287,11 @@ def _normalize_sonar_issue(raw: dict) -> dict:
 @app.get("/api/health")
 def health() -> dict:
     try:
-        _redis().ping()
-        redis_ok = True
+        _gcs().bucket(_bucket()).exists()
+        gcs_ok = True
     except Exception:
-        redis_ok = False
-    return {"status": "ok", "version": "2.0.0", "redis": redis_ok}
+        gcs_ok = False
+    return {"status": "ok", "version": "2.1.0", "gcs": gcs_ok}
 
 
 # ── Report upload ─────────────────────────────────────────────────────────────
@@ -304,7 +310,7 @@ async def upload_report(file: UploadFile = File(...)) -> dict:
     # ── GCS: durable store shared across all pods ─────────────────────────
     _gcs_upload(_GCS_REPORT, content, "application/json")
 
-    # ── Parse issues and cache in Redis for fast reads ────────────────────
+    # ── Parse issues and persist parsed list to GCS for fast reads ────────
     from parser import parse_sonar_report
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
         tf.write(content)
@@ -325,13 +331,13 @@ async def upload_report(file: UploadFile = File(...)) -> dict:
 
 @app.get("/api/issues")
 def get_issues() -> dict:
-    issues = _get_issues()   # reads from Redis
+    issues = _get_issues()   # reads from GCS
     return {"issues": issues, "total": len(issues)}
 
 
 @app.delete("/api/issues/{key}")
 def delete_issue(key: str) -> dict:
-    """Remove an issue from the Redis cache and patch the GCS report blob."""
+    """Remove an issue from state/issues.json and patch the GCS report blob."""
     issues = _get_issues()
     before = len(issues)
     issues = [i for i in issues if i.get("key") != key]
@@ -342,7 +348,7 @@ def delete_issue(key: str) -> dict:
 
     _set_issues(issues)
 
-    # Patch GCS blob so it stays in sync with Redis
+    # Patch report blob so it stays in sync with the parsed issues list
     try:
         existing = json.loads(_gcs_download_text(_GCS_REPORT))
         if isinstance(existing, dict) and "issues" in existing:
@@ -374,9 +380,10 @@ def get_sonar_rule(rule_key: str) -> dict:
     import re as _re
     from config import settings as s
 
-    # Redis config overlay takes priority over env-var defaults
-    sonar_token    = _redis_cfg_get("sonar_token")    or s.sonar_token
-    sonar_host_url = _redis_cfg_get("sonar_host_url") or s.sonar_host_url
+    # GCS config overlay takes priority over env-var defaults
+    overrides      = _cfg_overrides()
+    sonar_token    = _cfg_get("sonar_token", overrides)    or s.sonar_token
+    sonar_host_url = _cfg_get("sonar_host_url", overrides) or s.sonar_host_url
 
     if not sonar_token:
         raise HTTPException(400, "SONAR_TOKEN is not configured. Add it in Settings.")
@@ -389,7 +396,7 @@ def get_sonar_rule(rule_key: str) -> dict:
             f"{base_url}/api/rules/show",
             auth=(sonar_token, ""),
             params={"key": rule_key},
-	    verify=False,
+            verify=False,
             timeout=15,
         )
     except Exception as exc:
@@ -451,14 +458,15 @@ def get_sonar_rule(rule_key: str) -> dict:
 def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
     """
     Proxy a live SonarQube /api/issues/search call using the configured
-    SONAR_TOKEN and SONAR_HOST_URL, then store results in Redis (fast reads)
-    and GCS (durable across Redis restarts).
+    SONAR_TOKEN and SONAR_HOST_URL, then store results in GCS
+    (state/issues.json for fast reads + reports blob as durable source).
     """
     import requests as _requests
     from config import settings as s
 
-    sonar_token    = _redis_cfg_get("sonar_token")    or s.sonar_token
-    sonar_host_url = _redis_cfg_get("sonar_host_url") or s.sonar_host_url
+    overrides      = _cfg_overrides()
+    sonar_token    = _cfg_get("sonar_token", overrides)    or s.sonar_token
+    sonar_host_url = _cfg_get("sonar_host_url", overrides) or s.sonar_host_url
 
     if not sonar_token:
         raise HTTPException(400, "SONAR_TOKEN is not configured. Add it in Settings.")
@@ -485,7 +493,7 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
                 url,
                 auth=(sonar_token, ""),
                 params=params,
-		verify=False,
+                verify=False,
                 timeout=30,
             )
             if resp.status_code == 401:
@@ -515,7 +523,7 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
         logger.error(f"[SonarFetch] Error: {exc}")
         raise HTTPException(500, f"Failed to reach SonarQube: {exc}") from exc
 
-    # ── Store in Redis (fast) and GCS (durable across Redis restarts) ─────
+    # ── Store parsed issues + durable report in GCS ────────────────────────
     _set_issues(all_issues)
     try:
         report_data = {
@@ -551,7 +559,7 @@ def get_structured_report() -> dict:
     Return a structured summary of the currently loaded issues,
     grouped by severity and rule, ready to download as a JSON report.
     """
-    issues = _get_issues()   # reads from Redis
+    issues = _get_issues()   # reads from GCS
 
     if not issues:
         return {
@@ -603,7 +611,7 @@ def start_run(req: PipelineRunRequest) -> dict:
 
     run_id = str(uuid.uuid4())
 
-    # Initialise run document in Redis
+    # Initialise run document in GCS
     _set_run(run_id, {
         "id":         run_id,
         "status":     "queued",
@@ -614,16 +622,23 @@ def start_run(req: PipelineRunRequest) -> dict:
         "created_at": time.time(),
     })
 
-    # Track insertion order (newest first), capped at 200
-    _redis().lpush(_KEY_RUN_IDS, run_id)
-    _redis().ltrim(_KEY_RUN_IDS, 0, 199)
-
-    # Enqueue job — worker pod picks it up via BRPOP sonar:jobs
-    _redis().lpush(_KEY_JOBS, json.dumps({
+    # Enqueue job — worker pod polls jobs/pending/ and claims it
+    _gcs_write_json(_job_blob(run_id), {
         "run_id":      run_id,
         "req":         req.model_dump(),
         "report_blob": _GCS_REPORT,
-    }))
+    })
+
+    # Prune oldest run documents beyond the cap (best-effort)
+    try:
+        blobs = sorted(
+            _gcs().bucket(_bucket()).list_blobs(prefix=_GCS_RUNS_PFX),
+            key=lambda b: b.time_created or 0,
+        )
+        for b in blobs[:-_MAX_RUNS_KEPT] if len(blobs) > _MAX_RUNS_KEPT else []:
+            b.delete()
+    except Exception as exc:
+        logger.warning(f"[API] Run pruning failed: {exc}")
 
     logger.info(f"[API] Enqueued pipeline job run_id={run_id} sev={req.severities}")
     return {"run_id": run_id, "status": "queued"}
@@ -634,19 +649,28 @@ def get_run_status(run_id: str) -> dict:
     run = _get_run(run_id)
     if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
-    # Worker writes step updates directly to Redis — no draining needed here
+    # Worker writes step updates directly to GCS — no draining needed here
     return run
 
 
 @app.post("/api/pipeline/cancel/{run_id}")
 def cancel_run(run_id: str) -> dict:
     """
-    Mark the run as cancelled in Redis. The worker pod checks the run status
+    Mark the run as cancelled in GCS. The worker pod checks the run status
     between pipeline steps and exits cleanly when it sees 'cancelled'.
+    If the job is still queued (worker hasn't claimed it yet), remove the
+    pending job blob so it never starts.
     """
     run = _get_run(run_id)
     if run is None:
         raise HTTPException(404, f"Run {run_id} not found")
+
+    # Best-effort: remove still-pending job so the worker never picks it up
+    try:
+        if _gcs_exists(_job_blob(run_id)):
+            _gcs_delete(_job_blob(run_id))
+    except Exception:
+        pass  # worker may have just claimed it — status check below covers that
 
     steps = run.get("steps", [])
     for s in steps:
@@ -661,7 +685,7 @@ def cancel_run(run_id: str) -> dict:
         "error":  "Cancelled by user",
         "steps":  steps,
     })
-    logger.info(f"[API] Marked run {run_id} as cancelled in Redis")
+    logger.info(f"[API] Marked run {run_id} as cancelled in GCS")
     return {"message": f"Run {run_id} cancelled", "run_id": run_id}
 
 
@@ -669,17 +693,27 @@ def cancel_run(run_id: str) -> dict:
 def list_runs() -> dict:
     """
     Return full run data for every run so the Angular UI can rehydrate its
-    pipeline history after a page reload. Reads from Redis — newest first.
+    pipeline history after a page reload. Lists runs/ blobs — newest first.
     """
-    run_ids  = _redis().lrange(_KEY_RUN_IDS, 0, 99)
-    runs_out = [run for rid in run_ids if (run := _get_run(rid))]
+    blobs = sorted(
+        _gcs().bucket(_bucket()).list_blobs(prefix=_GCS_RUNS_PFX),
+        key=lambda b: b.time_created or 0,
+        reverse=True,
+    )[:100]
+
+    runs_out: list[dict] = []
+    for b in blobs:
+        try:
+            runs_out.append(json.loads(b.download_as_bytes().decode("utf-8")))
+        except Exception as exc:
+            logger.warning(f"[API] Could not read run blob {b.name}: {exc}")
     return {"runs": runs_out}
 
 
 @app.delete("/api/pipeline/runs/{run_id}")
 def delete_run(run_id: str) -> dict:
     """
-    Remove a finished run from Redis so it won't reappear after the UI reloads.
+    Remove a finished run from GCS so it won't reappear after the UI reloads.
     Returns 409 if the run is still active.
     """
     run = _get_run(run_id)
@@ -688,9 +722,13 @@ def delete_run(run_id: str) -> dict:
     if run.get("status") == "running":
         raise HTTPException(409, f"Run {run_id} is still active — cancel it first")
 
-    _redis().delete(_run_key(run_id))
-    _redis().lrem(_KEY_RUN_IDS, 0, run_id)
-    logger.info(f"[API] Deleted run {run_id} from Redis")
+    _gcs_delete(_run_blob(run_id))
+    try:
+        if _gcs_exists(_job_blob(run_id)):
+            _gcs_delete(_job_blob(run_id))
+    except Exception:
+        pass
+    logger.info(f"[API] Deleted run {run_id} from GCS")
     return {"message": f"Run {run_id} deleted"}
 
 
@@ -779,9 +817,11 @@ def get_config() -> dict:
     def mask(v: str) -> str:
         return "***" if v else ""
 
-    # Redis config hash overrides env-var defaults (non-token fields only)
+    # GCS config blob overrides env-var defaults (non-token fields only)
+    overrides = _cfg_overrides()
+
     def _ov(key: str, default: Any) -> Any:
-        v = _redis_cfg_get(key)
+        v = _cfg_get(key, overrides)
         return v if v != "" else default
 
     return {
@@ -809,24 +849,25 @@ def get_config() -> dict:
 @app.post("/api/reload")
 def reload_config() -> dict:
     """
-    No-op in stateless mode: every request reads live config from Redis.
+    No-op in stateless mode: every request reads live config from GCS.
     Kept for UI compatibility — the Angular settings page calls this after saving.
     """
     from config import settings as s
+    overrides = _cfg_overrides()
     return {
-        "message":         "Stateless mode — config is read live from Redis on every request.",
-        "sonar_host_url":  _redis_cfg_get("sonar_host_url") or s.sonar_host_url,
-        "sonar_token_set": bool(s.sonar_token or _redis_cfg_get("sonar_token")),
+        "message":         "Stateless mode — config is read live from GCS on every request.",
+        "sonar_host_url":  _cfg_get("sonar_host_url", overrides) or s.sonar_host_url,
+        "sonar_token_set": bool(s.sonar_token or _cfg_get("sonar_token", overrides)),
     }
 
 
 @app.post("/api/config")
 def update_config(req: ConfigUpdateRequest) -> dict:
     """
-    Persist settings changes to Redis Hash (sonar:config) so every pod sees
-    the change immediately without a restart.
+    Persist settings changes to the GCS config blob (state/config.json) so
+    every pod sees the change on its next read without a restart.
 
-    Token fields (github_token, sonar_token) are NOT stored in Redis —
+    Token fields (github_token, sonar_token) are NOT stored in GCS —
     set them as K8s Secret env vars for persistence across pod restarts.
     They can still be updated here; the change applies to this pod's
     os.environ for the current session.
@@ -864,7 +905,7 @@ def update_config(req: ConfigUpdateRequest) -> dict:
     }
 
     updated: list[str] = []
-    redis_updates: dict[str, str] = {}
+    gcs_updates: dict[str, str] = {}
 
     for field, env_key in env_key_map.items():
         if field not in mapping:
@@ -880,21 +921,23 @@ def update_config(req: ConfigUpdateRequest) -> dict:
             setattr(s, attr, value)
 
         if field in token_fields:
-            # Tokens: local env only — never written to Redis
+            # Tokens: local env only — never written to GCS
             pass
         else:
-            # Non-secret: persist to Redis so all pods see the change
-            redis_updates[attr] = val_str
+            # Non-secret: persist to GCS so all pods see the change
+            gcs_updates[attr] = val_str
 
         updated.append(field)
 
-    if redis_updates:
-        _redis().hset(_KEY_CONFIG, mapping=redis_updates)
+    if gcs_updates:
+        overrides = _cfg_overrides()
+        overrides.update(gcs_updates)
+        _gcs_write_json(_GCS_CONFIG, overrides)
 
-    logger.info(f"[Config] Redis-persisted: {list(redis_updates)}, "
+    logger.info(f"[Config] GCS-persisted: {list(gcs_updates)}, "
                 f"env-only (tokens): {[f for f in updated if f in token_fields]}")
     return {
-        "message":        "Config updated — non-token fields persisted to Redis (all pods updated instantly)",
+        "message":        "Config updated — non-token fields persisted to GCS (all pods updated)",
         "updated_fields": updated,
     }
 
@@ -903,16 +946,8 @@ def update_config(req: ConfigUpdateRequest) -> dict:
 
 @app.on_event("startup")
 def _startup() -> None:
-    logger.info("[Startup] SonarAI API — GCS + Memorystore Redis stateless mode")
-    logger.info(f"[Startup] REDIS_URL  : {os.environ.get('REDIS_URL', 'redis://localhost:6379')}")
+    logger.info("[Startup] SonarAI API — GCS-only stateless mode")
     logger.info(f"[Startup] GCS_BUCKET : {os.environ.get('GCS_BUCKET', '(not set)')}")
-
-    # Warm Redis connection
-    try:
-        _redis().ping()
-        logger.info("[Startup] Redis connection OK")
-    except Exception as exc:
-        logger.error(f"[Startup] Redis connection FAILED: {exc}")
 
     # Warm GCS connection
     try:
@@ -921,18 +956,18 @@ def _startup() -> None:
     except Exception as exc:
         logger.warning(f"[Startup] GCS init warning: {exc}")
 
-    # Re-hydrate issues cache from GCS if Redis was restarted cold
-    if not _redis().exists(_KEY_ISSUES):
-        try:
+    # Re-hydrate parsed issues blob from the raw report if it's missing
+    try:
+        if not _gcs_exists(_GCS_ISSUES) and _gcs_exists(_GCS_REPORT):
             raw    = json.loads(_gcs_download_text(_GCS_REPORT))
             issues = raw.get("issues", raw) if isinstance(raw, dict) else raw
             _set_issues(issues)
-            logger.info(f"[Startup] Re-hydrated {len(issues)} issues from GCS into Redis")
-        except Exception as exc:
-            logger.info(f"[Startup] No GCS report to re-hydrate ({exc})")
+            logger.info(f"[Startup] Re-hydrated {len(issues)} issues from report into state/issues.json")
+    except Exception as exc:
+        logger.info(f"[Startup] No GCS report to re-hydrate ({exc})")
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    """Nothing to clean up — all state lives in Redis and GCS."""
+    """Nothing to clean up — all state lives in GCS."""
     logger.info("[Shutdown] SonarAI API stopping — no child processes to terminate")
