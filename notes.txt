@@ -27,31 +27,3 @@ Your config in the Dockerfile sets this up like:
 [program:sonar-api]   → starts uvicorn on port 8000
 [program:fortify-api] → starts uvicorn on port 8001
 Without supervisord, you'd need to either run three separate containers (the typical Docker approach with docker-compose) or write a custom shell script to manage the processes yourself. Since your setup bundles everything into a single container, supervisord is the clean way to handle it.
-
-
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: fortifyai-config
-  namespace: fortifyai
-data:
-  # ── Redis (Memorystore) ────────────────────────────────────────
-  REDIS_URL: "redis://10.x.x.x:6379/0"
-  JOB_TTL_SECONDS: "86400"
-
-  # ── GCS (escalation files) ────────────────────────────────────
-  GCS_BUCKET: "your-project-fortifyai-data"
-  GCS_ESCALATION_PREFIX: "escalations/"   # optional, this is the default
-
-  # ── Pipeline ──────────────────────────────────────────────────
-  MAX_PIPELINE_WORKERS: "8"
-  FORTIFY_BASE_URL: "https://api.ams.fortify.com"
-  FORTIFY_SCOPE: "api-tenant"
-  GCP_LOCATION: "us-central1"
-  VERTEX_MODEL: "gemini-2.5-flash"
-  MAX_TOKENS: "8192"
-  MAX_RETRIES: "3"
-  MAX_UPGRADES: "0"
-  JIRA_ID_PREFIX: "FORTIFY"
-  CORS_ORIGINS: "https://your-ui.example.com"
-  ADR_OUTPUT_DIR: "/tmp/fortifyai"
