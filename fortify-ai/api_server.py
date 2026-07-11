@@ -75,7 +75,7 @@ from state import AgentState
 
 
 # ── Pipeline job store ────────────────────────────────────────────────────────
-# Redis-backed when REDIS_URL is set; falls back to in-process dict otherwise.
+# GCS-backed when GCS_BUCKET is set; falls back to in-process dict otherwise.
 # Any uvicorn worker or GKE pod can look up any pipeline_id — eliminates the
 # 404-on-poll race that occurs with multi-worker / multi-replica deployments.
 _store = create_job_store()
