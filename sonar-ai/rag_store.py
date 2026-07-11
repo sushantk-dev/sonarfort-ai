@@ -18,9 +18,22 @@ Deduplication (new in Iteration 2+):
     to ensure no two returned fixes are too similar to each other
     (pairwise similarity must stay below MMR_DIVERSITY_THRESHOLD).
 
-Graceful degradation: if ChromaDB or Vertex embeddings are unavailable,
-all public functions return empty results and log a warning — the pipeline
-continues without RAG context.
+GCS persistence (new):
+  ChromaDB itself only works against a local filesystem (SQLite + HNSW binary
+  segments), so GCS is used as a durable backing store via a sync layer:
+    • On first collection access, if settings.chroma_gcs_bucket is set and the
+      local persist dir has no ChromaDB state yet, all blobs under
+      gs://<bucket>/<prefix>/ are downloaded into the persist dir.
+    • After every successful store_fix() upsert, changed local files are
+      uploaded back to the bucket (incremental — unchanged index segments are
+      skipped based on size+mtime).
+  Concurrency: this is last-writer-wins. Run a single writer instance (or
+  accept that concurrent writers may overwrite each other's uploads).
+  Leave chroma_gcs_bucket empty to disable and use purely local persistence.
+
+Graceful degradation: if ChromaDB, Vertex embeddings, or GCS are unavailable,
+all public functions degrade gracefully (empty results / local-only mode) and
+log a warning — the pipeline continues without RAG context.
 """
 
 from __future__ import annotations
@@ -49,6 +62,127 @@ MMR_DIVERSITY_THRESHOLD = 0.80
 
 # Fetch this many raw candidates from ChromaDB before MMR; must be >= top_k.
 MMR_FETCH_MULTIPLIER = 3
+
+
+# ── GCS sync layer ─────────────────────────────────────────────────────────────
+
+_gcs_bucket = None            # cached google.cloud.storage.Bucket, or False if disabled/failed
+_gcs_synced_down = False      # guard: download from GCS at most once per process
+_uploaded_state: dict[str, tuple[int, float]] = {}  # rel_path -> (size, mtime) at last upload
+
+
+def _get_gcs_bucket():
+    """
+    Return the configured GCS bucket handle, cached.
+
+    Returns None if chroma_gcs_bucket is unset, google-cloud-storage is missing,
+    or the bucket is unreachable (logged once, then cached as disabled).
+    """
+    global _gcs_bucket
+    if _gcs_bucket is not None:
+        return _gcs_bucket or None  # False → None
+    try:
+        from config import settings
+        bucket_name = getattr(settings, "chroma_gcs_bucket", "") or ""
+        if not bucket_name:
+            _gcs_bucket = False
+            return None
+        from google.cloud import storage
+        client = storage.Client(project=settings.gcp_project)
+        _gcs_bucket = client.bucket(bucket_name)
+        logger.info(f"[RAG] GCS persistence enabled: gs://{bucket_name}")
+        return _gcs_bucket
+    except Exception as exc:
+        logger.warning(f"[RAG] GCS unavailable, falling back to local-only ChromaDB: {exc}")
+        _gcs_bucket = False
+        return None
+
+
+def _gcs_prefix() -> str:
+    """Normalised object prefix (no leading slash, single trailing slash)."""
+    from config import settings
+    prefix = (getattr(settings, "chroma_gcs_prefix", "chroma") or "chroma").strip("/")
+    return f"{prefix}/"
+
+
+def _sync_from_gcs(persist_dir: str) -> None:
+    """
+    Download the ChromaDB persist dir from GCS into `persist_dir`.
+
+    Runs at most once per process, and only when the local dir contains no
+    ChromaDB state yet (no chroma.sqlite3) — an existing local store is never
+    clobbered by a stale remote copy.
+    """
+    global _gcs_synced_down
+    if _gcs_synced_down:
+        return
+    _gcs_synced_down = True
+
+    bucket = _get_gcs_bucket()
+    if bucket is None:
+        return
+
+    local_root = Path(persist_dir)
+    if (local_root / "chroma.sqlite3").exists():
+        logger.info("[RAG] Local ChromaDB state present — skipping GCS download")
+        return
+
+    prefix = _gcs_prefix()
+    try:
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        if not blobs:
+            logger.info(f"[RAG] No existing ChromaDB snapshot at gs://{bucket.name}/{prefix} — starting fresh")
+            return
+        count = 0
+        for blob in blobs:
+            rel = blob.name[len(prefix):]
+            if not rel or rel.endswith("/"):
+                continue
+            dest = local_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(str(dest))
+            stat = dest.stat()
+            _uploaded_state[rel] = (stat.st_size, stat.st_mtime)
+            count += 1
+        logger.info(f"[RAG] Restored ChromaDB from gs://{bucket.name}/{prefix} ({count} files)")
+    except Exception as exc:
+        logger.warning(f"[RAG] GCS download failed (continuing with local store): {exc}")
+
+
+def _sync_to_gcs() -> None:
+    """
+    Upload the local ChromaDB persist dir to GCS (incremental).
+
+    Files whose size+mtime are unchanged since the last upload are skipped, so
+    steady-state cost is roughly one chroma.sqlite3 upload plus any new/updated
+    HNSW segment files per stored fix. Failures are logged and swallowed —
+    the local store remains the source of truth for this process.
+    """
+    bucket = _get_gcs_bucket()
+    if bucket is None:
+        return
+    try:
+        from config import settings
+        local_root = Path(settings.chroma_persist_dir)
+        if not local_root.exists():
+            return
+        prefix = _gcs_prefix()
+        uploaded = 0
+        for path in local_root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(local_root)).replace("\\", "/")
+            stat = path.stat()
+            sig = (stat.st_size, stat.st_mtime)
+            if _uploaded_state.get(rel) == sig:
+                continue
+            bucket.blob(prefix + rel).upload_from_filename(str(path))
+            _uploaded_state[rel] = sig
+            uploaded += 1
+        if uploaded:
+            logger.info(f"[RAG] Synced {uploaded} file(s) to gs://{bucket.name}/{prefix}")
+    except Exception as exc:
+        logger.warning(f"[RAG] GCS upload failed (local store unaffected): {exc}")
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -83,6 +217,7 @@ def _get_collection():
         from config import settings
         persist_dir = settings.chroma_persist_dir
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
+        _sync_from_gcs(persist_dir)  # restore prior state from GCS, if configured
         _chroma_client = chromadb.PersistentClient(path=persist_dir)
         _collection = _chroma_client.get_or_create_collection(
             name=COLLECTION_NAME,
@@ -347,6 +482,7 @@ def store_fix(
             f"[RAG] Stored fix for rule={rule_key} file={file_name} "
             f"(id={doc_id}, total_docs={collection.count()})"
         )
+        _sync_to_gcs()  # persist updated store to GCS, if configured
         return True
     except Exception as exc:
         logger.warning(f"[RAG] Failed to store fix: {exc}")
@@ -365,6 +501,7 @@ def collection_stats() -> dict[str, Any]:
             "name":      COLLECTION_NAME,
             "dedup_threshold":      DEDUP_THRESHOLD,
             "mmr_diversity_threshold": MMR_DIVERSITY_THRESHOLD,
+            "gcs_enabled": _get_gcs_bucket() is not None,
         }
     except Exception:
         return {"available": False, "count": 0}

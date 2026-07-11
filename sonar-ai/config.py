@@ -92,6 +92,16 @@ class Settings(BaseSettings):
         description="Directory for ChromaDB persistent vector store",
     )
     rag_top_k: int = Field(default=3, description="Number of similar fixes to retrieve")
+    chroma_gcs_bucket: str = Field(
+        default="",
+        description="GCS bucket for durable ChromaDB persistence (empty = local-only). "
+                    "The persist dir is downloaded from GCS on startup and re-uploaded "
+                    "after every stored fix.",
+    )
+    chroma_gcs_prefix: str = Field(
+        default="chroma",
+        description="Object prefix inside chroma_gcs_bucket for ChromaDB files",
+    )
 
     # ── LangSmith tracing (Iteration 2) ──────────────────────────────────────
     langsmith_api_key: str = Field(default="", description="LangSmith API key for tracing")
