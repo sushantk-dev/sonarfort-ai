@@ -277,7 +277,9 @@ def fetch_token(
 
 def write_token_to_env(token: str, env_path: str | Path | None = None) -> None:
     """
-    Set FORTIFY_API_TOKEN in the current process's environment.
+    Set FORTIFY_API_TOKEN in the current process's environment AND persist
+    it to the shared GCS runtime config (when GCS_BUCKET is set) so every
+    pod picks it up within CONFIG_SYNC_SECONDS and it survives restarts.
 
     This no longer writes to a .env file on disk -- config.py reads
     FortifyAIConfig fields straight from the process environment, so a
@@ -285,19 +287,24 @@ def write_token_to_env(token: str, env_path: str | Path | None = None) -> None:
 
     ``env_path`` is accepted (and ignored) purely for backward
     compatibility with older callers that still pass it; it has no effect.
-
-    Note: this only affects the *current process's* environment. It does
-    NOT persist across a server restart -- set FORTIFY_API_TOKEN at the
-    container / orchestrator level if you need it to survive a restart.
     """
     if env_path is not None:
         logger.debug(
             "[FortifyAuth] write_token_to_env: env_path is ignored -- the "
             "token is set directly in the process environment instead."
         )
-    os.environ["FORTIFY_API_TOKEN"] = token
+    try:
+        # persist_overrides sets os.environ locally AND merge-writes the
+        # shared gs://{GCS_BUCKET}/fortifyai/config/runtime.json blob.
+        # Degrades to env-only automatically when GCS_BUCKET is unset.
+        from runtime_config import persist_overrides
+        persisted = persist_overrides({"FORTIFY_API_TOKEN": token})
+    except ImportError:
+        os.environ["FORTIFY_API_TOKEN"] = token
+        persisted = False
     logger.info(
-        f"[FortifyAuth] OK FORTIFY_API_TOKEN set in process environment "
+        f"[FortifyAuth] OK FORTIFY_API_TOKEN set in process environment"
+        f"{' and persisted to shared GCS config' if persisted else ''} "
         f"(preview: {token[:12]}...)"
     )
 

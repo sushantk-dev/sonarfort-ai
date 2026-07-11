@@ -311,14 +311,19 @@ def write_escalation_report(
     gcp_location: str = "us-central1",
 ) -> Optional[str]:
     """
-    Write the escalation report to GCS (preferred) or local disk (fallback).
+    Write the escalation report.
 
-    GCS path:   gs://{GCS_BUCKET}/{GCS_ESCALATION_PREFIX}escalation_{artifact_id}_{ts}.txt
-    Local path: {output_dir}/escalation_{artifact_id}_{ts}.txt
+    GCS mode (GCS_BUCKET set — required in production / multi-pod):
+        gs://{GCS_BUCKET}/{GCS_ESCALATION_PREFIX}escalation_{artifact_id}_{ts}.txt
+        On upload failure the report is NOT written locally — a local file
+        would be invisible to other pods and to the GCS-backed /escalations
+        endpoints, silently reintroducing per-pod state. The failure is
+        surfaced (returns None → counted as failed in the run summary).
+
+    Local mode (GCS_BUCKET unset — single-pod development only):
+        {output_dir}/escalation_{artifact_id}_{ts}.txt
 
     Returns the GCS URI or local file path on success, None on failure.
-    Set GCS_BUCKET env var to enable GCS — required for multi-pod GKE deployments
-    where local disk is not shared across pods.
     """
     artifact_id = group["parsed"]["artifact_id"]
     ts          = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -327,10 +332,17 @@ def write_escalation_report(
         group, escalation_reason, adr_results, gcp_project, gcp_location
     )
 
-    # ── GCS path (primary) ────────────────────────────────────────────────────
-    bucket, bucket_name = _get_gcs_bucket()
-    if bucket is not None:
-        blob_name = _GCS_ESC_PREFIX + filename
+    # ── GCS mode (sole path when a bucket is configured) ─────────────────────
+    if _os.environ.get("GCS_BUCKET", "").strip():
+        bucket, bucket_name = _get_gcs_bucket()
+        if bucket is None:
+            logger.error(
+                "[Report] GCS_BUCKET is set but the bucket is unreachable — "
+                "escalation report NOT written (no local fallback in GCS mode)"
+            )
+            return None
+        prefix    = _os.environ.get("GCS_ESCALATION_PREFIX", "escalations/").rstrip("/") + "/"
+        blob_name = prefix + filename
         try:
             blob = bucket.blob(blob_name)
             blob.upload_from_string(text.encode("utf-8"), content_type="text/plain")
@@ -339,10 +351,12 @@ def write_escalation_report(
             return uri
         except Exception as exc:
             logger.error(
-                f"[Report] GCS upload failed ({exc}) — falling back to local filesystem"
+                f"[Report] GCS upload failed ({exc}) — escalation report NOT "
+                f"written (no local fallback in GCS mode)"
             )
+            return None
 
-    # ── Local filesystem fallback (single-pod / local dev) ───────────────────
+    # ── Local mode (single-pod / local dev only) ─────────────────────────────
     out_dir = Path(output_dir)
     try:
         out_dir.mkdir(parents=True, exist_ok=True)

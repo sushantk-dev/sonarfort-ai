@@ -71,7 +71,13 @@ from pydantic import BaseModel, Field
 # ── Internal imports ──────────────────────────────────────────────────────────
 from config import FortifyAIConfig, load_config
 from job_store import create_job_store, ALL_STAGE_NAMES
+from runtime_config import apply_overrides, persist_overrides, is_persisted
 from state import AgentState
+
+# Pull any GCS-persisted runtime config overrides (Settings-page saves,
+# refreshed Fortify tokens) into this pod's environment before anything
+# else reads load_config().
+apply_overrides(force=True)
 
 
 # ── Pipeline job store ────────────────────────────────────────────────────────
@@ -122,6 +128,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _sync_runtime_config(request, call_next):
+    """
+    Keep this pod's environment in sync with the shared GCS runtime config
+    (Settings-page saves and token refreshes made on ANY pod). Throttled
+    internally to one GCS read per CONFIG_SYNC_SECONDS (default 15 s), so
+    the per-request cost is a dict lookup.
+    """
+    apply_overrides()
+    return await call_next(request)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -740,18 +758,20 @@ def get_config():
 @app.post("/api/config", tags=["Utility"])
 def save_config(req: ConfigUpdateRequest):
     """
-    Apply Settings-page fields to the running process's environment variables.
+    Apply Settings-page fields as runtime config overrides.
 
-    No file is read or written — each field is set via `os.environ[...]`,
-    so the next `load_config()` call (which reads BaseSettings straight from
-    the process environment) immediately picks up the new value. Only
-    non-None fields are applied; fields omitted from the request are left
-    untouched. Tokens are only applied when a non-empty string is supplied
-    (empty string or None = leave unchanged).
+    Each field is written to the shared GCS runtime config blob
+    (gs://{GCS_BUCKET}/fortifyai/config/runtime.json) AND to this process's
+    environment. Every other pod picks the change up within
+    CONFIG_SYNC_SECONDS (default 15 s) via the sync middleware, and the
+    values survive pod restarts.
 
-    Note: these changes live only in this process's environment. They do
-    NOT persist across a server restart — set them at the container /
-    orchestrator level for that.
+    When GCS_BUCKET is unset (local dev), behaviour degrades to the
+    original process-environment-only semantics.
+
+    Only non-None fields are applied; fields omitted from the request are
+    left untouched. Tokens are only applied when a non-empty string is
+    supplied (empty string or None = leave unchanged).
     """
     import os as _os
 
@@ -790,13 +810,16 @@ def save_config(req: ConfigUpdateRequest):
     if not updates:
         return {"message": "No fields to update"}
 
-    for key, val in updates.items():
-        _os.environ[key] = val
+    persisted = persist_overrides(updates)
 
     return {
-        "message": f"Applied {len(updates)} field(s) to the process environment",
+        "message": (
+            f"Applied {len(updates)} field(s) "
+            + ("and persisted to shared GCS config" if persisted
+               else "to the process environment only (GCS not configured)")
+        ),
         "updated": list(updates.keys()),
-        "persisted": False,
+        "persisted": persisted,
     }
 
 
@@ -872,6 +895,9 @@ def auth_token(req: Optional[AuthTokenRequest] = None):
             scope=_req.scope,
         )
         if _req.write_to_env and token_data.get("access_token"):
+            # write_token_to_env sets the local process env AND persists the
+            # token to the shared GCS runtime config (see fortify_auth.py),
+            # so every pod sees the refreshed token within CONFIG_SYNC_SECONDS.
             write_token_to_env(token_data["access_token"])
         return ok({
             "access_token":   token_data.get("access_token"),
@@ -1808,11 +1834,90 @@ if __name__ == "__main__":
 # These endpoints serve them so the UI can list, view, and delete them.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Escalation storage helpers (GCS-first, local fallback for dev) ───────────
+
+def _esc_backend():
+    """
+    Return ("gcs", bucket, bucket_name, prefix, client) when GCS_BUCKET is
+    set and reachable, else ("local",). Env vars are read fresh on every
+    call so runtime-config overrides apply immediately.
+    """
+    bucket_name = os.environ.get("GCS_BUCKET", "").strip()
+    if bucket_name:
+        try:
+            from google.cloud import storage
+            client = storage.Client()
+            prefix = os.environ.get("GCS_ESCALATION_PREFIX", "escalations/").rstrip("/") + "/"
+            return ("gcs", client.bucket(bucket_name), bucket_name, prefix, client)
+        except Exception as exc:
+            print(f"[Escalations] GCS unavailable ({exc}) — using local dir")
+    return ("local",)
+
+
+def _parse_escalation_text(content: str) -> dict:
+    """Parse key fields from the flat escalation report text format."""
+    artifact_id = ""
+    cves: list[str] = []
+    reason = ""
+    tried: list[str] = []
+    severity = "HIGH"
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("Artifact:"):
+            artifact_id = line.split(":", 1)[-1].strip()
+        elif line.startswith("CVEs:"):
+            cves = [v.strip() for v in line.split(":", 1)[-1].split(",") if v.strip()]
+        elif line.startswith("Reason:"):
+            reason = line.split(":", 1)[-1].strip()
+        elif line.startswith("Tried:"):
+            tried = [v.strip() for v in line.split(":", 1)[-1].split(",") if v.strip()]
+        elif line.startswith("Severity:"):
+            severity = line.split(":", 1)[-1].strip()
+    return {"artifact_id": artifact_id, "cves": cves, "reason": reason,
+            "tried": tried, "severity": severity}
+
+
 @app.get("/escalations", tags=["Escalations"])
 def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) -> dict:
-    """List all Fortify escalation .txt files.
-    Reads output directory from the ADR_OUTPUT_DIR environment variable; override via ?output_dir=.
+    """List all Fortify escalation reports.
+
+    GCS mode (GCS_BUCKET set): lists text blobs under GCS_ESCALATION_PREFIX
+    in the shared bucket — every pod sees the same escalations regardless
+    of which pod wrote them.
+    Local mode (no GCS_BUCKET): lists escalation_*.txt in ADR_OUTPUT_DIR
+    (override via ?output_dir=), for single-pod development only.
     """
+    backend = _esc_backend()
+
+    if backend[0] == "gcs":
+        _, bucket, bucket_name, prefix, client = backend
+        items = []
+        for blob in client.list_blobs(bucket_name, prefix=prefix):
+            if not blob.name.endswith(".txt"):
+                continue
+            filename = blob.name[len(prefix):]
+            if "/" in filename or not filename.startswith("escalation_"):
+                continue
+            try:
+                content = blob.download_as_bytes().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            parsed = _parse_escalation_text(content)
+            items.append({
+                "filename":    filename,
+                "artifact_id": parsed["artifact_id"] or filename.rsplit(".", 1)[0],
+                "cves":        parsed["cves"],
+                "reason":      parsed["reason"],
+                "tried":       parsed["tried"],
+                "severity":    parsed["severity"],
+                "size_bytes":  blob.size or len(content),
+                "modified_at": blob.updated.timestamp() if blob.updated else 0.0,
+                "uri":         f"gs://{bucket_name}/{blob.name}",
+            })
+        items.sort(key=lambda i: i["modified_at"], reverse=True)
+        return {"escalations": items, "total": len(items)}
+
+    # ── Local mode (single-pod dev) ───────────────────────────────────────
     from pathlib import Path
     resolved_dir = output_dir or load_config().adr_output_dir
     esc_dir = Path(resolved_dir)
@@ -1827,34 +1932,14 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
     ):
         stat = txt_file.stat()
         content = txt_file.read_text(encoding="utf-8", errors="replace")
-
-        # Parse key fields from the flat text report format
-        artifact_id = ""
-        cves: list[str] = []
-        reason = ""
-        tried: list[str] = []
-        severity = "HIGH"
-
-        for line in content.splitlines():
-            line = line.strip()
-            if line.startswith("Artifact:"):
-                artifact_id = line.split(":", 1)[-1].strip()
-            elif line.startswith("CVEs:"):
-                cves = [v.strip() for v in line.split(":", 1)[-1].split(",") if v.strip()]
-            elif line.startswith("Reason:"):
-                reason = line.split(":", 1)[-1].strip()
-            elif line.startswith("Tried:"):
-                tried = [v.strip() for v in line.split(":", 1)[-1].split(",") if v.strip()]
-            elif line.startswith("Severity:"):
-                severity = line.split(":", 1)[-1].strip()
-
+        parsed = _parse_escalation_text(content)
         items.append({
             "filename":    txt_file.name,
-            "artifact_id": artifact_id or txt_file.stem,
-            "cves":        cves,
-            "reason":      reason,
-            "tried":       tried,
-            "severity":    severity,
+            "artifact_id": parsed["artifact_id"] or txt_file.stem,
+            "cves":        parsed["cves"],
+            "reason":      parsed["reason"],
+            "tried":       parsed["tried"],
+            "severity":    parsed["severity"],
             "size_bytes":  stat.st_size,
             "modified_at": stat.st_mtime,
         })
@@ -1867,13 +1952,31 @@ def get_fortify_escalation(
     filename: str,
     output_dir: Optional[str] = Query(default=None)
 ) -> dict:
-    """Return the full text content of one Fortify escalation file.
-    Reads output directory from the ADR_OUTPUT_DIR environment variable; override via ?output_dir=.
-    """
-    from pathlib import Path
+    """Return the full text content of one Fortify escalation report
+    (GCS blob when GCS_BUCKET is set, local file otherwise)."""
     if "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
+    backend = _esc_backend()
+
+    if backend[0] == "gcs":
+        _, bucket, bucket_name, prefix, _client = backend
+        from google.api_core import exceptions as gexc
+        blob = bucket.blob(prefix + filename)
+        try:
+            content = blob.download_as_bytes().decode("utf-8", errors="replace")
+        except gexc.NotFound:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Escalation {filename!r} not found in gs://{bucket_name}/{prefix}",
+            )
+        return {
+            "filename":    filename,
+            "content":     content,
+            "modified_at": blob.updated.timestamp() if blob.updated else 0.0,
+        }
+
+    from pathlib import Path
     resolved_dir = output_dir or load_config().adr_output_dir
     esc_path = Path(resolved_dir) / filename
     if not esc_path.exists():
@@ -1892,13 +1995,27 @@ def delete_fortify_escalation(
     filename: str,
     output_dir: Optional[str] = Query(default=None)
 ) -> dict:
-    """Delete a Fortify escalation file.
-    Reads output directory from the ADR_OUTPUT_DIR environment variable; override via ?output_dir=.
-    """
-    from pathlib import Path
+    """Delete a Fortify escalation report
+    (GCS blob when GCS_BUCKET is set, local file otherwise)."""
     if "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
+    backend = _esc_backend()
+
+    if backend[0] == "gcs":
+        _, bucket, bucket_name, prefix, _client = backend
+        from google.api_core import exceptions as gexc
+        blob = bucket.blob(prefix + filename)
+        try:
+            blob.delete()
+        except gexc.NotFound:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Escalation {filename!r} not found in gs://{bucket_name}/{prefix}",
+            )
+        return {"message": f"Deleted {filename}", "ok": True}
+
+    from pathlib import Path
     resolved_dir = output_dir or load_config().adr_output_dir
     esc_path = Path(resolved_dir) / filename
     if not esc_path.exists():
