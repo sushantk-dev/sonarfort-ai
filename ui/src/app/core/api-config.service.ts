@@ -26,13 +26,19 @@ const DEV_SONAR_HOST    = 'http://localhost:8000';
 const DEV_FORTIFY_HOST  = 'http://localhost:8001';
 
 const PROD_FALLBACK_HOST = 'https://sonarfort-ai.use1.npe.usis.gcp.efx';
-const FORTIFY_PATH  = (_w.__FORTIFYAI_FORTIFY_PATH__ ?? '/fortify') as string;
 
 // Only fall back to the dev split when nothing has been explicitly
 // configured — an injected host or a saved Settings value always wins.
 const _hasInjectedHost = !!_w.__FORTIFYAI_API_HOST__;
+const _isDevDefault = isDevMode() && !_hasInjectedHost;
 const DEFAULT_HOST = _w.__FORTIFYAI_API_HOST__
-  ?? (isDevMode() && !_hasInjectedHost ? DEV_SONAR_HOST : PROD_FALLBACK_HOST);
+  ?? (_isDevDefault ? DEV_SONAR_HOST : PROD_FALLBACK_HOST);
+
+// Fortify's path suffix — empty in the dev split (separate localhost:8001
+// host needs no path), '/fortify' otherwise (shared host, deployed envs).
+const FORTIFY_PATH = _isDevDefault
+  ? ''
+  : ((_w.__FORTIFYAI_FORTIFY_PATH__ ?? '/fortify') as string);
 
 @Injectable({ providedIn: 'root' })
 export class ApiConfigService {
@@ -56,8 +62,10 @@ export class ApiConfigService {
   /** Base URL for Sonar + shared API calls */
   sonarBaseUrl = computed(() => this._normalize(this.apiHost()));
 
-  /** Base URL for Fortify API calls — /fortify path in deployed envs,
-   *  a separate localhost:8001 host in local dev. */
+  /** Base URL for Fortify API calls — separate localhost:8001 host (no
+   *  path) in local dev; shared host + /fortify path in deployed envs.
+   *  FORTIFY_PATH is already '' whenever the dev split applies, so
+   *  /fortify is never appended in development mode either way. */
   fortifyBaseUrl = computed(() => this._devSplitActive
     ? this._normalize(this._devFortifyHost())
     : `${this._normalize(this.apiHost())}${FORTIFY_PATH}`);
