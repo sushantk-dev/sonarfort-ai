@@ -1,6 +1,7 @@
 // src/app/core/settings-state.service.ts
 import { Injectable, inject, signal, computed } from '@angular/core';
 import { forkJoin, of } from 'rxjs';
+import { switchMap, catchError } from 'rxjs/operators';
 import { ApiService } from './api.service';
 import { ApiConfigService } from './api-config.service';
 
@@ -123,14 +124,18 @@ export class SettingsStateService {
   load() {
     if (this.loaded()) return;
 
-    this.apiSvc.getConfig().subscribe({
-      next: (remote) => {
-        // Detect which tokens are set (backend sends '***' for set tokens)
-        this.tokenStatus.set({
-          githubToken:  remote.github_token    === '***',
-          sonarToken:   remote.sonar_token     === '***',
-          fortifyApiToken: remote.fortify_api_token   === '***',
-        });
+    // Sequential fetch: Sonar/general config first, then Fortify.
+    // Fortify's response is merged in only after the Sonar call resolves,
+    // so Fortify-specific fields (fortify_api_token / fortify_host_url)
+    // never get clobbered by a general-config response that arrived later.
+    this.apiSvc.getConfig().pipe(
+      switchMap((remote) => {
+        // Apply the Sonar/general response immediately.
+        this.tokenStatus.update(ts => ({
+          ...ts,
+          githubToken: remote.github_token === '***',
+          sonarToken:  remote.sonar_token  === '***',
+        }));
 
         this.cfg.update(c => ({
           ...c,
@@ -143,7 +148,6 @@ export class SettingsStateService {
           plannerTemp:    remote.planner_temperature         ?? c.plannerTemp,
           generatorTemp:  remote.generator_temperature       ?? c.generatorTemp,
           sonarOrg:       remote.sonar_host_url              || c.sonarOrg,
-          fortifyHostUrl: remote.fortify_host_url            || c.fortifyHostUrl,
           maxRetries:     remote.max_critic_retries          ?? c.maxRetries,
           chromaPath:     remote.chroma_persist_dir          || c.chromaPath,
           embeddingModel: remote.embedding_model             || c.embeddingModel,
@@ -152,8 +156,32 @@ export class SettingsStateService {
           // Tokens: keep empty — we show the masked placeholder UI instead
           githubToken:    '',
           sonarToken:     '',
-          fortifyApiToken:   '',
-                }));
+        }));
+
+        // Now chase it with the Fortify config fetch.
+        return this.apiSvc.getFortifyConfig().pipe(
+          catchError(() => {
+            // Fortify side unreachable — Sonar/general values already
+            // applied above, so just fall back to Fortify defaults.
+            this.loadErr.set('Fortify backend offline — showing defaults for Fortify fields.');
+            return of(null);
+          }),
+        );
+      }),
+    ).subscribe({
+      next: (fortifyRemote) => {
+        if (fortifyRemote) {
+          this.tokenStatus.update(ts => ({
+            ...ts,
+            fortifyApiToken: fortifyRemote.fortify_api_token === '***',
+          }));
+
+          this.cfg.update(c => ({
+            ...c,
+            fortifyHostUrl: fortifyRemote.fortify_host_url || c.fortifyHostUrl,
+            fortifyApiToken: '',
+          }));
+        }
 
         // Sync UI fields from live apiCfg (may differ if loaded from localStorage)
         this.cfg.update(cc => ({
@@ -161,7 +189,7 @@ export class SettingsStateService {
           apiHost: this.apiCfg.apiHost(),
         }));
         this.loaded.set(true);
-        this.loadErr.set('');
+        if (fortifyRemote) this.loadErr.set('');
       },
       error: () => {
         this.loadErr.set('Backend offline — showing defaults. Changes will not persist until API is reachable.');

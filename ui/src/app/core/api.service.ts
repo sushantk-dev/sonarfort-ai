@@ -217,6 +217,16 @@ export class ApiService {
     return this.http.get<BackendConfig>(`${this.base}/api/config`);
   }
 
+  /**
+   * Same /api/config endpoint, but routed through fortifyBase (/fortify).
+   * Used to read back Fortify-specific fields (fortify_api_token,
+   * fortify_host_url) from the Fortify side, matching how
+   * saveFortifyConfig() writes them.
+   */
+  getFortifyConfig(): Observable<BackendConfig> {
+    return this.http.get<BackendConfig>(`${this.fortifyBase}/api/config`);
+  }
+
   saveConfig(cfg: Partial<BackendConfig>): Observable<{ message: string }> {
     return this.http.post<any>(`${this.base}/api/config`, cfg);
   }
