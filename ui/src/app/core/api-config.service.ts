@@ -49,8 +49,27 @@ export class ApiConfigService {
   // ── Dev-mode split override for Fortify. Only used when nothing has been
   //    explicitly configured (no injected host, no saved localStorage host,
   //    and no Settings-page apiHost edit has occurred). ─────────────────────
-  private _devSplitActive = isDevMode() && !_hasInjectedHost && this._load('host') === null;
+  private _devSplitActive = this._resolveDevSplit();
   private _devFortifyHost = signal<string>(this._load('fortifyHost') ?? DEV_FORTIFY_HOST);
+
+  /**
+   * Determines whether the dev split should be active, self-healing a
+   * one-time bug: an earlier version of this service auto-persisted the
+   * untouched default host to localStorage on every load, which then
+   * looked identical to a real user-configured host on the next reload
+   * and permanently disabled the split. If we find a saved host that is
+   * exactly the dev default (never something a user would type), treat
+   * it as never having been saved and clear it.
+   */
+  private _resolveDevSplit(): boolean {
+    if (!isDevMode() || _hasInjectedHost) return false;
+    const saved = this._load('host');
+    if (saved === DEV_SONAR_HOST) {
+      try { localStorage.removeItem(`${STORAGE_KEY}_host`); } catch {}
+      return true;
+    }
+    return saved === null;
+  }
 
   // ── Legacy port signals — kept only so existing callers (e.g.
   //    SettingsStateService) that still read/pass apiPort / fortifyPort
@@ -77,8 +96,15 @@ export class ApiConfigService {
   isSplit = computed(() => this._devSplitActive);
 
   constructor() {
-    effect(() => this._save('host', this.apiHost()));
-    effect(() => { if (this._devSplitActive) this._save('fortifyHost', this._devFortifyHost()); });
+    // NOTE: intentionally NOT an effect() on apiHost() — that would fire
+    // immediately for the untouched default value too, writing it to
+    // localStorage and permanently disabling the dev split on the very
+    // next reload (the _devSplitActive check below depends on 'host'
+    // being absent from storage). Persistence now happens only inside
+    // apply(), i.e. only when a real Settings save occurs.
+    if (this._devSplitActive) {
+      effect(() => this._save('fortifyHost', this._devFortifyHost()));
+    }
   }
 
   /**
@@ -90,7 +116,9 @@ export class ApiConfigService {
    */
   apply(host: string, _port?: number, _fortifyPort?: number | null) {
     this._devSplitActive = false;
-    this.apiHost.set(host?.trim() || DEFAULT_HOST);
+    const resolved = host?.trim() || DEFAULT_HOST;
+    this.apiHost.set(resolved);
+    this._save('host', resolved);
   }
 
   private _normalize(host: string): string {
