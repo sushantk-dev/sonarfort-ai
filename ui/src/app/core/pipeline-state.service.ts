@@ -26,8 +26,8 @@ const FORTIFY_STAGE_LABELS: Record<string, string> = {
 
 const FORTIFY_STAGE_ORDER = Object.keys(FORTIFY_STAGE_LABELS);
 
-const POLL_MS        = 2000;   // poll interval while running
-const QUEUED_POLL_MS = 600;    // faster poll while job is still queued
+const POLL_MS        = 50000;  // poll interval while running
+const QUEUED_POLL_MS = 50000;  // poll interval — same cadence whether queued or running
 
 // ── localStorage key for Fortify runs that survived a page reload ─────────────
 const FORTIFY_ACTIVE_KEY = 'sonarfort_fortify_active_runs';
