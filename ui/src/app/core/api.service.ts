@@ -174,11 +174,11 @@ export class ApiService {
   }
 
   /**
-   * Poll a run every 50 s until status is 'done' or 'error'.
+   * Poll a run every 30 s until status is 'done' or 'error'.
    * Emits each intermediate RunStatus so the UI can show live steps.
    */
   pollRun(runId: string): Observable<RunStatus> {
-    return interval(50000).pipe(
+    return interval(30000).pipe(
       switchMap(() => this.getRunStatus(runId)),
       takeWhile(s => s.status !== 'done' && s.status !== 'error', true),
       share(),
