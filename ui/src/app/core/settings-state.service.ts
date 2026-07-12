@@ -173,7 +173,7 @@ export class SettingsStateService {
         if (fortifyRemote) {
           this.tokenStatus.update(ts => ({
             ...ts,
-            fortifyApiToken: fortifyRemote.fortify_api_token === '***',
+            fortifyApiToken: fortifyRemote.fortify_token === '***',
           }));
 
           this.cfg.update(c => ({

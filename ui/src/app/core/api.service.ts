@@ -120,6 +120,16 @@ export interface BackendConfig {
   adr_output_dir:              string;
 }
 
+/**
+ * Shape returned by GET on the Fortify config endpoint. Same as
+ * BackendConfig except the token field comes back as `fortify_token`
+ * (the POST/save side still uses `fortify_api_token` — see
+ * saveFortifyConfig below, which is unchanged).
+ */
+export type FortifyConfigResponse = Omit<BackendConfig, 'fortify_api_token'> & {
+  fortify_token: string;
+};
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private http   = inject(HttpClient);
@@ -223,8 +233,8 @@ export class ApiService {
    * fortify_host_url) from the Fortify side, matching how
    * saveFortifyConfig() writes them.
    */
-  getFortifyConfig(): Observable<BackendConfig> {
-    return this.http.get<BackendConfig>(`${this.fortifyBase}/api/config`);
+  getFortifyConfig(): Observable<FortifyConfigResponse> {
+    return this.http.get<FortifyConfigResponse>(`${this.fortifyBase}/api/config`);
   }
 
   saveConfig(cfg: Partial<BackendConfig>): Observable<{ message: string }> {
