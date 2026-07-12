@@ -95,6 +95,7 @@ def _blank_job(pipeline_id: str, stages: list[str] | None = None) -> dict:
         "elapsed_seconds": None,
         "error":           None,
         "result":          None,
+        "cancel_requested": False,
         "stages":          _blank_stages(stages),
     }
 
@@ -136,6 +137,20 @@ class JobStore(ABC):
     @abstractmethod
     def list_jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
         """Return recent jobs newest-first (summary records)."""
+
+    @abstractmethod
+    def request_cancel(self, pipeline_id: str) -> None:
+        """Flag a running job for cooperative cancellation.
+
+        This does NOT stop work already executing inside a thread-pool
+        stage — it sets a flag that the pipeline runner checks between
+        stages (see ``_check_cancelled`` in api_server.py) so the run
+        stops advancing to the next stage/side-effect as soon as possible.
+        """
+
+    @abstractmethod
+    def is_cancel_requested(self, pipeline_id: str) -> bool:
+        """Return True if ``request_cancel`` was called for this job."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -334,6 +349,15 @@ class GcsJobStore(JobStore):
                 jobs.append(doc)
         return jobs
 
+    def request_cancel(self, pipeline_id: str) -> None:
+        def _apply(doc: dict) -> None:
+            doc["cancel_requested"] = True
+        self._mutate(pipeline_id, _apply, "request_cancel")
+
+    def is_cancel_requested(self, pipeline_id: str) -> bool:
+        doc, _gen = self._read_doc(pipeline_id)
+        return bool(doc and doc.get("cancel_requested"))
+
     # ── Lazy TTL purge (backstop — prefer a bucket lifecycle rule) ───────────
 
     def _maybe_purge(self) -> None:
@@ -426,6 +450,17 @@ class NullJobStore(JobStore):
             {k: v for k, v in j.items() if k != "result"}
             for j in jobs[offset: offset + limit]
         ]
+
+    def request_cancel(self, pipeline_id: str) -> None:
+        with self._lock:
+            j = self._jobs.get(pipeline_id)
+            if j:
+                j["cancel_requested"] = True
+
+    def is_cancel_requested(self, pipeline_id: str) -> bool:
+        with self._lock:
+            j = self._jobs.get(pipeline_id)
+            return bool(j and j.get("cancel_requested"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

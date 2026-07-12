@@ -109,6 +109,21 @@ def _finish_job(pipeline_id: str, status: str, result: dict | None = None,
                 error: str | None = None, t0: float | None = None) -> None:
     _store.finish_job(pipeline_id, status, result=result, error=error, t0=t0)
 
+
+class PipelineCancelled(Exception):
+    """Raised internally when a job's cancel flag is observed between stages."""
+
+
+def _check_cancelled(pipeline_id: str | None) -> None:
+    """
+    Cooperative cancellation checkpoint. Called between pipeline stages (and
+    inside long per-group loops) so a POST /pipeline/cancel/{id} actually
+    stops the run from advancing to the next stage/side-effect, instead of
+    just being ignored while the job runs to completion in the background.
+    """
+    if pipeline_id and _store.is_cancel_requested(pipeline_id):
+        raise PipelineCancelled()
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -553,6 +568,7 @@ def _run_full_pipeline(
     japicmp_path = cfg.japicmp_jar_path or "/nonexistent/japicmp.jar"
 
     # Stage 1 — triage
+    _check_cancelled(pipeline_id)
     t = _stage_start("triage")
     groups, triage_skipped = group_by_dependency(raw_vulns)
     groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
@@ -571,21 +587,25 @@ def _run_full_pipeline(
     })
 
     # Stage 2 — version resolver
+    _check_cancelled(pipeline_id)
     t = _stage_start("version-resolver")
     resolved = resolve_all_groups(client, release_id, groups)
     _stage_done("version-resolver", t, {"groups_count": len(resolved)})
 
     # Stage 3 — context
+    _check_cancelled(pipeline_id)
     t = _stage_start("context")
     context = locate_all_groups(project_path, resolved)
     _stage_done("context", t, {"groups_count": len(context)})
 
     # Stage 4 — api diff
+    _check_cancelled(pipeline_id)
     t = _stage_start("api-diff")
     diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
     _stage_done("api-diff", t, {"groups_count": len(diffed)})
 
     # Stage 5 — ai reasoning
+    _check_cancelled(pipeline_id)
     t = _stage_start("ai-reasoning")
     reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
     _stage_done("ai-reasoning", t, {
@@ -594,9 +614,11 @@ def _run_full_pipeline(
     })
 
     # Stage 6 — adr fix
+    _check_cancelled(pipeline_id)
     t = _stage_start("adr-fix")
     adr_results: list[dict] = []
     for group in reasoned:
+        _check_cancelled(pipeline_id)  # stop before pushing the next commit
         artifact_id = group["parsed"]["artifact_id"]
         if group.get("next_node") == "escalate":
             adr_results.append({
@@ -629,6 +651,7 @@ def _run_full_pipeline(
     _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
 
     # Stage 7 — pr agent
+    _check_cancelled(pipeline_id)  # stop before opening PRs
     pr_results = []
     if not dry_run and cfg.github_token and cfg.github_repo:
         t = _stage_start("pr-agent")
@@ -644,6 +667,7 @@ def _run_full_pipeline(
         _stage_skip("pr-agent")
 
     # Stage 8 — writeback + summary
+    _check_cancelled(pipeline_id)
     if not dry_run:
         t = _stage_start("fortify-writeback")
         summary = run_all_reports(
@@ -1015,6 +1039,8 @@ async def pipeline_live(req: LivePipelineRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
+        except PipelineCancelled:
+            _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
@@ -1064,6 +1090,8 @@ async def pipeline_offline(req: OfflinePipelineRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
+        except PipelineCancelled:
+            _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
@@ -1128,6 +1156,8 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
             result["app_id"] = app_id
             result["repo"] = req.repo  # echo back so callers know which repo was used
             _finish_job(pid, "completed", result=result, t0=t0)
+        except PipelineCancelled:
+            _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
@@ -1182,6 +1212,8 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
+        except PipelineCancelled:
+            _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
@@ -1235,6 +1267,8 @@ async def pipeline_dry_run(req: DryRunRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
+        except PipelineCancelled:
+            _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
@@ -1301,6 +1335,42 @@ def pipeline_stage_status(pipeline_id: str, stage_name: str):
                    f"Valid stages: {valid}",
         )
     return ok({"pipeline_id": pipeline_id, "stage": stage_name, **stage})
+
+
+@app.post("/pipeline/cancel/{pipeline_id}", tags=["Pipeline Status"])
+def cancel_pipeline(pipeline_id: str):
+    """
+    Request cancellation of a running pipeline job.
+
+    This sets a flag that the pipeline runner checks **between stages**
+    (see `_check_cancelled` calls in `_run_full_pipeline` / `_run_until`).
+    Work already executing inside the current stage's thread-pool call is
+    NOT interrupted — cancellation takes effect at the next stage boundary
+    (and, for the `adr-fix` stage, between each dependency in the loop),
+    which is what stops further side-effects like PR creation or Fortify
+    writeback from firing after the user cancels.
+
+    Returns 404 if the pipeline_id is unknown. If the job has already
+    reached a terminal state (`completed` / `failed` / `cancelled`), this
+    is a no-op that reports the existing status.
+    """
+    job = _store.get_job(pipeline_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+
+    if job.get("status") in ("completed", "failed", "cancelled"):
+        return ok({
+            "pipeline_id": pipeline_id,
+            "message": f"Job already in terminal state '{job['status']}' — nothing to cancel",
+            "status": job["status"],
+        })
+
+    _store.request_cancel(pipeline_id)
+    return ok({
+        "pipeline_id": pipeline_id,
+        "message": "Cancellation requested — the run will stop at the next stage boundary",
+        "status": "cancelling",
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1643,6 +1713,7 @@ def _run_until(
     result: dict = {"release_id": release_id, "stopped_after": stop_after}
 
     # Stage 0 — triage
+    _check_cancelled(pipeline_id)
     t = _s_start("triage")
     groups, triage_skipped = group_by_dependency(raw_vulns)
     groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
@@ -1658,6 +1729,7 @@ def _run_until(
         return result
 
     # Stage 1 — version resolver
+    _check_cancelled(pipeline_id)
     t = _s_start("version-resolver")
     resolved = resolve_all_groups(client, release_id, groups)
     result["groups"] = resolved
@@ -1668,6 +1740,7 @@ def _run_until(
         return result
 
     # Stage 2 — context
+    _check_cancelled(pipeline_id)
     t = _s_start("context")
     context_groups = locate_all_groups(project_path, resolved)
     result["groups"] = context_groups
@@ -1678,6 +1751,7 @@ def _run_until(
         return result
 
     # Stage 3 — api diff
+    _check_cancelled(pipeline_id)
     t = _s_start("api-diff")
     diff_groups = run_api_diff_all_groups(
         context_groups, project_path,
@@ -1691,6 +1765,7 @@ def _run_until(
         return result
 
     # Stage 4 — ai reasoning
+    _check_cancelled(pipeline_id)
     t = _s_start("ai-reasoning")
     reasoned = reason_all_groups(diff_groups, cfg.gcp_project, cfg.gcp_location)
     result["groups"] = reasoned
@@ -1704,9 +1779,11 @@ def _run_until(
         return result
 
     # Stage 5 — adr fix
+    _check_cancelled(pipeline_id)
     t = _s_start("adr-fix")
     adr_results: list[dict] = []
     for group in reasoned:
+        _check_cancelled(pipeline_id)  # stop before pushing the next commit
         artifact_id = group["parsed"]["artifact_id"]
         if group.get("next_node") == "escalate" or not cfg.adr_path:
             adr_results.append({
@@ -1735,6 +1812,7 @@ def _run_until(
         return result
 
     # Stage 6 — pr agent
+    _check_cancelled(pipeline_id)  # stop before opening PRs
     t = _s_start("pr-agent")
     pr_results = []
     if cfg.github_token and cfg.github_repo:
@@ -1786,6 +1864,8 @@ def _make_partial_endpoint(stop_after: StageLabel):
                 if req.repo:
                     result["repo"] = req.repo
                 _finish_job(pid, "completed", result=result, t0=t0)
+            except PipelineCancelled:
+                _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
             except Exception as exc:
                 _finish_job(pid, "failed", error=str(exc), t0=t0)
             finally:
