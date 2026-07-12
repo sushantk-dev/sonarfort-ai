@@ -1916,17 +1916,38 @@ if __name__ == "__main__":
 
 # ── Escalation storage helpers (GCS-first, local fallback for dev) ───────────
 
+
+# Reused across requests — constructing storage.Client() does an auth
+# handshake, so building a fresh one per request was a major slowdown.
+_gcs_client_singleton = None
+
+# For legacy blobs written before we started stamping parsed fields as blob
+# metadata: cache the parsed result per blob name, invalidated by blob.updated.
+# Avoids re-downloading + re-parsing the same old file's full text on every
+# single list request.
+_legacy_parse_cache: dict[str, tuple[float, dict]] = {}
+
+# Local-mode parse cache keyed by absolute file path, invalidated by mtime.
+# Escalation files are write-once, so this turns a full re-read of every
+# file on every request into just a stat() call once the cache is warm.
+_local_parse_cache: dict[str, tuple[float, dict]] = {}
+
+
 def _esc_backend():
     """
     Return ("gcs", bucket, bucket_name, prefix, client) when GCS_BUCKET is
     set and reachable, else ("local",). Env vars are read fresh on every
-    call so runtime-config overrides apply immediately.
+    call so runtime-config overrides apply immediately, but the underlying
+    storage.Client() is created once and reused.
     """
     bucket_name = os.environ.get("GCS_BUCKET", "").strip()
     if bucket_name:
         try:
-            from google.cloud import storage
-            client = storage.Client()
+            global _gcs_client_singleton
+            if _gcs_client_singleton is None:
+                from google.cloud import storage
+                _gcs_client_singleton = storage.Client()
+            client = _gcs_client_singleton
             prefix = os.environ.get("GCS_ESCALATION_PREFIX", "escalations/").rstrip("/") + "/"
             return ("gcs", client.bucket(bucket_name), bucket_name, prefix, client)
         except Exception as exc:
@@ -1972,17 +1993,42 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
     if backend[0] == "gcs":
         _, bucket, bucket_name, prefix, client = backend
         items = []
+        # list_blobs() already returns metadata (including custom metadata)
+        # for free as part of the listing call — no per-blob GET needed
+        # unless we hit an older file written before metadata was stamped.
         for blob in client.list_blobs(bucket_name, prefix=prefix):
             if not blob.name.endswith(".txt"):
                 continue
             filename = blob.name[len(prefix):]
             if "/" in filename or not filename.startswith("escalation_"):
                 continue
-            try:
-                content = blob.download_as_bytes().decode("utf-8", errors="replace")
-            except Exception:
-                continue
-            parsed = _parse_escalation_text(content)
+
+            modified_at = blob.updated.timestamp() if blob.updated else 0.0
+            meta = blob.metadata or {}
+
+            if meta.get("artifact_id") is not None:
+                # Fast path: fields were stamped at write time, no download.
+                parsed = {
+                    "artifact_id": meta.get("artifact_id", ""),
+                    "cves":        [v for v in meta.get("cves", "").split(",") if v],
+                    "reason":      meta.get("reason", ""),
+                    "tried":       [v for v in meta.get("tried", "").split(",") if v],
+                    "severity":    meta.get("severity", "HIGH"),
+                }
+            else:
+                # Legacy blob with no stamped metadata — parse full content,
+                # but only once per (blob, modified_at); cache the result.
+                cached = _legacy_parse_cache.get(blob.name)
+                if cached and cached[0] == modified_at:
+                    parsed = cached[1]
+                else:
+                    try:
+                        content = blob.download_as_bytes().decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    parsed = _parse_escalation_text(content)
+                    _legacy_parse_cache[blob.name] = (modified_at, parsed)
+
             items.append({
                 "filename":    filename,
                 "artifact_id": parsed["artifact_id"] or filename.rsplit(".", 1)[0],
@@ -1990,8 +2036,8 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
                 "reason":      parsed["reason"],
                 "tried":       parsed["tried"],
                 "severity":    parsed["severity"],
-                "size_bytes":  blob.size or len(content),
-                "modified_at": blob.updated.timestamp() if blob.updated else 0.0,
+                "size_bytes":  blob.size or 0,
+                "modified_at": modified_at,
                 "uri":         f"gs://{bucket_name}/{blob.name}",
             })
         items.sort(key=lambda i: i["modified_at"], reverse=True)
@@ -2011,8 +2057,15 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
         reverse=True
     ):
         stat = txt_file.stat()
-        content = txt_file.read_text(encoding="utf-8", errors="replace")
-        parsed = _parse_escalation_text(content)
+        path_key = str(txt_file.resolve())
+        cached = _local_parse_cache.get(path_key)
+        if cached and cached[0] == stat.st_mtime:
+            parsed = cached[1]
+        else:
+            content = txt_file.read_text(encoding="utf-8", errors="replace")
+            parsed = _parse_escalation_text(content)
+            _local_parse_cache[path_key] = (stat.st_mtime, parsed)
+
         items.append({
             "filename":    txt_file.name,
             "artifact_id": parsed["artifact_id"] or txt_file.stem,

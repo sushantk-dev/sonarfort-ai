@@ -283,19 +283,31 @@ import os as _os
 _GCS_BUCKET         = _os.environ.get("GCS_BUCKET", "").strip()
 _GCS_ESC_PREFIX     = _os.environ.get("GCS_ESCALATION_PREFIX", "escalations/").rstrip("/") + "/"
 
+# Reused across calls — constructing google.cloud.storage.Client() does an
+# auth/credential handshake, so building a fresh one per write is wasteful.
+_gcs_client_singleton = None
+
+
+def _get_gcs_client():
+    global _gcs_client_singleton
+    if _gcs_client_singleton is None:
+        from google.cloud import storage
+        _gcs_client_singleton = storage.Client()
+    return _gcs_client_singleton
+
 
 def _get_gcs_bucket():
     """
     Return (bucket, bucket_name) when GCS_BUCKET env var is set, else (None, None).
     Uses Workload Identity on GKE — no key file needed.
-    Refreshes env var on every call so hot-updates via os.environ work.
+    Refreshes env var on every call so hot-updates via os.environ work, but
+    reuses a single cached storage.Client() instance.
     """
     name = _os.environ.get("GCS_BUCKET", "").strip()
     if not name:
         return None, None
     try:
-        from google.cloud import storage
-        client = storage.Client()
+        client = _get_gcs_client()
         return client.bucket(name), name
     except Exception as exc:
         logger.warning(f"[Report] GCS unavailable ({exc}) — falling back to local filesystem")
@@ -332,6 +344,24 @@ def write_escalation_report(
         group, escalation_reason, adr_results, gcp_project, gcp_location
     )
 
+    # Fields the /escalations list endpoint needs — stashed as blob metadata
+    # so listing can read them straight off list_blobs() without a separate
+    # download_as_bytes() round-trip per file.
+    cves       = group.get("cves", [])
+    candidates = group.get("version_candidates", {}).get("candidates", [])
+    reason     = (
+        escalation_reason
+        or group.get("escalate_reason")
+        or "Automated fix was not possible"
+    )
+    esc_metadata = {
+        "artifact_id": artifact_id,
+        "cves":        ",".join(cves),
+        "reason":      reason[:1500],  # metadata values have a size limit
+        "tried":       ",".join(candidates),
+        "severity":    str(group.get("severity", "Unknown")),
+    }
+
     # ── GCS mode (sole path when a bucket is configured) ─────────────────────
     if _os.environ.get("GCS_BUCKET", "").strip():
         bucket, bucket_name = _get_gcs_bucket()
@@ -345,6 +375,7 @@ def write_escalation_report(
         blob_name = prefix + filename
         try:
             blob = bucket.blob(blob_name)
+            blob.metadata = esc_metadata
             blob.upload_from_string(text.encode("utf-8"), content_type="text/plain")
             uri = f"gs://{bucket_name}/{blob_name}"
             logger.info(f"[Report] 📄 Escalation report uploaded: {uri}")
