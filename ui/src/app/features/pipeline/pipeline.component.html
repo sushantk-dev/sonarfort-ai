@@ -1,5 +1,13 @@
 <div class="page">
 
+  <!-- ── Full-screen loader — shown while a Start/Stop request is in flight ── -->
+  <div class="loading-overlay" *ngIf="state.submitting() as action">
+    <div class="loading-overlay__spinner"></div>
+    <div class="loading-overlay__label">
+      {{ action === 'start' ? 'Starting run…' : 'Stopping run…' }}
+    </div>
+  </div>
+
   <!-- ── Header ── -->
   <div class="page-header">
     <div>

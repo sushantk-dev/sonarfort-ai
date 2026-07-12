@@ -213,6 +213,7 @@ export class PipelineComponent {
     }
 
     // Fire-and-forget: POST to Fortify API server, then poll /pipeline/status/{id}
+    this.state.submitting.set('start');
     fetch(`${baseUrl}${endpoint}`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -220,6 +221,7 @@ export class PipelineComponent {
     })
     .then(r => r.json())
     .then(resp => {
+      this.state.submitting.set(null);
       // Backend wraps responses: { ok: true, data: { pipeline_id, status } }
       const pipeline_id = resp?.data?.pipeline_id ?? resp?.pipeline_id;
       if (pipeline_id) {
@@ -229,6 +231,7 @@ export class PipelineComponent {
       }
     })
     .catch(err => {
+      this.state.submitting.set(null);
       this.state.error.set(`Fortify API error: ${err.message}`);
     });
   }

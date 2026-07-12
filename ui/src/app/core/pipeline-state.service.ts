@@ -1,6 +1,6 @@
 // src/app/core/pipeline-state.service.ts
 import { Injectable, inject, signal } from '@angular/core';
-import { Subscription, timer } from 'rxjs';
+import { Subscription, timer, firstValueFrom } from 'rxjs';
 import { switchMap, takeWhile, tap } from 'rxjs/operators';
 import { HttpClient } from '@angular/common/http';
 import { ApiService, RunStatus, PipelineStep } from './api.service';
@@ -97,6 +97,14 @@ export class PipelineStateService {
   selected = signal<UiRun | null>(null);
   running  = signal(false);
   error    = signal<string | null>(null);
+
+  /**
+   * Which action (if any) currently has a request in flight to a backend.
+   * Drives a full-screen loader in the UI — 'start' while waiting on the
+   * initial POST for a Sonar or Fortify run, 'stop' while waiting on the
+   * cancel request(s) to be acknowledged. null the rest of the time.
+   */
+  submitting = signal<'start' | 'stop' | null>(null);
 
   /**
    * Set to the pipeline_id of the most recently completed (or errored) Fortify
@@ -580,12 +588,17 @@ export class PipelineStateService {
   // ══════════════════════════════════════════════════════════════════════════
   startRun(req: RunRequest) {
     if (this.running()) return;
+    this.submitting.set('start');
     this.running.set(true);
     this.error.set(null);
 
     this.api.startRun(req).subscribe({
-      next: ({ run_id }) => this._pollRun(run_id, req),
+      next: ({ run_id }) => {
+        this.submitting.set(null);
+        this._pollRun(run_id, req);
+      },
       error: (err: any) => {
+        this.submitting.set(null);
         const detail = err?.error?.detail ?? err?.message ?? 'Pipeline start failed';
         this.error.set(detail);
         this.running.set(false);
@@ -818,9 +831,11 @@ export class PipelineStateService {
   }
 
   // ── Cancel ────────────────────────────────────────────────────────────────
-  cancelRun() {
+  async cancelRun() {
     const runId = this._activeRunId;
     if (!runId) return;
+
+    this.submitting.set('stop');
 
     this._poll?.unsubscribe();
     this._poll = undefined;
@@ -835,22 +850,22 @@ export class PipelineStateService {
     this._fortifyPolls.clear();
     this._fortifyQueue.length = 0;
 
-    // Notify the backend(s). A single "Stop" click cancels either the one
-    // active Sonar run OR one-or-more Fortify pipelines — never both, since
-    // trackFortifyRun() queues Fortify runs behind an active Sonar run
-    // rather than letting them run concurrently with it.
+    // Notify the backend(s) and WAIT for the response — this is what the
+    // 'stop' loader is covering. A single "Stop" click cancels either the
+    // one active Sonar run OR one-or-more Fortify pipelines — never both,
+    // since trackFortifyRun() queues Fortify runs behind an active Sonar
+    // run rather than letting them run concurrently with it.
     //
     // IMPORTANT: Fortify pipelines live on the Fortify server (fortifyBase —
     // localhost:8001 in dev) with a bare /pipeline/cancel/{id} route, no
     // /api prefix. They must NOT go through api.cancelRun(), which always
     // targets the Sonar server (this.base — localhost:8000 in dev).
     if (fortifyIds.length > 0) {
-      fortifyIds.forEach(id => {
-        fetch(`${this.fortifyBase}/pipeline/cancel/${id}`, { method: 'POST' })
-          .catch(() => {});
-      });
+      await Promise.all(fortifyIds.map(id =>
+        fetch(`${this.fortifyBase}/pipeline/cancel/${id}`, { method: 'POST' }).catch(() => {})
+      ));
     } else {
-      this.api.cancelRun(runId).subscribe({ error: () => {} });
+      await firstValueFrom(this.api.cancelRun(runId)).catch(() => {});
     }
 
     this.runs.update(rs => rs.map(r => {
@@ -870,6 +885,7 @@ export class PipelineStateService {
     const updated = this.runs().find(r => r.id === runId);
     if (updated && this.selected()?.id === runId) this.selected.set(updated);
 
+    this.submitting.set(null);
     this.running.set(false);
     this._activeRunId = null;
 
