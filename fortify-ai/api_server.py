@@ -71,6 +71,7 @@ from pydantic import BaseModel, Field
 # ── Internal imports ──────────────────────────────────────────────────────────
 from config import FortifyAIConfig, load_config
 from job_store import create_job_store, ALL_STAGE_NAMES
+from token_tracker import token_tracker
 from runtime_config import apply_overrides, persist_overrides, is_persisted
 from state import AgentState
 
@@ -107,6 +108,12 @@ def _update_stage(pipeline_id: str, stage: str, **kwargs) -> None:
 
 def _finish_job(pipeline_id: str, status: str, result: dict | None = None,
                 error: str | None = None, t0: float | None = None) -> None:
+    # Attach LLM token consumption for this run to the persisted result so
+    # GET /pipeline/status/{id} reports it after completion. end_run() also
+    # unbinds the tracker from the worker thread.
+    usage = token_tracker.end_run(pipeline_id)
+    if isinstance(result, dict) and "token_usage" not in result:
+        result["token_usage"] = usage
     _store.finish_job(pipeline_id, status, result=result, error=error, t0=t0)
 
 
@@ -527,6 +534,8 @@ def _run_full_pipeline(
     When *pipeline_id* is supplied, each stage updates the shared job store so
     callers can poll /pipeline/status/{pipeline_id} for live progress.
     """
+    if pipeline_id:
+        token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
     from agents.version_resolver import resolve_all_groups
@@ -1374,6 +1383,48 @@ def cancel_pipeline(pipeline_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TOKEN USAGE ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/tokens/usage", tags=["Tokens"])
+def tokens_usage_all():
+    """
+    Return LLM token consumption totals **since this process started**.
+
+    Response shape:
+    ```
+    {
+      "global": { calls, input_tokens, output_tokens, total_tokens,
+                  models: {model: total}, stages: {stage: {...}} },
+      "runs":   { "<pipeline_id>": { calls, input_tokens,
+                                     output_tokens, total_tokens } }
+    }
+    ```
+
+    Notes:
+    - Counters are **in-memory and per-pod**. For a durable per-run record,
+      read `result.token_usage` from `GET /pipeline/status/{pipeline_id}`
+      after the run completes (persisted via the job store).
+    - CLI runs (`fortifyai.py`) and stage-level `/stages/*` calls are counted
+      in the global bucket even without a pipeline_id.
+    """
+    return ok(token_tracker.all_runs())
+
+
+@app.get("/tokens/usage/{pipeline_id}", tags=["Tokens"])
+def tokens_usage_run(pipeline_id: str):
+    """
+    Return **live** per-stage LLM token consumption for one pipeline run.
+
+    Useful for polling while a run is in progress — unlike
+    `/pipeline/status/{id}`, which only includes `token_usage` in the final
+    result after completion. Returns zeros (not 404) for unknown or
+    not-yet-started pipeline ids, and for runs executed on another pod.
+    """
+    return ok(token_tracker.summary(pipeline_id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/stages/triage", tags=["Individual Stages"])
 def stage_triage(req: TriageRequest):
@@ -1679,6 +1730,8 @@ def _run_until(
     max_upgrades: int = 0,
 ) -> dict:
     """Run the pipeline and stop (inclusive) at `stop_after`, updating the job store per stage."""
+    if pipeline_id:
+        token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
     from agents.version_resolver import resolve_all_groups

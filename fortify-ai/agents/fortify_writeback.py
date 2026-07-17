@@ -35,6 +35,11 @@ from loguru import logger
 
 from state import AgentState
 
+try:  # flat layout (token_tracker.py at repo root, next to state.py)
+    from token_tracker import token_tracker
+except ImportError:  # package layout
+    from agents.token_tracker import token_tracker  # type: ignore
+
 
 # ── LLM-generated next steps ──────────────────────────────────────────────────
 
@@ -134,6 +139,9 @@ def _generate_next_steps_llm(
         t0       = time.time()
         response = llm.invoke(messages)
         latency  = time.time() - t0
+        token_tracker.record(
+            "fortify-writeback", response, model=getattr(llm, "model_name", None),
+        )
         text     = response.content if hasattr(response, "content") else str(response)
         logger.debug(f"[Report] LLM next steps generated ({latency:.1f}s, {len(text)} chars)")
 
