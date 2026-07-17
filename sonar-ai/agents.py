@@ -47,7 +47,10 @@ import logging as _logging
 
 from config import settings
 from prompts import planner_prompt, generator_prompt, critic_prompt, format_rag_context
-from state import AgentState, PlannerOutput, GeneratorOutput, CriticOutput, RAGContext, SonarRuleDetail
+from state import (
+    AgentState, PlannerOutput, GeneratorOutput, CriticOutput,
+    RAGContext, SonarRuleDetail, TokenUsageRecord,
+)
 
 # ── Retry configuration ───────────────────────────────────────────────────────
 # Transient Vertex AI failures (rate limits, service unavailability) should be
@@ -284,6 +287,56 @@ def _invoke_with_retry(
             f"[{node_name}] Fallback model '{fallback_model}' also failed: {exc}"
         )
         raise
+
+
+# ── Token usage tracking ──────────────────────────────────────────────────────
+
+def _extract_usage(response: Any) -> dict[str, int]:
+    """
+    Pull input/output token counts off a LangChain AIMessage.
+
+    ChatVertexAI populates the standardized `usage_metadata` attribute
+    (input_tokens / output_tokens). Falls back to the raw Vertex fields in
+    response_metadata (prompt_token_count / candidates_token_count) for older
+    langchain-google-vertexai versions. Returns zeros if neither is present
+    so token tracking can never break the pipeline.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        return {
+            "input_tokens":  int(usage.get("input_tokens", 0)),
+            "output_tokens": int(usage.get("output_tokens", 0)),
+        }
+    raw = (getattr(response, "response_metadata", {}) or {}).get("usage_metadata", {}) or {}
+    return {
+        "input_tokens":  int(raw.get("prompt_token_count", 0)),
+        "output_tokens": int(raw.get("candidates_token_count", 0)),
+    }
+
+
+def _record_usage(state: AgentState, node_name: str, response: Any) -> dict:
+    """
+    Return a partial-state update appending this call's token usage to
+    state['token_usage_log']. Merge into each LLM node's return dict:
+
+        return {**state, "planner_output": parsed,
+                **_record_usage(state, "Planner", response)}
+
+    Only successful responses reach this helper (it runs after
+    _invoke_with_retry returns), so failed attempts are never counted.
+    Records are tagged with the current issue key so per-issue usage can be
+    computed by filtering the log — no reset-on-issue-advance hook needed.
+    """
+    usage = _extract_usage(response)
+    record: TokenUsageRecord = {
+        "issue_key": state.get("current_issue", {}).get("key", ""),
+        "node": node_name,
+        **usage,
+    }
+    logger.info(
+        f"[{node_name}] tokens: in={usage['input_tokens']} out={usage['output_tokens']}"
+    )
+    return {"token_usage_log": [*state.get("token_usage_log", []), record]}
 
 
 # ── JSON parsing helper ───────────────────────────────────────────────────────
@@ -744,7 +797,8 @@ def plan_fix(state: AgentState) -> AgentState:
         f"strategy_preview={parsed['strategy'][:80]!r}"
     )
 
-    return {**state, "planner_output": parsed}
+    return {**state, "planner_output": parsed,
+            **_record_usage(state, "Planner", response)}
 
 
 # ── LLM·2  Generator ─────────────────────────────────────────────────────────
@@ -902,7 +956,8 @@ def generate_fix(state: AgentState) -> AgentState:
         f"changed_methods={parsed['changed_methods']}"
     )
 
-    return {**state, "generator_output": parsed}
+    return {**state, "generator_output": parsed,
+            **_record_usage(state, "Generator", response)}
 
 
 # ── LLM·3  Critic ─────────────────────────────────────────────────────────────
@@ -1107,7 +1162,8 @@ def critique_fix(state: AgentState) -> AgentState:
             f"(delta={delta:+.2f}, approved={approved}, concerns={concern_count})"
         )
 
-    return {**state, "critic_output": parsed, "planner_output": planner_out}
+    return {**state, "critic_output": parsed, "planner_output": planner_out,
+            **_record_usage(state, "Critic", response)}
 
 
 # ── File helpers ──────────────────────────────────────────────────────────────

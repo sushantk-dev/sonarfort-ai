@@ -409,6 +409,10 @@
 
         <div class="run-card__foot">
           <span>{{ doneCnt(run) }} / {{ run.steps.length }} steps</span>
+          <span *ngIf="run.tokens" class="run-card__tokens"
+                title="LLM tokens — input {{ run.tokens.input }} / output {{ run.tokens.output }}">
+            {{ fmtTokens(run.tokens.input) }}/{{ fmtTokens(run.tokens.output) }} tok
+          </span>
           <span *ngIf="run.request" class="run-card__repo" [title]="run.request.repo_url">
             {{ run.request.repo_url | slice:run.request.repo_url.lastIndexOf('/')+1 }}
           </span>
@@ -538,6 +542,16 @@
               {{ run.confidence ?? '—' }}
             </div>
             <div class="stat-strip__lbl">Confidence</div>
+          </div>
+          <div class="stat-strip__divider"></div>
+          <div class="stat-strip__item">
+            <div class="stat-strip__val stat-strip__val--tokens">
+              <ng-container *ngIf="run.tokens; else noTokens">
+                {{ fmtTokens(run.tokens.input) }}<span class="stat-strip__tok-sep">/</span>{{ fmtTokens(run.tokens.output) }}
+              </ng-container>
+              <ng-template #noTokens>—</ng-template>
+            </div>
+            <div class="stat-strip__lbl">Tokens in / out</div>
           </div>
           <div class="stat-strip__divider"></div>
           <div class="stat-strip__item">

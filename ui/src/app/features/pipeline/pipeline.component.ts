@@ -126,6 +126,7 @@ export class PipelineComponent {
 
   doneCnt(run: UiRun)      { return this.state.doneCnt(run); }
   confClass(c: any)        { return this.state.confClass(c); }
+  fmtTokens(n?: number)    { return this.state.fmtTokens(n); }
   outcomeIcon(o?: string)  { return this.state.outcomeIcon(o); }
   outcomeTitle(o?: string) { return this.state.outcomeTitle(o); }
 

@@ -388,6 +388,20 @@
       &.medium { color: var(--status-warning); }
       &.low    { color: var(--status-danger); }
     }
+
+    // "1.2k/0.3k" runs wider than a bare number — drop size, go mono
+    &--tokens {
+      font-size: 17px;
+      font-family: var(--font-mono);
+      letter-spacing: -0.3px;
+      padding-top: 3px;   // optically align with the taller 22px siblings
+    }
+  }
+
+  &__tok-sep {
+    color: var(--text-muted);
+    font-weight: 400;
+    margin: 0 3px;
   }
 
   &__lbl {
@@ -1162,6 +1176,15 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+// ── Run card token badge — "1.2k/0.3k tok" ────────────────────────────────
+.run-card__tokens {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 

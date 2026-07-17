@@ -92,6 +92,14 @@ class SonarRuleDetail(TypedDict, total=False):
     fix_summary: str         # Extracted plain-text fix guidance (Claude-distilled)
 
 
+class TokenUsageRecord(TypedDict):
+    """One LLM call's token consumption. Appended per call (incl. retries)."""
+    issue_key: str
+    node: str              # "Planner" | "Generator" | "Critic"
+    input_tokens: int
+    output_tokens: int
+
+
 class IssueResult(TypedDict):
     """Per-issue outcome stored in pipeline_results list."""
     issue_key: str
@@ -105,6 +113,7 @@ class IssueResult(TypedDict):
     confidence: float
     sonar_rescan_ok: Optional[bool]
     error: Optional[str]
+    token_usage: Optional[dict]   # {input_tokens, output_tokens} summed for this issue
 
 
 class AgentState(TypedDict, total=False):
@@ -158,6 +167,9 @@ class AgentState(TypedDict, total=False):
     # ── Pipeline metadata ─────────────────────────────────────────────────────
     errors: list[str]               # Accumulated non-fatal errors / warnings
     done: bool                      # Signals terminal state to the graph
+
+    # ── Token tracking ────────────────────────────────────────────────────────
+    token_usage_log: list[TokenUsageRecord]   # One record per LLM call (incl. retries)
 
     # ── Multi-issue tracking (Iteration 2) ────────────────────────────────────
     pipeline_results: list[IssueResult]   # Accumulated results across all issues
