@@ -37,6 +37,7 @@ export interface IssueResult {
   confidence:      number;
   sonar_rescan_ok: boolean | null;
   error:           string | null;
+  token_usage?:    { input_tokens: number; output_tokens: number } | null;
 }
 
 export interface RunStatus {
@@ -46,6 +47,7 @@ export interface RunStatus {
   results:     IssueResult[];
   error:       string | null;
   elapsed_ms?: number;
+  token_usage?: { input_tokens: number; output_tokens: number };
 }
 
 export interface ApiIssue {

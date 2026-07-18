@@ -187,6 +187,22 @@ def deliver(state: AgentState) -> AgentState:
 
 # ── IssueResult helpers ───────────────────────────────────────────────────────
 
+def _issue_token_usage(state: AgentState, issue_key: str) -> dict:
+    """
+    Sum input/output tokens for one issue by filtering the run-wide
+    token_usage_log (populated by agents.py). Includes retries, since each
+    retry appends its own Generator/Critic record.
+    """
+    records = [
+        r for r in state.get("token_usage_log", [])
+        if r.get("issue_key") == issue_key
+    ]
+    return {
+        "input_tokens":  sum(r.get("input_tokens", 0)  for r in records),
+        "output_tokens": sum(r.get("output_tokens", 0) for r in records),
+    }
+
+
 def _make_issue_result(
     issue: dict,
     state: AgentState,
@@ -209,6 +225,7 @@ def _make_issue_result(
         "confidence": confidence,
         "sonar_rescan_ok": sonar_rescan_ok,
         "error": error,
+        "token_usage": _issue_token_usage(state, issue.get("key", "")),
     }
 
 

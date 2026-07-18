@@ -42,6 +42,11 @@ from loguru import logger
 
 from state import AgentState, AiReasoningResult
 
+try:  # flat layout (token_tracker.py at repo root, next to state.py)
+    from token_tracker import token_tracker
+except ImportError:  # package layout
+    from agents.token_tracker import token_tracker  # type: ignore
+
 # ── Confidence score mapping ──────────────────────────────────────────────────
 # Maps the LLM's categorical confidence string to a normalised 0-1 float.
 # These values drive confLabel() thresholds in the frontend (≥0.8 HIGH, ≥0.5 MEDIUM).
@@ -346,10 +351,14 @@ def reason_about_upgrade(
     try:
         response = llm.invoke(messages)
         latency = time.time() - t0
+        usage = token_tracker.record(
+            "ai-reasoning", response, model=getattr(llm, "model_name", None),
+        )
         raw_text = response.content if hasattr(response, "content") else str(response)
         logger.info(
             f"[AI Reasoning] LLM call complete "
-            f"({latency:.1f}s, {len(raw_text)} chars)"
+            f"({latency:.1f}s, {len(raw_text)} chars, "
+            f"{usage['input_tokens']}→{usage['output_tokens']} tokens)"
         )
     except Exception as exc:
         logger.warning(

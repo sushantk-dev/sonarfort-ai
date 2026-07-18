@@ -74,6 +74,7 @@ export interface UiRun {
   prUrls?:            string[];   // all PRs — Fortify can fix multiple deps per run
   ragHits?:           number;
   retries?:           number;
+  tokens?:            { input: number; output: number };   // LLM token consumption (in/out)
   live:               boolean;
   status?:            'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'empty';
   request?:           RunRequest;
@@ -686,6 +687,7 @@ export class PipelineStateService {
         ruleKey:           first?.rule_key  ? first.rule_key  : r.ruleKey,
         severity:          first?.severity  ? first.severity  : r.severity,
         component:         first?.file_path ? first.file_path : r.component,
+        tokens:            this._mapTokens(status.token_usage ?? first?.token_usage) ?? r.tokens,
         startedAt:         r.startedAt ?? Date.now(),
       };
 
@@ -728,6 +730,7 @@ export class PipelineStateService {
       outcome:           r.outcome,
       confidence:        this.confLabel(r.confidence),
       confidencePercent: this.confPercent(r.confidence),
+      tokens:            this._mapTokens(r.token_usage),
       prUrl:             r.pr_url ?? undefined,
       steps:             status.steps ?? [],
       live:              true,
@@ -757,6 +760,7 @@ export class PipelineStateService {
       confidence:        confLabel,
       confidencePercent: confPercent,
       prUrl:             first?.pr_url    ?? undefined,
+      tokens:            this._mapTokens(r.token_usage ?? first?.token_usage),
       steps,
       live:              false,
       status:            r.status ?? 'done',
@@ -789,6 +793,23 @@ export class PipelineStateService {
   select(run: UiRun)   { this.selected.set(run); }
   doneCnt(run: UiRun)  { return run.steps.filter(s => s.status === 'done').length; }
   confClass(c: ConfLabel | string | undefined) { return (c ?? '').toLowerCase(); }
+
+  // ── Token helpers ─────────────────────────────────────────────────────────
+
+  /** Map backend {input_tokens, output_tokens} → UiRun.tokens, or undefined. */
+  private _mapTokens(tu: any): { input: number; output: number } | undefined {
+    if (!tu) return undefined;
+    const input  = Number(tu.input_tokens  ?? 0);
+    const output = Number(tu.output_tokens ?? 0);
+    if (!input && !output) return undefined;   // nothing recorded → UI shows '—'
+    return { input, output };
+  }
+
+  /** 1234 → "1.2k", 987 → "987", undefined → "—". */
+  fmtTokens(n?: number): string {
+    if (n == null) return '—';
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
 
   outcomeIcon(o?: string) {
     return { pr_opened:'✓', draft_pr:'~', escalated:'!', error:'✕', cancelled:'◼', empty:'—' }[o ?? ''] ?? '?';

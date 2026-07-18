@@ -300,13 +300,25 @@ def _run_job(job: dict) -> None:
                 s["status"] = "done"
 
         results: list[dict] = final_state.get("pipeline_results", [])
+
+        # ── Run-level token totals (summed across all LLM calls, incl. retries)
+        usage_log: list[dict] = final_state.get("token_usage_log", [])
+        token_usage = {
+            "input_tokens":  sum(r.get("input_tokens", 0)  for r in usage_log),
+            "output_tokens": sum(r.get("output_tokens", 0) for r in usage_log),
+        }
+
         _update_run(run_id, {
-            "status":     "done",
-            "results":    results,
-            "elapsed_ms": elapsed_ms,
-            "steps":      steps,
+            "status":      "done",
+            "results":     results,
+            "elapsed_ms":  elapsed_ms,
+            "steps":       steps,
+            "token_usage": token_usage,
         })
-        logger.info(f"[Worker] Run {run_id} done in {elapsed_ms}ms — {len(results)} result(s)")
+        logger.info(
+            f"[Worker] Run {run_id} done in {elapsed_ms}ms — {len(results)} result(s), "
+            f"tokens in={token_usage['input_tokens']} out={token_usage['output_tokens']}"
+        )
 
         # Upload local escalation files → GCS
         try:

@@ -37,6 +37,11 @@ from loguru import logger
 
 from state import AgentState
 
+try:  # flat layout (token_tracker.py at repo root, next to state.py)
+    from token_tracker import token_tracker
+except ImportError:  # package layout
+    from agents.token_tracker import token_tracker  # type: ignore
+
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
@@ -106,8 +111,14 @@ def _call_llm(prompt_vars: dict, llm) -> Optional[dict]:
         t0 = time.time()
         response = llm.invoke(messages)
         latency = time.time() - t0
+        usage = token_tracker.record(
+            "ai-code-fix", response, model=getattr(llm, "model_name", None),
+        )
         raw = response.content if hasattr(response, "content") else str(response)
-        logger.debug(f"[AI Code Fix] LLM responded in {latency:.1f}s")
+        logger.debug(
+            f"[AI Code Fix] LLM responded in {latency:.1f}s "
+            f"({usage['input_tokens']}→{usage['output_tokens']} tokens)"
+        )
 
         # Strip markdown fences
         raw = re.sub(r"```(?:json)?", "", raw).strip()
