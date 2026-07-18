@@ -55,6 +55,18 @@ interface StageInfo {
   output_summary?:  Record<string, any>;
 }
 
+interface TokenStageUsage {
+  calls:         number;
+  input_tokens:  number;
+  output_tokens: number;
+  total_tokens:  number;
+}
+
+interface TokenUsage extends TokenStageUsage {
+  models?: Record<string, number>;
+  stages?: Record<string, TokenStageUsage>;
+}
+
 interface PipelineResult {
   total_fixed?:     number;
   total_escalated?: number;
@@ -64,6 +76,7 @@ interface PipelineResult {
   groups?:          DepGroup[];
   adr_results?:     AdrEntry[];
   pr_results?:      PrResult[];
+  token_usage?:     TokenUsage;
   summary?: {
     total_fixed?:     number;
     total_escalated?: number;
@@ -90,6 +103,13 @@ const STAGE_LABELS: Record<string, string> = {
   'adr-fix':           'ADR Fix',
   'pr-agent':          'PR Agent',
   'fortify-writeback': 'Fortify Writeback',
+};
+
+// Labels for stages appearing in token_usage.stages — superset of the job
+// stages because AI Code Fix records tokens but is not a job-store stage.
+const TOKEN_STAGE_LABELS: Record<string, string> = {
+  ...STAGE_LABELS,
+  'ai-code-fix': 'AI Code Fix',
 };
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -222,6 +242,22 @@ const STAGE_LABELS: Record<string, string> = {
                 <span class="stat-card__value-sub" *ngIf="avgConfidence() !== '—'">
                   {{ avgConfidenceScore() }}
                 </span>
+              </span>
+            </div>
+          </div>
+
+          <div class="stat-card stat-card--tokens" *ngIf="tokenUsage()">
+            <div class="stat-card__icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 1.5L9.6 6.4L14.5 8L9.6 9.6L8 14.5L6.4 9.6L1.5 8L6.4 6.4L8 1.5Z"
+                      stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <div class="stat-card__body">
+              <span class="stat-card__label">LLM tokens</span>
+              <span class="stat-card__value">
+                {{ formatTokens(tokenUsage()!.total_tokens) }}
+                <span class="stat-card__value-sub">{{ tokenUsage()!.calls }} call{{ tokenUsage()!.calls === 1 ? '' : 's' }}</span>
               </span>
             </div>
           </div>
@@ -448,6 +484,37 @@ const STAGE_LABELS: Record<string, string> = {
               <span class="stage-pill__elapsed" *ngIf="stage.elapsed">{{ stage.elapsed }}s</span>
             </div>
           </div>
+
+          <!-- ── LLM token usage breakdown ─────────────────────────────── -->
+          <div class="token-panel" *ngIf="tokenUsage() && tokenStageRows().length > 0">
+            <div class="token-panel__head">
+              <span class="token-panel__title">LLM token usage</span>
+              <span class="token-panel__models" *ngIf="tokenModelNames()">{{ tokenModelNames() }}</span>
+            </div>
+            <div class="token-table">
+              <div class="token-table__head">
+                <span>Stage</span>
+                <span class="num">Calls</span>
+                <span class="num">Input</span>
+                <span class="num">Output</span>
+                <span class="num">Total</span>
+              </div>
+              <div class="token-table__row" *ngFor="let r of tokenStageRows()">
+                <span>{{ r.label }}</span>
+                <span class="num">{{ r.calls }}</span>
+                <span class="num">{{ formatTokens(r.input_tokens) }}</span>
+                <span class="num">{{ formatTokens(r.output_tokens) }}</span>
+                <span class="num token-table__total">{{ formatTokens(r.total_tokens) }}</span>
+              </div>
+              <div class="token-table__row token-table__row--sum">
+                <span>Total</span>
+                <span class="num">{{ tokenUsage()!.calls }}</span>
+                <span class="num">{{ formatTokens(tokenUsage()!.input_tokens) }}</span>
+                <span class="num">{{ formatTokens(tokenUsage()!.output_tokens) }}</span>
+                <span class="num token-table__total">{{ formatTokens(tokenUsage()!.total_tokens) }}</span>
+              </div>
+            </div>
+          </div>
         </ng-container>
 
       </ng-container>
@@ -538,7 +605,7 @@ const STAGE_LABELS: Record<string, string> = {
     /* Stat grid */
     .stat-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(142px, 1fr));
       gap: 10px;
       margin-bottom: 20px;
     }
@@ -562,6 +629,9 @@ const STAGE_LABELS: Record<string, string> = {
     .stat-card--escalated .stat-card__icon { background: #FAEEDA22; color: #854F0B; }
     .stat-card--failed   .stat-card__icon { background: #FCEBEB22; color: #A32D2D; }
     .stat-card--total    .stat-card__icon { background: #E6F1FB22; color: #185FA5; }
+    .stat-card__body {
+      min-width: 0; /* allow shrink inside flex — prevents clipped labels/values */
+    }
     .stat-card__label {
       display: block;
       font-size: 12px;
@@ -770,6 +840,10 @@ const STAGE_LABELS: Record<string, string> = {
       align-items: flex-start;
       gap: 1px;
       min-width: 0;
+      font-size: 16px;      /* word value, not a number — 22px overflows the card */
+      line-height: 1.25;
+      padding-top: 2px;
+      letter-spacing: 0.02em;
     }
     .stat-card__value-sub {
       font-size: 12px;
@@ -885,6 +959,59 @@ const STAGE_LABELS: Record<string, string> = {
     .stage-pill--pending { color: var(--text-muted); opacity: 0.6; }
     .stage-pill__label { font-weight: 500; }
     .stage-pill__elapsed { font-size: 11px; color: var(--text-muted); margin-left: 2px; }
+
+    /* Token usage panel */
+    .token-panel {
+      margin-top: 18px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-2);
+      overflow: hidden;
+    }
+    .token-panel__head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .token-panel__title {
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .token-panel__models {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: monospace;
+    }
+    .token-table {
+      font-size: 12px;
+    }
+    .token-table__head,
+    .token-table__row {
+      display: grid;
+      grid-template-columns: 1fr 64px 84px 84px 84px;
+      gap: 8px;
+      padding: 7px 14px;
+      align-items: center;
+    }
+    .token-table__head {
+      color: var(--text-muted);
+      font-size: 11px;
+      border-bottom: 1px solid var(--border);
+    }
+    .token-table__row + .token-table__row {
+      border-top: 1px solid var(--border);
+    }
+    .token-table__row--sum {
+      font-weight: 600;
+      background: var(--surface-1, transparent);
+    }
+    .token-table .num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .token-table__total { font-weight: 500; }
   `]
 })
 export class SummaryReportComponent implements OnInit {
@@ -1060,6 +1187,29 @@ export class SummaryReportComponent implements OnInit {
     ?? dep.version_candidates?.candidates?.[0]
     ?? dep.ai_reasoning?.recommended_version
     ?? '—';
+
+  // ── Token usage helpers ───────────────────────────────────────────────────
+
+  tokenUsage = (): TokenUsage | null =>
+    this.status()?.result?.token_usage ?? null;
+
+  tokenStageRows = (): (TokenStageUsage & { label: string })[] => {
+    const stages = this.tokenUsage()?.stages ?? {};
+    return Object.entries(stages).map(([key, s]) => ({
+      label: TOKEN_STAGE_LABELS[key] ?? key,
+      ...s,
+    }));
+  };
+
+  tokenModelNames = (): string =>
+    Object.keys(this.tokenUsage()?.models ?? {}).join(', ');
+
+  formatTokens = (n: number | undefined | null): string => {
+    if (n == null) return '—';
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
+    return `${n}`;
+  };
 
   formatSeconds = (s: number): string => {
     if (s < 60) return `${Math.round(s)}s`;
