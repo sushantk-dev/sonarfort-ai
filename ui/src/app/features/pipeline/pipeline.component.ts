@@ -111,12 +111,35 @@ export class PipelineComponent {
 
   /** Runs filtered to the active source tab — Sonar or Fortify */
   filteredRuns(): UiRun[] {
-    const src = this.activeSource();
+    return this._runsFor(this.activeSource());
+  }
+
+  private _runsFor(src: 'sonar' | 'fortify'): UiRun[] {
     return this.state.allRuns.filter(r =>
       src === 'sonar'
         ? (r.source === 'sonar' || !r.source)   // legacy runs without source field = Sonar
         : r.source === 'fortify'
     );
+  }
+
+  /**
+   * Switch the active source tab and re-sync the detail panel selection.
+   * `state.selected()` is shared across both tabs, so without this a run
+   * selected under one tab (e.g. the last Fortify run) stays shown in the
+   * detail panel after switching to the other tab, even though the run
+   * list below no longer includes it.
+   */
+  switchSource(src: 'sonar' | 'fortify') {
+    this.activeSource.set(src);
+    this.showForm.set(false);
+    this.showFortifyForm.set(false);
+    this.showInput.set(false);
+
+    const current = this.state.selected();
+    const stillVisible = !!current && this._runsFor(src).some(r => r.id === current.id);
+    if (!stillVisible) {
+      this.state.selected.set(this._runsFor(src)[0] ?? null);
+    }
   }
 
   select(run: UiRun) {
