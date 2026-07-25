@@ -740,6 +740,10 @@ class ConfigUpdateRequest(BaseModel):
     sonar_host_url:              Optional[str]   = None
     fortify_host_url:            Optional[str]   = None
     adr_output_dir:              Optional[str]   = None
+    # Fortify OAuth credentials (used to fetch/refresh the Bearer token)
+    fortify_username:             Optional[str]   = None
+    fortify_password:             Optional[str]   = None
+    fortify_scope:                Optional[str]   = None
     # Tokens — write-only; reading returns "***" if set, "" if empty
     github_token:                Optional[str]   = None
     sonar_token:                 Optional[str]   = None
@@ -779,6 +783,10 @@ def get_config():
         "sonar_host_url":              getattr(cfg, "sonar_host_url", ""),
         "fortify_host_url":            cfg.fortify_base_url,
         "adr_output_dir":              cfg.adr_output_dir,
+        # Fortify OAuth credentials — username/scope are not secret, password is masked
+        "fortify_username":            cfg.fortify_username,
+        "fortify_password":            _mask(cfg.fortify_password),
+        "fortify_scope":               cfg.fortify_scope,
         # Tokens — masked
         "github_token":                _mask(cfg.github_token),
         "sonar_token":                 _mask(getattr(cfg, "sonar_token", "")),
@@ -823,6 +831,9 @@ def save_config(req: ConfigUpdateRequest):
         "sonar_host_url":              "SONAR_HOST_URL",
         "fortify_host_url":            "FORTIFY_BASE_URL",
         "adr_output_dir":              "ADR_OUTPUT_DIR",
+        "fortify_username":            "FORTIFY_USERNAME",
+        "fortify_password":            "FORTIFY_PASSWORD",
+        "fortify_scope":               "FORTIFY_SCOPE",
         "github_token":                "GITHUB_TOKEN",
         "sonar_token":                 "SONAR_TOKEN",
         "fortify_token":               "FORTIFY_API_TOKEN",
@@ -833,8 +844,8 @@ def save_config(req: ConfigUpdateRequest):
         val = getattr(req, field, None)
         if val is None:
             continue
-        # For token fields: skip if empty string (keep existing value)
-        if field in ("github_token", "sonar_token", "fortify_token") and not str(val):
+        # For secret fields: skip if empty string (keep existing value)
+        if field in ("github_token", "sonar_token", "fortify_token", "fortify_password") and not str(val):
             continue
         updates[env_key] = str(val)
 

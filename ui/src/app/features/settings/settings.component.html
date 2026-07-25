@@ -296,6 +296,59 @@
               </span>
             </div>
 
+            <!-- ── Fortify Username ── -->
+            <div class="field">
+              <label class="field__label">Username</label>
+              <input class="input"
+                     [value]="cfg.fortifyUsername"
+                     (input)="patch('fortifyUsername', $any($event.target).value)"
+                     placeholder="domain\\username"
+                     autocomplete="username">
+              <span class="field__hint">
+                Fortify login username — used with password below to obtain/refresh
+                the Bearer token via OAuth
+              </span>
+            </div>
+
+            <!-- ── Fortify Password ── -->
+            <div class="field">
+              <label class="field__label">Password</label>
+              <div class="token-set" *ngIf="tokenStatus.fortifyPassword && !isEditing('fortifyPassword')">
+                <div class="token-set__mask">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                    <rect x="1" y="5" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                    <path d="M3.5 5V3.5a2.5 2.5 0 015 0V5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                  </svg>
+                  ••••••••••••••••
+                </div>
+                <div class="token-set__actions">
+                  <button class="token-btn token-btn--change" (click)="startEditing('fortifyPassword')">Change</button>
+                </div>
+              </div>
+              <div *ngIf="!tokenStatus.fortifyPassword || isEditing('fortifyPassword')" class="token-input-wrap">
+                <input class="input" type="password"
+                       [value]="cfg.fortifyPassword"
+                       (input)="patch('fortifyPassword', $any($event.target).value)"
+                       [placeholder]="tokenStatus.fortifyPassword ? 'Enter new password to replace…' : '••••••••'"
+                       autocomplete="new-password">
+                <button *ngIf="isEditing('fortifyPassword')" class="token-btn token-btn--cancel"
+                        (click)="cancelEditing('fortifyPassword')">Cancel</button>
+              </div>
+            </div>
+
+            <!-- ── Fortify OAuth Scope (api-tenant) ── -->
+            <div class="field">
+              <label class="field__label">API Tenant / Scope</label>
+              <input class="input"
+                     [value]="cfg.fortifyScope"
+                     (input)="patch('fortifyScope', $any($event.target).value)"
+                     placeholder="api-tenant">
+              <span class="field__hint">
+                OAuth <code>scope</code> sent to <code>/oauth/token</code> — identifies the
+                Fortify tenant (default: <code>api-tenant</code>)
+              </span>
+            </div>
+
             <!-- ── OAuth refresh token ── -->
             <div class="field">
               <label class="field__label">Refresh Token via OAuth
@@ -305,8 +358,9 @@
               <!-- Collapsed: show refresh button when credentials already set -->
               <div class="oauth-bar" *ngIf="!showOAuthForm()">
                 <div class="oauth-bar__hint">
-                  Use your Fortify username and password to fetch a fresh Bearer token
-                  automatically — applied to <code>FORTIFY_API_TOKEN</code> in server environment
+                  Use your saved Fortify username and password above to fetch a fresh
+                  Bearer token on demand — applied to <code>FORTIFY_API_TOKEN</code> in
+                  server environment
                 </div>
                 <button class="oauth-btn" (click)="showOAuthForm.set(true)">
                   <svg width="12" height="12" viewBox="0 0 14 14" fill="none">

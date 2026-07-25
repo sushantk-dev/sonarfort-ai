@@ -107,6 +107,9 @@ export interface BackendConfig {
   sonar_host_url:              string;
   fortify_api_token:               string;
   fortify_host_url:            string;
+  fortify_username:            string;
+  fortify_password:            string;
+  fortify_scope:               string;
   planner_temperature:         number;
   generator_temperature:       number;
   max_critic_retries:          number;

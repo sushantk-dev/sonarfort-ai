@@ -19,6 +19,9 @@ export interface AppConfig {
   sonarOrg:       string;
   fortifyApiToken:   string;
   fortifyHostUrl: string;
+  fortifyUsername: string;
+  fortifyPassword: string;
+  fortifyScope:    string;
   plannerTemp:    number;
   generatorTemp:  number;
   maxRetries:     number;
@@ -50,6 +53,7 @@ export interface TokenStatus {
   githubToken:  boolean;   // true = set in .env
   sonarToken:   boolean;
   fortifyApiToken: boolean;
+  fortifyPassword: boolean;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -71,6 +75,9 @@ export class SettingsStateService {
     sonarOrg:       'https://sonarcloud.io',
     fortifyApiToken:   '',
     fortifyHostUrl: 'https://api.ams.fortify.com',
+    fortifyUsername: '',
+    fortifyPassword: '',
+    fortifyScope:    'api-tenant',
     plannerTemp:    0.1,
     generatorTemp:  0.3,
     maxRetries:     1,
@@ -85,6 +92,7 @@ export class SettingsStateService {
     githubToken:  false,
     sonarToken:   false,
     fortifyApiToken: false,
+    fortifyPassword: false,
   });
 
   // Track which token fields the user is actively editing
@@ -174,12 +182,16 @@ export class SettingsStateService {
           this.tokenStatus.update(ts => ({
             ...ts,
             fortifyApiToken: fortifyRemote.fortify_token === '***',
+            fortifyPassword: fortifyRemote.fortify_password === '***',
           }));
 
           this.cfg.update(c => ({
             ...c,
             fortifyHostUrl: fortifyRemote.fortify_host_url || c.fortifyHostUrl,
+            fortifyUsername: fortifyRemote.fortify_username || c.fortifyUsername,
+            fortifyScope:   fortifyRemote.fortify_scope     || c.fortifyScope,
             fortifyApiToken: '',
+            fortifyPassword: '',
           }));
         }
 
@@ -265,6 +277,18 @@ export class SettingsStateService {
     if (c.fortifyHostUrl) {
       fortifyPayload['fortify_host_url'] = c.fortifyHostUrl;
     }
+    // Username and scope aren't secrets — send whenever they have a value
+    if (c.fortifyUsername) {
+      fortifyPayload['fortify_username'] = c.fortifyUsername;
+    }
+    if (c.fortifyScope) {
+      fortifyPayload['fortify_scope'] = c.fortifyScope;
+    }
+    // Password follows the same masked "Change" flow as the other secrets
+    const sendFortifyPassword = editing.has('fortifyPassword') || (!this.tokenStatus().fortifyPassword && c.fortifyPassword);
+    if (sendFortifyPassword) {
+      fortifyPayload['fortify_password'] = c.fortifyPassword;
+    }
 
     // Apply host to ApiConfigService immediately — no backend round-trip needed
     this.apiCfg.apply(c.apiHost);
@@ -282,11 +306,12 @@ export class SettingsStateService {
           ...(payload['github_token']  !== undefined ? { githubToken:  !!c.githubToken  } : {}),
           ...(payload['sonar_token']   !== undefined ? { sonarToken:   !!c.sonarToken   } : {}),
           ...(fortifyPayload['fortify_api_token'] !== undefined ? { fortifyApiToken: !!c.fortifyApiToken } : {}),
+          ...(fortifyPayload['fortify_password']  !== undefined ? { fortifyPassword: !!c.fortifyPassword } : {}),
         }));
 
         // Clear editing state and token values after save
         this.editingTokens.set(new Set());
-        this.cfg.update(cc => ({ ...cc, githubToken: '', sonarToken: '', fortifyApiToken: '' }));
+        this.cfg.update(cc => ({ ...cc, githubToken: '', sonarToken: '', fortifyApiToken: '', fortifyPassword: '' }));
 
         this.saving.set(false);
         this.saved.set(true);
