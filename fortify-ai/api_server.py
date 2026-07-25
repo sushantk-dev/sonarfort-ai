@@ -12,8 +12,6 @@ Execution Modes:
     POST /pipeline/app-name        — Full pipeline, resolve app name → release
     POST /pipeline/app-id          — Full pipeline, resolve app_id → release
     POST /pipeline/dry-run         — Full pipeline, skips ADR/PR/writeback side-effects
-    POST /pipeline/resume/{pipeline_id} — Resume a failed/cancelled job from its last
-                                           checkpointed stage (same pipeline_id)
 
   PIPELINE STATUS
     GET  /pipeline/status/{pipeline_id}               — overall pipeline status + all stage statuses
@@ -69,12 +67,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from loguru import logger
 
 # ── Internal imports ──────────────────────────────────────────────────────────
 from config import FortifyAIConfig, load_config
 from job_store import create_job_store, ALL_STAGE_NAMES
-from token_tracker import token_tracker
 from runtime_config import apply_overrides, persist_overrides, is_persisted
 from state import AgentState
 
@@ -95,34 +91,6 @@ _store = create_job_store()
 _MAX_WORKERS = int(os.environ.get("MAX_PIPELINE_WORKERS", 8))
 _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="pipeline-worker")
 
-# ── Per-working-directory mutual exclusion ─────────────────────────────────────
-# Concurrent pipelines that resolve to the SAME on-disk project_path (i.e. no
-# `repo` was passed, so they all share the env-configured PROJECT_PATH rather
-# than each getting an isolated tempfile.mkdtemp() clone) would otherwise run
-# `context`'s file lookups, `api-diff`'s japicmp calls, and adr-fix's git
-# checkout/commit/push concurrently in the *same working tree* — a real race
-# that can corrupt the checkout. Runs against a `repo`-triggered clone never
-# contend here since each gets a unique temp directory as its lock key.
-#
-# NOTE: this is a process-local lock. It serializes concurrent runs within one
-# pod. If PROJECT_PATH points at storage shared across multiple pod replicas
-# (e.g. a network mount), it does NOT protect against a different pod running
-# the same path at the same time — that would need a distributed lock (e.g.
-# a GCS-object-based mutex, mirroring how job_store.py uses generation
-# preconditions). Not needed for the common case of one pod or repo-per-clone.
-_project_locks: dict[str, Lock] = {}
-_project_locks_guard = Lock()
-
-
-def _project_lock(project_path: str) -> Lock:
-    """Return (creating if needed) the lock for a resolved project_path."""
-    with _project_locks_guard:
-        lock = _project_locks.get(project_path)
-        if lock is None:
-            lock = Lock()
-            _project_locks[project_path] = lock
-        return lock
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -139,12 +107,6 @@ def _update_stage(pipeline_id: str, stage: str, **kwargs) -> None:
 
 def _finish_job(pipeline_id: str, status: str, result: dict | None = None,
                 error: str | None = None, t0: float | None = None) -> None:
-    # Attach LLM token consumption for this run to the persisted result so
-    # GET /pipeline/status/{id} reports it after completion. end_run() also
-    # unbinds the tracker from the worker thread.
-    usage = token_tracker.end_run(pipeline_id)
-    if isinstance(result, dict) and "token_usage" not in result:
-        result["token_usage"] = usage
     _store.finish_job(pipeline_id, status, result=result, error=error, t0=t0)
 
 
@@ -320,20 +282,6 @@ class DryRunRequest(BaseModel):
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
     )
-    config: ConfigOverrides = Field(default_factory=ConfigOverrides)
-
-
-class ResumeRequest(BaseModel):
-    """
-    Optional body for POST /pipeline/resume/{pipeline_id}.
-
-    Everything needed to resume (release_id, repo, report_path, dry_run, ...)
-    is already stored in the job's ``resume_meta`` from the original request.
-    ``config`` is only for refreshing secrets — the Fortify/GitHub tokens are
-    deliberately NOT persisted with the checkpoint, so pass them again here
-    if the original run relied on request-level overrides rather than
-    environment variables (e.g. a token that has since rotated).
-    """
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
 
@@ -573,25 +521,12 @@ def _run_full_pipeline(
     dry_run: bool = False,
     pipeline_id: str | None = None,
     max_upgrades: int = 0,
-    resume_checkpoint: dict | None = None,
 ) -> dict:
     """
     Execute the full pipeline and return a summary dict.
     When *pipeline_id* is supplied, each stage updates the shared job store so
-    callers can poll /pipeline/status/{pipeline_id} for live progress, and
-    each stage's JSON-serializable output is checkpointed to the job store
-    as it completes.
-
-    When *resume_checkpoint* is supplied (the dict previously returned by
-    ``_store.get_checkpoint``), stages whose output is already present in it
-    are skipped entirely and their checkpointed data is reused instead of
-    re-executing — this is what lets ``POST /pipeline/resume/{pipeline_id}``
-    continue a failed run from the point it stopped rather than from stage 1.
-    Side-effecting stages (adr-fix's git commits, pr-agent's PR creation) are
-    only ever run once because their results get checkpointed too.
+    callers can poll /pipeline/status/{pipeline_id} for live progress.
     """
-    if pipeline_id:
-        token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
     from agents.version_resolver import resolve_all_groups
@@ -602,11 +537,6 @@ def _run_full_pipeline(
     from agents.pr_agent import create_prs_for_all_groups
     from agents.fortify_writeback import run_all_reports
     from state import AdrResult
-
-    # Accumulated checkpoint — seeded from a prior run's checkpoint on resume,
-    # built up fresh otherwise. Each stage adds its own output key(s) and we
-    # persist the *entire* dict so far (not a delta) — see save_checkpoint.
-    ckpt: dict = dict(resume_checkpoint or {})
 
     def _stage_start(name: str) -> float:
         t = time.time()
@@ -634,208 +564,127 @@ def _run_full_pipeline(
         if pipeline_id:
             _update_stage(pipeline_id, name, status="skipped")
 
-    def _stage_resumed(name: str, summary: dict | None = None) -> None:
-        """Mark a stage completed without re-running it — its output came
-        from a checkpoint left by a previous (failed/cancelled) attempt."""
-        if pipeline_id:
-            _update_stage(pipeline_id, name,
-                          status="completed",
-                          finished_at=_now(),
-                          elapsed_seconds=0,
-                          output_summary={**(summary or {}), "resumed_from_checkpoint": True})
-
-    def _checkpoint(next_stage: str) -> None:
-        """Persist the checkpoint accumulated so far, tagged with the name
-        of the stage a resume should start at next."""
-        if pipeline_id:
-            ckpt["resume_stage"] = next_stage
-            _store.save_checkpoint(pipeline_id, **ckpt)
-
     project_path = Path(cfg.project_path) if cfg.project_path else Path(".")
     japicmp_path = cfg.japicmp_jar_path or "/nonexistent/japicmp.jar"
 
     # Stage 1 — triage
-    if "groups" in ckpt:
-        groups = ckpt["groups"]
-        triage_skipped = ckpt.get("triage_skipped", 0)
-        _stage_resumed("triage", {"total_groups": len(groups), "total_skipped": triage_skipped})
-    else:
-        _check_cancelled(pipeline_id)
-        t = _stage_start("triage")
-        groups, triage_skipped = group_by_dependency(raw_vulns)
-        groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
-        if not groups:
-            _stage_done("triage", t, {
-                "total_groups": 0, "groups_count": 0,
-                "total_skipped": triage_skipped,
-            })
-            for s in ["version-resolver", "context", "api-diff",
-                      "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback"]:
-                _stage_skip(s)
-            return {"status": "skipped", "reason": "No actionable findings"}
+    _check_cancelled(pipeline_id)
+    t = _stage_start("triage")
+    groups, triage_skipped = group_by_dependency(raw_vulns)
+    groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
+    if not groups:
         _stage_done("triage", t, {
-            "total_groups": len(groups), "groups_count": len(groups),
+            "total_groups": 0, "groups_count": 0,
             "total_skipped": triage_skipped,
         })
-        ckpt["groups"] = groups
-        ckpt["triage_skipped"] = triage_skipped
-        _checkpoint("version-resolver")
+        for s in ["version-resolver", "context", "api-diff",
+                  "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback"]:
+            _stage_skip(s)
+        return {"status": "skipped", "reason": "No actionable findings"}
+    _stage_done("triage", t, {
+        "total_groups": len(groups), "groups_count": len(groups),
+        "total_skipped": triage_skipped,
+    })
 
     # Stage 2 — version resolver
-    if "resolved" in ckpt:
-        resolved = ckpt["resolved"]
-        _stage_resumed("version-resolver", {"groups_count": len(resolved)})
-    else:
-        _check_cancelled(pipeline_id)
-        t = _stage_start("version-resolver")
-        resolved = resolve_all_groups(client, release_id, groups)
-        _stage_done("version-resolver", t, {"groups_count": len(resolved)})
-        ckpt["resolved"] = resolved
-        _checkpoint("context")
+    _check_cancelled(pipeline_id)
+    t = _stage_start("version-resolver")
+    resolved = resolve_all_groups(client, release_id, groups)
+    _stage_done("version-resolver", t, {"groups_count": len(resolved)})
 
-    # Stages 3–6 touch the on-disk project_path (context reads it, api-diff
-    # runs japicmp against it, adr-fix checks out/edits/commits/pushes in it)
-    # — serialize per-path so two pipelines sharing a non-cloned PROJECT_PATH
-    # can't race in the same working tree. See _project_lock's docstring.
-    _proj_key = str(project_path.resolve())
-    _lock = _project_lock(_proj_key)
-    if not _lock.acquire(blocking=False):
-        logger.info(f"[pipeline {pipeline_id}] waiting for project lock on {_proj_key} "
-                    f"(another run is using this working directory)")
-        _lock.acquire(blocking=True)
+    # Stage 3 — context
+    _check_cancelled(pipeline_id)
+    t = _stage_start("context")
+    context = locate_all_groups(project_path, resolved)
+    _stage_done("context", t, {"groups_count": len(context)})
+
+    # Stage 4 — api diff
+    _check_cancelled(pipeline_id)
+    t = _stage_start("api-diff")
+    diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
+    _stage_done("api-diff", t, {"groups_count": len(diffed)})
+
+    # Stage 5 — ai reasoning
+    _check_cancelled(pipeline_id)
+    t = _stage_start("ai-reasoning")
     try:
-        # Stage 3 — context
-        if "context" in ckpt:
-            context = ckpt["context"]
-            _stage_resumed("context", {"groups_count": len(context)})
-        else:
-            _check_cancelled(pipeline_id)
-            t = _stage_start("context")
-            context = locate_all_groups(project_path, resolved)
-            _stage_done("context", t, {"groups_count": len(context)})
-            ckpt["context"] = context
-            _checkpoint("api-diff")
+        reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
+    except Exception as exc:
+        # A fatal AI reasoning error (permission denied, auth, quota, etc.)
+        # must stop the pipeline — mark the stage failed (not left stuck at
+        # "running") and re-raise so the caller marks the whole job failed.
+        _stage_fail("ai-reasoning", t, str(exc))
+        raise
+    _stage_done("ai-reasoning", t, {
+        "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
+        "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+    })
 
-        # Stage 4 — api diff
-        if "diffed" in ckpt:
-            diffed = ckpt["diffed"]
-            _stage_resumed("api-diff", {"groups_count": len(diffed)})
-        else:
-            _check_cancelled(pipeline_id)
-            t = _stage_start("api-diff")
-            diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
-            _stage_done("api-diff", t, {"groups_count": len(diffed)})
-            ckpt["diffed"] = diffed
-            _checkpoint("ai-reasoning")
-
-        # Stage 5 — ai reasoning
-        if "reasoned" in ckpt:
-            reasoned = ckpt["reasoned"]
-            _stage_resumed("ai-reasoning", {
-                "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-                "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+    # Stage 6 — adr fix
+    _check_cancelled(pipeline_id)
+    t = _stage_start("adr-fix")
+    adr_results: list[dict] = []
+    for group in reasoned:
+        _check_cancelled(pipeline_id)  # stop before pushing the next commit
+        artifact_id = group["parsed"]["artifact_id"]
+        if group.get("next_node") == "escalate":
+            adr_results.append({
+                "artifact_id": artifact_id,
+                "result": AdrResult(
+                    success=False, branch_name=None, commit_hash=None,
+                    build_time_seconds=None, pdf_path=None,
+                    error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
+                ),
+            })
+            continue
+        if dry_run or not cfg.adr_path:
+            adr_results.append({
+                "artifact_id": artifact_id,
+                "result": AdrResult(
+                    success=False, branch_name=None, commit_hash=None,
+                    build_time_seconds=None, pdf_path=None,
+                    error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
+                ),
             })
         else:
-            _check_cancelled(pipeline_id)
-            t = _stage_start("ai-reasoning")
-            reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
-            _stage_done("ai-reasoning", t, {
-                "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-                "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
-            })
-            ckpt["reasoned"] = reasoned
-            _checkpoint("adr-fix")
-
-        # Stage 6 — adr fix
-        # Side-effecting (git commit/push) — only ever run once. If a prior
-        # attempt already checkpointed adr_results, reuse them rather than
-        # risking a duplicate commit for groups that already succeeded.
-        if "adr_results" in ckpt:
-            adr_results = ckpt["adr_results"]
-            _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-            _stage_resumed("adr-fix", {"fixed": _adr_ok, "total": len(adr_results)})
-        else:
-            _check_cancelled(pipeline_id)
-            t = _stage_start("adr-fix")
-            adr_results: list[dict] = []
-            for group in reasoned:
-                _check_cancelled(pipeline_id)  # stop before pushing the next commit
-                artifact_id = group["parsed"]["artifact_id"]
-                if group.get("next_node") == "escalate":
-                    adr_results.append({
-                        "artifact_id": artifact_id,
-                        "result": AdrResult(
-                            success=False, branch_name=None, commit_hash=None,
-                            build_time_seconds=None, pdf_path=None,
-                            error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
-                        ),
-                    })
-                    continue
-                if dry_run or not cfg.adr_path:
-                    adr_results.append({
-                        "artifact_id": artifact_id,
-                        "result": AdrResult(
-                            success=False, branch_name=None, commit_hash=None,
-                            build_time_seconds=None, pdf_path=None,
-                            error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
-                        ),
-                    })
-                else:
-                    result = run_adr_fix(
-                        group, adr_path=cfg.adr_path,
-                        project_path=str(project_path),
-                        jira_prefix=cfg.jira_id_prefix,
-                        release_id=release_id,
-                    )
-                    adr_results.append({"artifact_id": artifact_id, "result": result})
-            _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-            _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
-            ckpt["adr_results"] = adr_results
-            _checkpoint("pr-agent")
-    finally:
-        _lock.release()
+            result = run_adr_fix(
+                group, adr_path=cfg.adr_path,
+                project_path=str(project_path),
+                jira_prefix=cfg.jira_id_prefix,
+                release_id=release_id,
+            )
+            adr_results.append({"artifact_id": artifact_id, "result": result})
+    _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+    _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
 
     # Stage 7 — pr agent
-    # Also side-effecting (opens PRs) — same reuse-on-resume rule as adr-fix.
-    if "pr_results" in ckpt:
-        pr_results = ckpt["pr_results"]
-        _stage_resumed("pr-agent", {"prs_created": len(pr_results)})
+    _check_cancelled(pipeline_id)  # stop before opening PRs
+    pr_results = []
+    if not dry_run and cfg.github_token and cfg.github_repo:
+        t = _stage_start("pr-agent")
+        pr_results = create_prs_for_all_groups(
+            groups=reasoned, adr_results=adr_results,
+            release_id=release_id,
+            github_token=cfg.github_token,
+            github_repo=cfg.github_repo,
+            reviewers=cfg.get_reviewers(),
+        )
+        _stage_done("pr-agent", t, {"prs_created": len(pr_results)})
     else:
-        _check_cancelled(pipeline_id)  # stop before opening PRs
-        pr_results = []
-        if not dry_run and cfg.github_token and cfg.github_repo:
-            t = _stage_start("pr-agent")
-            pr_results = create_prs_for_all_groups(
-                groups=reasoned, adr_results=adr_results,
-                release_id=release_id,
-                github_token=cfg.github_token,
-                github_repo=cfg.github_repo,
-                reviewers=cfg.get_reviewers(),
-            )
-            _stage_done("pr-agent", t, {"prs_created": len(pr_results)})
-        else:
-            _stage_skip("pr-agent")
-        ckpt["pr_results"] = pr_results
-        _checkpoint("fortify-writeback")
+        _stage_skip("pr-agent")
 
     # Stage 8 — writeback + summary
-    if "summary" in ckpt:
-        summary = ckpt["summary"]
-        _stage_resumed("fortify-writeback", summary if isinstance(summary, dict) else None)
+    _check_cancelled(pipeline_id)
+    if not dry_run:
+        t = _stage_start("fortify-writeback")
+        summary = run_all_reports(
+            groups=reasoned, adr_results=adr_results,
+            pr_results=pr_results, output_dir=cfg.adr_output_dir,
+        )
+        _stage_done("fortify-writeback", t, summary)
     else:
-        _check_cancelled(pipeline_id)
-        if not dry_run:
-            t = _stage_start("fortify-writeback")
-            summary = run_all_reports(
-                groups=reasoned, adr_results=adr_results,
-                pr_results=pr_results, output_dir=cfg.adr_output_dir,
-            )
-            _stage_done("fortify-writeback", t, summary)
-        else:
-            _stage_skip("fortify-writeback")
-            summary = {"dry_run": True, "groups": len(reasoned)}
-        ckpt["summary"] = summary
-        _checkpoint("done")
+        _stage_skip("fortify-writeback")
+        summary = {"dry_run": True, "groups": len(reasoned)}
 
     return {
         "release_id":   release_id,
@@ -870,32 +719,8 @@ async def startup_event():
 
 @app.get("/health", tags=["Utility"])
 def health():
-    """Liveness probe — always returns 200 OK.
-
-    Also reports this pod's pipeline thread-pool load so `MAX_PIPELINE_WORKERS`
-    can be sized from real data: if `queued` is consistently > 0, concurrent
-    triggers are waiting on free workers and it's worth raising the env var
-    (or adding pod replicas, which requires GCS_BUCKET so job state is shared).
-    """
-    # ThreadPoolExecutor doesn't expose these as public API. Guarded because
-    # a liveness probe must never fail — if internals change across a Python
-    # version, we just omit the stats instead of breaking /health.
-    executor_stats: dict | None
-    try:
-        active = sum(1 for t in _EXECUTOR._threads if t.is_alive())
-        queued = _EXECUTOR._work_queue.qsize()
-        executor_stats = {
-            "max_workers": _MAX_WORKERS,
-            "active_workers": active,
-            "queued_tasks": queued,
-        }
-    except Exception:
-        executor_stats = None
-    return {
-        "ok": True,
-        "service": "FortifyAI API",
-        "executor": executor_stats,
-    }
+    """Liveness probe — always returns 200 OK."""
+    return {"ok": True, "service": "FortifyAI API"}
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -1196,11 +1021,6 @@ async def pipeline_live(req: LivePipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
-    _store.update_job(pid, resume_meta={
-        "endpoint": "live", "release_id": req.release_id, "report_path": None,
-        "app_name": None, "app_id": None, "repo": req.repo,
-        "max_upgrades": req.max_upgrades, "dry_run": False,
-    })
 
     async def _run():
         t0 = time.time()
@@ -1252,11 +1072,6 @@ async def pipeline_offline(req: OfflinePipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
-    _store.update_job(pid, resume_meta={
-        "endpoint": "offline", "release_id": req.release_id, "report_path": req.report_path,
-        "app_name": None, "app_id": None, "repo": req.repo,
-        "max_upgrades": req.max_upgrades, "dry_run": False,
-    })
 
     async def _run():
         t0 = time.time()
@@ -1319,11 +1134,6 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
-    _store.update_job(pid, resume_meta={
-        "endpoint": "app-name", "release_id": 0, "report_path": None,
-        "app_name": req.app_name, "app_id": None, "repo": req.repo,
-        "max_upgrades": req.max_upgrades, "dry_run": False,
-    })
 
     async def _run():
         t0 = time.time()
@@ -1383,11 +1193,6 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
-    _store.update_job(pid, resume_meta={
-        "endpoint": "app-id", "release_id": 0, "report_path": None,
-        "app_name": None, "app_id": req.app_id, "repo": req.repo,
-        "max_upgrades": req.max_upgrades, "dry_run": False,
-    })
 
     async def _run():
         t0 = time.time()
@@ -1441,11 +1246,6 @@ async def pipeline_dry_run(req: DryRunRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
-    _store.update_job(pid, resume_meta={
-        "endpoint": "dry-run", "release_id": req.release_id, "report_path": req.report_path,
-        "app_name": req.app_name, "app_id": getattr(req, "app_id", None), "repo": req.repo,
-        "max_upgrades": req.max_upgrades, "dry_run": True,
-    })
 
     async def _run():
         t0 = time.time()
@@ -1485,98 +1285,6 @@ async def pipeline_dry_run(req: DryRunRequest):
 
     asyncio.create_task(_run())
     return ok({"pipeline_id": pid, "status": "queued"})
-
-
-@app.post("/pipeline/resume/{pipeline_id}", tags=["Full Pipeline"])
-async def pipeline_resume(pipeline_id: str, req: ResumeRequest = ResumeRequest()):
-    """
-    Resume a **failed** or **cancelled** pipeline job from the last stage that
-    completed successfully, instead of starting over from stage 1.
-
-    Each stage's output is checkpointed to the job store as it finishes, so
-    this replays only the stage that failed onward. Side-effecting stages
-    (adr-fix's git commit/push, pr-agent's PR creation) are NOT re-executed
-    once they've completed — their checkpointed output is reused, so
-    resuming never creates a duplicate commit or PR for work that already
-    succeeded.
-
-    Reuses the *same* pipeline_id — poll GET /pipeline/status/{pipeline_id}
-    exactly as before.
-
-    Returns 404 if the pipeline_id is unknown, and 409 if the job isn't in a
-    resumable state (still running/queued/completed) or has no checkpoint to
-    resume from (it failed before completing even one stage — start a new
-    run instead).
-    """
-    job = _store.get_job(pipeline_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-
-    if job.get("status") not in ("failed", "cancelled"):
-        raise HTTPException(
-            status_code=409,
-            detail=(f"Job '{pipeline_id}' is '{job.get('status')}' — only 'failed' or "
-                    f"'cancelled' jobs can be resumed."),
-        )
-
-    meta = job.get("resume_meta")
-    checkpoint = _store.get_checkpoint(pipeline_id)
-    if not meta or not checkpoint:
-        raise HTTPException(
-            status_code=409,
-            detail=(f"Job '{pipeline_id}' has no checkpoint to resume from — it failed "
-                    f"before completing any stage (or predates resume support). "
-                    f"Start a new run instead."),
-        )
-
-    _store.update_job(pipeline_id, status="running", error=None,
-                      finished_at=None, cancel_requested=False)
-
-    async def _run():
-        t0 = time.time()
-        loop = asyncio.get_event_loop()
-        clone_dir: str | None = None
-        try:
-            cfg = _apply_overrides(load_config(), req.config)
-            cfg, clone_dir = await loop.run_in_executor(
-                _EXECUTOR,
-                lambda: _clone_repo_if_needed(cfg, meta.get("repo")),
-            )
-            client, raw_vulns, release_id, app_id = await loop.run_in_executor(
-                _EXECUTOR,
-                lambda: _resolve_vulnerabilities(
-                    cfg, meta.get("release_id", 0), meta.get("report_path"),
-                    meta.get("app_name"), meta.get("app_id"),
-                ),
-            )
-            result = await loop.run_in_executor(
-                _EXECUTOR,
-                lambda: _run_full_pipeline(
-                    cfg, client, raw_vulns, release_id,
-                    dry_run=meta.get("dry_run", False),
-                    max_upgrades=meta.get("max_upgrades", 0),
-                    pipeline_id=pipeline_id,
-                    resume_checkpoint=checkpoint,
-                ),
-            )
-            if meta.get("repo"):
-                result["repo"] = meta["repo"]
-            _finish_job(pipeline_id, "completed", result=result, t0=t0)
-        except PipelineCancelled:
-            _finish_job(pipeline_id, "cancelled", error="Cancelled by user", t0=t0)
-        except Exception as exc:
-            _finish_job(pipeline_id, "failed", error=str(exc), t0=t0)
-        finally:
-            if clone_dir:
-                import shutil
-                shutil.rmtree(clone_dir, ignore_errors=True)
-
-    asyncio.create_task(_run())
-    return ok({
-        "pipeline_id": pipeline_id,
-        "status": "running",
-        "resumed_from_stage": checkpoint.get("resume_stage"),
-    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1670,48 +1378,6 @@ def cancel_pipeline(pipeline_id: str):
         "message": "Cancellation requested — the run will stop at the next stage boundary",
         "status": "cancelling",
     })
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOKEN USAGE ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.get("/tokens/usage", tags=["Tokens"])
-def tokens_usage_all():
-    """
-    Return LLM token consumption totals **since this process started**.
-
-    Response shape:
-    ```
-    {
-      "global": { calls, input_tokens, output_tokens, total_tokens,
-                  models: {model: total}, stages: {stage: {...}} },
-      "runs":   { "<pipeline_id>": { calls, input_tokens,
-                                     output_tokens, total_tokens } }
-    }
-    ```
-
-    Notes:
-    - Counters are **in-memory and per-pod**. For a durable per-run record,
-      read `result.token_usage` from `GET /pipeline/status/{pipeline_id}`
-      after the run completes (persisted via the job store).
-    - CLI runs (`fortifyai.py`) and stage-level `/stages/*` calls are counted
-      in the global bucket even without a pipeline_id.
-    """
-    return ok(token_tracker.all_runs())
-
-
-@app.get("/tokens/usage/{pipeline_id}", tags=["Tokens"])
-def tokens_usage_run(pipeline_id: str):
-    """
-    Return **live** per-stage LLM token consumption for one pipeline run.
-
-    Useful for polling while a run is in progress — unlike
-    `/pipeline/status/{id}`, which only includes `token_usage` in the final
-    result after completion. Returns zeros (not 404) for unknown or
-    not-yet-started pipeline ids, and for runs executed on another pod.
-    """
-    return ok(token_tracker.summary(pipeline_id))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2020,8 +1686,6 @@ def _run_until(
     max_upgrades: int = 0,
 ) -> dict:
     """Run the pipeline and stop (inclusive) at `stop_after`, updating the job store per stage."""
-    if pipeline_id:
-        token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
     from agents.version_resolver import resolve_all_groups
@@ -2049,6 +1713,14 @@ def _run_until(
     def _s_skip(name: str) -> None:
         if pipeline_id:
             _update_stage(pipeline_id, name, status="skipped")
+
+    def _s_fail(name: str, t: float, error: str) -> None:
+        if pipeline_id:
+            _update_stage(pipeline_id, name,
+                          status="failed",
+                          finished_at=_now(),
+                          elapsed_seconds=round(time.time() - t, 3),
+                          error=error)
 
     idx = STAGE_ORDER.index(stop_after)
     project_path = Path(cfg.project_path) if cfg.project_path else Path(".")
@@ -2082,88 +1754,81 @@ def _run_until(
             _s_skip(s)
         return result
 
-    # Stages 2–5 touch the on-disk project_path — same race as in
-    # _run_full_pipeline, so use the same per-path lock. A `with` block here
-    # (rather than the manual acquire/try/finally used above) because this
-    # function has several early `return result` points mid-span, and the
-    # context manager releases correctly on all of them.
-    _proj_key = str(project_path.resolve())
-    _lock = _project_lock(_proj_key)
-    if _lock.locked():
-        logger.info(f"[pipeline {pipeline_id}] waiting for project lock on {_proj_key} "
-                    f"(another run is using this working directory)")
-    with _lock:
-        # Stage 2 — context
-        _check_cancelled(pipeline_id)
-        t = _s_start("context")
-        context_groups = locate_all_groups(project_path, resolved)
-        result["groups"] = context_groups
-        _s_done("context", t, {"groups_count": len(context_groups)})
-        if idx == 2:
-            for s in STAGE_ORDER[3:]:
-                _s_skip(s)
-            return result
+    # Stage 2 — context
+    _check_cancelled(pipeline_id)
+    t = _s_start("context")
+    context_groups = locate_all_groups(project_path, resolved)
+    result["groups"] = context_groups
+    _s_done("context", t, {"groups_count": len(context_groups)})
+    if idx == 2:
+        for s in STAGE_ORDER[3:]:
+            _s_skip(s)
+        return result
 
-        # Stage 3 — api diff
-        _check_cancelled(pipeline_id)
-        t = _s_start("api-diff")
-        diff_groups = run_api_diff_all_groups(
-            context_groups, project_path,
-            cfg.japicmp_jar_path or "/nonexistent/japicmp.jar",
-        )
-        result["groups"] = diff_groups
-        _s_done("api-diff", t, {"groups_count": len(diff_groups)})
-        if idx == 3:
-            for s in STAGE_ORDER[4:]:
-                _s_skip(s)
-            return result
+    # Stage 3 — api diff
+    _check_cancelled(pipeline_id)
+    t = _s_start("api-diff")
+    diff_groups = run_api_diff_all_groups(
+        context_groups, project_path,
+        cfg.japicmp_jar_path or "/nonexistent/japicmp.jar",
+    )
+    result["groups"] = diff_groups
+    _s_done("api-diff", t, {"groups_count": len(diff_groups)})
+    if idx == 3:
+        for s in STAGE_ORDER[4:]:
+            _s_skip(s)
+        return result
 
-        # Stage 4 — ai reasoning
-        _check_cancelled(pipeline_id)
-        t = _s_start("ai-reasoning")
+    # Stage 4 — ai reasoning
+    _check_cancelled(pipeline_id)
+    t = _s_start("ai-reasoning")
+    try:
         reasoned = reason_all_groups(diff_groups, cfg.gcp_project, cfg.gcp_location)
-        result["groups"] = reasoned
-        _s_done("ai-reasoning", t, {
-            "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-            "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
-        })
-        if idx == 4:
-            for s in STAGE_ORDER[5:]:
-                _s_skip(s)
-            return result
+    except Exception as exc:
+        _s_fail("ai-reasoning", t, str(exc))
+        raise
+    result["groups"] = reasoned
+    _s_done("ai-reasoning", t, {
+        "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
+        "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+    })
+    if idx == 4:
+        for s in STAGE_ORDER[5:]:
+            _s_skip(s)
+        return result
 
-        # Stage 5 — adr fix
-        _check_cancelled(pipeline_id)
-        t = _s_start("adr-fix")
-        adr_results: list[dict] = []
-        for group in reasoned:
-            _check_cancelled(pipeline_id)  # stop before pushing the next commit
-            artifact_id = group["parsed"]["artifact_id"]
-            if group.get("next_node") == "escalate" or not cfg.adr_path:
-                adr_results.append({
-                    "artifact_id": artifact_id,
-                    "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
-                        error_reason="Escalated or ADR_PATH not set",
-                    ),
-                })
-            else:
-                adr_results.append({
-                    "artifact_id": artifact_id,
-                    "result": run_adr_fix(
-                        group, adr_path=cfg.adr_path,
-                        project_path=str(project_path),
-                        jira_prefix=cfg.jira_id_prefix,
-                        release_id=release_id,
-                    ),
-                })
-        _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-        result["adr_results"] = adr_results
-        _s_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
-        if idx == 5:
-            _s_skip("pr-agent")
-            return result
+    # Stage 5 — adr fix
+    _check_cancelled(pipeline_id)
+    t = _s_start("adr-fix")
+    adr_results: list[dict] = []
+    for group in reasoned:
+        _check_cancelled(pipeline_id)  # stop before pushing the next commit
+        artifact_id = group["parsed"]["artifact_id"]
+        if group.get("next_node") == "escalate" or not cfg.adr_path:
+            adr_results.append({
+                "artifact_id": artifact_id,
+                "result": AdrResult(
+                    success=False, branch_name=None, commit_hash=None,
+                    build_time_seconds=None, pdf_path=None,
+                    error_reason="Escalated or ADR_PATH not set",
+                ),
+            })
+        else:
+            adr_results.append({
+                "artifact_id": artifact_id,
+                "result": run_adr_fix(
+                    group, adr_path=cfg.adr_path,
+                    project_path=str(project_path),
+                    jira_prefix=cfg.jira_id_prefix,
+                    release_id=release_id,
+                ),
+            })
+    _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+    result["adr_results"] = adr_results
+    _s_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
+    if idx == 5:
+        _s_skip("pr-agent")
+        return result
 
     # Stage 6 — pr agent
     _check_cancelled(pipeline_id)  # stop before opening PRs
@@ -2270,38 +1935,17 @@ if __name__ == "__main__":
 
 # ── Escalation storage helpers (GCS-first, local fallback for dev) ───────────
 
-
-# Reused across requests — constructing storage.Client() does an auth
-# handshake, so building a fresh one per request was a major slowdown.
-_gcs_client_singleton = None
-
-# For legacy blobs written before we started stamping parsed fields as blob
-# metadata: cache the parsed result per blob name, invalidated by blob.updated.
-# Avoids re-downloading + re-parsing the same old file's full text on every
-# single list request.
-_legacy_parse_cache: dict[str, tuple[float, dict]] = {}
-
-# Local-mode parse cache keyed by absolute file path, invalidated by mtime.
-# Escalation files are write-once, so this turns a full re-read of every
-# file on every request into just a stat() call once the cache is warm.
-_local_parse_cache: dict[str, tuple[float, dict]] = {}
-
-
 def _esc_backend():
     """
     Return ("gcs", bucket, bucket_name, prefix, client) when GCS_BUCKET is
     set and reachable, else ("local",). Env vars are read fresh on every
-    call so runtime-config overrides apply immediately, but the underlying
-    storage.Client() is created once and reused.
+    call so runtime-config overrides apply immediately.
     """
     bucket_name = os.environ.get("GCS_BUCKET", "").strip()
     if bucket_name:
         try:
-            global _gcs_client_singleton
-            if _gcs_client_singleton is None:
-                from google.cloud import storage
-                _gcs_client_singleton = storage.Client()
-            client = _gcs_client_singleton
+            from google.cloud import storage
+            client = storage.Client()
             prefix = os.environ.get("GCS_ESCALATION_PREFIX", "escalations/").rstrip("/") + "/"
             return ("gcs", client.bucket(bucket_name), bucket_name, prefix, client)
         except Exception as exc:
@@ -2347,42 +1991,17 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
     if backend[0] == "gcs":
         _, bucket, bucket_name, prefix, client = backend
         items = []
-        # list_blobs() already returns metadata (including custom metadata)
-        # for free as part of the listing call — no per-blob GET needed
-        # unless we hit an older file written before metadata was stamped.
         for blob in client.list_blobs(bucket_name, prefix=prefix):
             if not blob.name.endswith(".txt"):
                 continue
             filename = blob.name[len(prefix):]
             if "/" in filename or not filename.startswith("escalation_"):
                 continue
-
-            modified_at = blob.updated.timestamp() if blob.updated else 0.0
-            meta = blob.metadata or {}
-
-            if meta.get("artifact_id") is not None:
-                # Fast path: fields were stamped at write time, no download.
-                parsed = {
-                    "artifact_id": meta.get("artifact_id", ""),
-                    "cves":        [v for v in meta.get("cves", "").split(",") if v],
-                    "reason":      meta.get("reason", ""),
-                    "tried":       [v for v in meta.get("tried", "").split(",") if v],
-                    "severity":    meta.get("severity", "HIGH"),
-                }
-            else:
-                # Legacy blob with no stamped metadata — parse full content,
-                # but only once per (blob, modified_at); cache the result.
-                cached = _legacy_parse_cache.get(blob.name)
-                if cached and cached[0] == modified_at:
-                    parsed = cached[1]
-                else:
-                    try:
-                        content = blob.download_as_bytes().decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-                    parsed = _parse_escalation_text(content)
-                    _legacy_parse_cache[blob.name] = (modified_at, parsed)
-
+            try:
+                content = blob.download_as_bytes().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            parsed = _parse_escalation_text(content)
             items.append({
                 "filename":    filename,
                 "artifact_id": parsed["artifact_id"] or filename.rsplit(".", 1)[0],
@@ -2390,8 +2009,8 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
                 "reason":      parsed["reason"],
                 "tried":       parsed["tried"],
                 "severity":    parsed["severity"],
-                "size_bytes":  blob.size or 0,
-                "modified_at": modified_at,
+                "size_bytes":  blob.size or len(content),
+                "modified_at": blob.updated.timestamp() if blob.updated else 0.0,
                 "uri":         f"gs://{bucket_name}/{blob.name}",
             })
         items.sort(key=lambda i: i["modified_at"], reverse=True)
@@ -2411,15 +2030,8 @@ def list_fortify_escalations(output_dir: Optional[str] = Query(default=None)) ->
         reverse=True
     ):
         stat = txt_file.stat()
-        path_key = str(txt_file.resolve())
-        cached = _local_parse_cache.get(path_key)
-        if cached and cached[0] == stat.st_mtime:
-            parsed = cached[1]
-        else:
-            content = txt_file.read_text(encoding="utf-8", errors="replace")
-            parsed = _parse_escalation_text(content)
-            _local_parse_cache[path_key] = (stat.st_mtime, parsed)
-
+        content = txt_file.read_text(encoding="utf-8", errors="replace")
+        parsed = _parse_escalation_text(content)
         items.append({
             "filename":    txt_file.name,
             "artifact_id": parsed["artifact_id"] or txt_file.stem,
