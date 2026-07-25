@@ -486,6 +486,25 @@
               Restart Run
             </button>
           </div>
+
+          <!-- Fortify: resume a failed/cancelled run from its last checkpointed
+               stage instead of restarting from scratch (new pipeline_id, same
+               endpoint). No [disabled]="running()" guard — Fortify runs queue
+               behind an active Sonar run automatically, and can run alongside
+               other Fortify runs, so resume shouldn't be blocked by either. -->
+          <div class="detail__actions" *ngIf="run.source === 'fortify' && state.canResume(run)">
+            <button class="action-btn action-btn--restart"
+                    title="Continue from the last completed stage — already-committed work (adr-fix, pr-agent) won't be redone"
+                    (click)="state.resumeFortifyRun(run.id)">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M2 6A4 4 0 1 1 6 10" stroke="currentColor" stroke-width="1.4"
+                      stroke-linecap="round"/>
+                <path d="M2 3.5V6.5H5" stroke="currentColor" stroke-width="1.4"
+                      stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Resume Run
+            </button>
+          </div>
         </div>
 
         <!-- Input viewer panel -->

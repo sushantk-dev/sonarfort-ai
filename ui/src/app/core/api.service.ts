@@ -209,6 +209,22 @@ export class ApiService {
     return this.http.get<any>(`${this.base}/api/pipeline/runs`);
   }
 
+  // ── Fortify pipeline actions ─────────────────────────────────────────────
+  // These hit bare /pipeline/* routes on fortifyBase (no /api prefix) — the
+  // Fortify server, not the Sonar one. Mirrors how status/cancel calls for
+  // Fortify runs are made directly against fortifyBase in
+  // pipeline-state.service.ts rather than through the Sonar-only methods
+  // above (startRun/cancelRun/deleteRun/listRuns all target `this.base`).
+
+  /**
+   * Resume a failed/cancelled Fortify pipeline from its last checkpointed
+   * stage instead of starting over. Returns the same pipeline_id — the
+   * caller keeps polling GET {fortifyBase}/pipeline/status/{id} as before.
+   */
+  resumeFortifyRun(pipelineId: string): Observable<any> {
+    return this.http.post<any>(`${this.fortifyBase}/pipeline/resume/${pipelineId}`, {});
+  }
+
   // ── Escalations ──────────────────────────────────────────────────────────
 
   listEscalations(): Observable<{ escalations: any[]; total: number }> {

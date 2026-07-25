@@ -851,6 +851,66 @@ export class PipelineStateService {
     this.api.deleteRun(id).subscribe({ error: () => {} });
   }
 
+  // ── Resume ────────────────────────────────────────────────────────────────
+  /** Whether a run can be resumed from the UI — failed/cancelled Fortify runs only.
+   *  (Sonar runs have no resume endpoint; queued/running runs are already live.) */
+  canResume(run: UiRun): boolean {
+    return run.source === 'fortify' && (run.status === 'error' || run.status === 'cancelled');
+  }
+
+  /**
+   * Resume a failed/cancelled Fortify run from its last checkpointed stage
+   * (POST /pipeline/resume/{pipeline_id} on the Fortify server) instead of
+   * starting over. Reuses the same pipeline_id, so polling just picks back
+   * up — stages the backend already completed come back as 'completed'
+   * with output_summary.resumed_from_checkpoint on the next poll tick
+   * rather than being re-run (this matters most for adr-fix/pr-agent,
+   * which have side effects — the backend won't double-commit or
+   * double-PR work that already succeeded).
+   */
+  resumeFortifyRun(pipelineId: string) {
+    const run = this.runs().find(r => r.id === pipelineId);
+    if (!run || !this.canResume(run) || !run.fortifyRequest) return;
+
+    this.error.set(null);
+
+    this.api.resumeFortifyRun(pipelineId).subscribe({
+      next: () => {
+        // Flip the card back to 'running' with the outcome banner cleared —
+        // the next poll tick fills in real stage statuses.
+        this.runs.update(rs => rs.map(r => r.id === pipelineId
+          ? { ...r, status: 'running' as const, outcome: undefined }
+          : r
+        ));
+        if (this.selected()?.id === pipelineId) {
+          this.selected.set(this.runs().find(r => r.id === pipelineId) ?? null);
+        }
+
+        // Same queue-behind-an-active-Sonar-run rule as trackFortifyRun —
+        // Fortify runs can coexist with each other, just not with Sonar.
+        const sonarRunActive = !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
+        if (sonarRunActive) {
+          this.runs.update(rs => rs.map(r => r.id === pipelineId ? { ...r, status: 'queued' as const } : r));
+          this._fortifyQueue.push({
+            pipelineId,
+            mode: run.fortifyRequest!.mode,
+            body: run.fortifyRequest!.body,
+          });
+          return;
+        }
+
+        this._persistFortifyRun(pipelineId, run.fortifyRequest!.mode, run.fortifyRequest!.body);
+        this._startFortifyPoll(pipelineId);
+        this.running.set(true);
+        this._activeRunId = pipelineId;
+      },
+      error: (err: any) => {
+        const detail = err?.error?.detail ?? err?.message ?? 'Resume failed';
+        this.error.set(`Resume: ${detail}`);
+      },
+    });
+  }
+
   // ── Cancel ────────────────────────────────────────────────────────────────
   async cancelRun() {
     const runId = this._activeRunId;
