@@ -60,8 +60,8 @@ def should_skip(vuln: dict) -> tuple[bool, str]:
     if vuln.get("category", "") != "Open Source":
         return True, f"Not an OSS finding (category={vuln.get('category')})"
 
-    if vuln.get("auditorStatus", "") != "Fixable OSS":
-        return True, f"Status: {vuln.get('auditorStatus')}"
+    # if vuln.get("auditorStatus", "") != "Fixable OSS":
+    #     return True, f"Status: {vuln.get('auditorStatus')}"
 
     if vuln.get("closedStatus", False):
         return True, "Already closed"
