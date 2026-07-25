@@ -22,6 +22,13 @@ Key design
 - The (potentially large) ``result`` payload is stored separately at
   ``{pipeline_id}.result.json`` so status polling and ``/pipeline/runs``
   listings never download the full result blob.
+- Each completed stage's JSON-serializable output is checkpointed to
+  ``{pipeline_id}.checkpoint.json`` (also kept out of the small job doc for
+  the same reason). If a run later fails or is cancelled, ``POST
+  /pipeline/resume/{pipeline_id}`` reads this checkpoint and re-enters
+  ``_run_full_pipeline`` partway through instead of from stage 1 — stages
+  with side effects (adr-fix, pr-agent) are not redone once their output is
+  checkpointed. Cleared automatically once the job completes successfully.
 - ``started_at`` is mirrored into custom blob metadata so ``list_jobs`` can
   sort newest-first from the listing alone, without downloading every doc.
 - Read-modify-write updates use GCS generation preconditions
@@ -97,6 +104,19 @@ def _blank_job(pipeline_id: str, stages: list[str] | None = None) -> dict:
         "result":          None,
         "cancel_requested": False,
         "stages":          _blank_stages(stages),
+        # Non-secret request metadata needed to reconstruct cfg/client on a
+        # resume (release_id, repo, report_path, dry_run, ...). Set once at
+        # job creation by api_server.py. None means "resume unsupported"
+        # (e.g. a job created before this feature existed).
+        "resume_meta":     None,
+        # Name of the next stage a resume would start at. Mirrored from the
+        # checkpoint doc onto this small record so status polls can show
+        # resumability without downloading the (potentially large) checkpoint.
+        "resume_stage":    None,
+        # NullJobStore keeps the checkpoint payload inline (GcsJobStore keeps
+        # it in a separate blob) — always present so save/get/delete_checkpoint
+        # don't need special-casing.
+        "checkpoint":      None,
     }
 
 
@@ -152,6 +172,27 @@ class JobStore(ABC):
     def is_cancel_requested(self, pipeline_id: str) -> bool:
         """Return True if ``request_cancel`` was called for this job."""
 
+    @abstractmethod
+    def save_checkpoint(self, pipeline_id: str, **fields) -> None:
+        """
+        Persist the full accumulated checkpoint for a job (the completed
+        stages' JSON-serializable output, plus ``resume_stage`` — the name
+        of the next stage to run). Called once per completed stage by the
+        pipeline runner with the *entire* checkpoint so far, not a delta.
+
+        Kept separate from the main job doc so frequent status polls never
+        have to download the (potentially large) intermediate stage data.
+        """
+
+    @abstractmethod
+    def get_checkpoint(self, pipeline_id: str) -> dict | None:
+        """Return the saved checkpoint dict, or None if the job has none."""
+
+    @abstractmethod
+    def delete_checkpoint(self, pipeline_id: str) -> None:
+        """Best-effort cleanup once a job completes successfully and its
+        checkpoint is no longer needed for a resume."""
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GCS implementation
@@ -192,6 +233,9 @@ class GcsJobStore(JobStore):
 
     def _result_blob_name(self, pid: str) -> str:
         return f"{self._prefix}{pid}.result.json"
+
+    def _checkpoint_blob_name(self, pid: str) -> str:
+        return f"{self._prefix}{pid}.checkpoint.json"
 
     def _epoch(self, iso_ts: str) -> float:
         try:
@@ -319,8 +363,13 @@ class GcsJobStore(JobStore):
             doc["finished_at"]     = _now()
             doc["elapsed_seconds"] = round(time.time() - t0, 3) if t0 else None
             doc["error"]           = error
+            if status == "completed":
+                # No longer needed for a resume — free the checkpoint blob.
+                doc["resume_stage"] = None
 
         self._mutate(pipeline_id, _apply, "finish_job")
+        if status == "completed":
+            self.delete_checkpoint(pipeline_id)
 
     def list_jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
         # 1. List job-doc blobs (skip .result.json), sort by started_at metadata
@@ -357,6 +406,44 @@ class GcsJobStore(JobStore):
     def is_cancel_requested(self, pipeline_id: str) -> bool:
         doc, _gen = self._read_doc(pipeline_id)
         return bool(doc and doc.get("cancel_requested"))
+
+    # ── Checkpoint / resume support ───────────────────────────────────────────
+
+    def save_checkpoint(self, pipeline_id: str, **fields) -> None:
+        # Only the single pipeline run that owns this job ever writes its
+        # checkpoint, sequentially, one stage at a time — no concurrent
+        # writers, so a plain overwrite is safe (no CAS needed here, unlike
+        # update_job/update_stage which can race with cancel/poll writers).
+        try:
+            blob = self._bucket.blob(self._checkpoint_blob_name(pipeline_id))
+            blob.upload_from_string(
+                json.dumps(fields).encode("utf-8"),
+                content_type="application/json",
+            )
+        except Exception as exc:
+            logger.error(f"[JobStore] save_checkpoint failed for {pipeline_id}: {exc}")
+            return
+        # Mirror the resume point onto the small job doc so status polls can
+        # show "resumable from: X" without downloading the checkpoint blob.
+        self.update_job(pipeline_id, resume_stage=fields.get("resume_stage"))
+
+    def get_checkpoint(self, pipeline_id: str) -> dict | None:
+        from google.api_core import exceptions as gexc
+        blob = self._bucket.blob(self._checkpoint_blob_name(pipeline_id))
+        try:
+            raw = blob.download_as_bytes()
+        except gexc.NotFound:
+            return None
+        return json.loads(raw.decode("utf-8")) if raw else None
+
+    def delete_checkpoint(self, pipeline_id: str) -> None:
+        from google.api_core import exceptions as gexc
+        try:
+            self._bucket.blob(self._checkpoint_blob_name(pipeline_id)).delete()
+        except gexc.NotFound:
+            pass
+        except Exception as exc:
+            logger.debug(f"[JobStore] delete_checkpoint skipped for {pipeline_id}: {exc}")
 
     # ── Lazy TTL purge (backstop — prefer a bucket lifecycle rule) ───────────
 
@@ -438,6 +525,9 @@ class NullJobStore(JobStore):
                 j["elapsed_seconds"] = round(time.time() - t0, 3) if t0 else None
                 j["result"]          = result
                 j["error"]           = error
+                if status == "completed":
+                    j["checkpoint"] = None
+                    j["resume_stage"] = None
 
     def list_jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
         with self._lock:
@@ -447,7 +537,7 @@ class NullJobStore(JobStore):
                 reverse=True,
             )
         return [
-            {k: v for k, v in j.items() if k != "result"}
+            {k: v for k, v in j.items() if k not in ("result", "checkpoint")}
             for j in jobs[offset: offset + limit]
         ]
 
@@ -461,6 +551,27 @@ class NullJobStore(JobStore):
         with self._lock:
             j = self._jobs.get(pipeline_id)
             return bool(j and j.get("cancel_requested"))
+
+    # ── Checkpoint / resume support ───────────────────────────────────────────
+
+    def save_checkpoint(self, pipeline_id: str, **fields) -> None:
+        with self._lock:
+            j = self._jobs.get(pipeline_id)
+            if j:
+                j["checkpoint"] = dict(fields)
+                j["resume_stage"] = fields.get("resume_stage")
+
+    def get_checkpoint(self, pipeline_id: str) -> dict | None:
+        with self._lock:
+            j = self._jobs.get(pipeline_id)
+            ckpt = j.get("checkpoint") if j else None
+            return dict(ckpt) if ckpt else None
+
+    def delete_checkpoint(self, pipeline_id: str) -> None:
+        with self._lock:
+            j = self._jobs.get(pipeline_id)
+            if j:
+                j["checkpoint"] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
