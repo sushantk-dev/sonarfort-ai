@@ -47,6 +47,26 @@ try:  # flat layout (token_tracker.py at repo root, next to state.py)
 except ImportError:  # package layout
     from agents.token_tracker import token_tracker  # type: ignore
 
+
+class AIReasoningError(Exception):
+    """
+    Raised when the LLM call itself fails for reasons that are NOT a normal
+    "safely fall back to heuristics" situation — e.g. permission denied,
+    auth/credential errors, quota exhaustion, network failures, etc.
+
+    Unlike a missing/unparseable JSON response (which is a model-quality
+    issue we can reasonably paper over with heuristics), a failed API call
+    means we have no signal at all about upgrade safety. The pipeline must
+    stop and be marked as a failure rather than silently guessing.
+    """
+
+    def __init__(self, artifact_id: str, original_exc: Exception):
+        self.artifact_id = artifact_id
+        self.original_exc = original_exc
+        super().__init__(
+            f"AI reasoning LLM call failed for {artifact_id}: {original_exc}"
+        )
+
 # ── Confidence score mapping ──────────────────────────────────────────────────
 # Maps the LLM's categorical confidence string to a normalised 0-1 float.
 # These values drive confLabel() thresholds in the frontend (≥0.8 HIGH, ≥0.5 MEDIUM).
@@ -361,12 +381,15 @@ def reason_about_upgrade(
             f"{usage['input_tokens']}→{usage['output_tokens']} tokens)"
         )
     except Exception as exc:
-        logger.warning(
-            f"[AI Reasoning] LLM call failed: {exc} — using heuristic fallback"
+        # A failed API call (permission denied, auth failure, quota, network,
+        # etc.) is a fatal condition — we do NOT fall back to heuristics here,
+        # since that would silently mask the fact that no real safety
+        # assessment was performed. Propagate so the caller can stop the
+        # pipeline and mark it as a failure.
+        logger.error(
+            f"[AI Reasoning] LLM call failed for {artifact_id}: {exc}"
         )
-        result = _heuristic_reasoning(group, candidate)
-        _log_result(artifact_id, current_version, candidate, result)
-        return result
+        raise AIReasoningError(artifact_id, exc) from exc
 
     # Parse JSON
     data = _extract_json(raw_text)
@@ -520,10 +543,36 @@ def ai_reasoning_node(
         state["audit_trail"].append({"node": "ai_reasoning", "status": "skipped"})
         return state
 
-    enriched = reason_all_groups(
-        groups, gcp_project, gcp_location,
-        vertex_model=vertex_model, max_tokens=max_tokens,
-    )
+    try:
+        enriched = reason_all_groups(
+            groups, gcp_project, gcp_location,
+            vertex_model=vertex_model, max_tokens=max_tokens,
+        )
+    except AIReasoningError as exc:
+        logger.error(
+            f"[AI Reasoning] Fatal error — halting pipeline: {exc}"
+        )
+        state["status"] = "failed"
+        state["escalation_reason"] = str(exc)
+        state["audit_trail"].append({
+            "node": "ai_reasoning",
+            "status": "failed",
+            "artifact_id": exc.artifact_id,
+            "error": str(exc.original_exc),
+        })
+        return state
+    except Exception as exc:  # catch-all: any other unexpected error
+        logger.error(
+            f"[AI Reasoning] Unexpected fatal error — halting pipeline: {exc}"
+        )
+        state["status"] = "failed"
+        state["escalation_reason"] = f"Unexpected AI reasoning error: {exc}"
+        state["audit_trail"].append({
+            "node": "ai_reasoning",
+            "status": "failed",
+            "error": str(exc),
+        })
+        return state
 
     state["_reasoned_groups"] = enriched  # type: ignore[typeddict-unknown-key]
     state["audit_trail"].append({

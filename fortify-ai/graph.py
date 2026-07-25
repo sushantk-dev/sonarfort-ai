@@ -201,12 +201,21 @@ def route_triage(
 
 def route_ai_reasoning(
     state: AgentState,
-) -> Literal["adr_fix", "ai_code_fix", "escalate"]:
+) -> Literal["adr_fix", "ai_code_fix", "escalate", END]:  # type: ignore[valid-type]
     """
     Iteration 7: Route based on AI confidence + safety verdict.
     Reads the first reasoned group's next_node from state.
     Falls back to adr_fix if not set (stub behaviour).
+
+    If ai_reasoning_node hit a fatal error (permission error, API failure,
+    etc.) it sets status="failed" and skips writing _reasoned_groups.
+    That is a hard stop — route straight to END so the "failed" status
+    is preserved (routing through "escalate" would overwrite it to
+    "escalated", which incorrectly implies a normal business decision
+    rather than a system failure).
     """
+    if state.get("status") == "failed":
+        return END
     groups: list[dict] = state.get("_reasoned_groups", [])  # type: ignore[attr-defined]
     if not groups:
         return "adr_fix"
@@ -300,6 +309,7 @@ def build_graph() -> StateGraph:
             "adr_fix": "adr_fix",
             "ai_code_fix": "ai_code_fix",
             "escalate": "escalate",
+            END: END,
         },
     )
 
