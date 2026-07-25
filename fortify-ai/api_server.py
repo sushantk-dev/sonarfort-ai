@@ -69,6 +69,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from loguru import logger
 
 # ── Internal imports ──────────────────────────────────────────────────────────
 from config import FortifyAIConfig, load_config
@@ -93,6 +94,34 @@ _store = create_job_store()
 # Override MAX_PIPELINE_WORKERS env var to tune for your pod's CPU limit.
 _MAX_WORKERS = int(os.environ.get("MAX_PIPELINE_WORKERS", 8))
 _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="pipeline-worker")
+
+# ── Per-working-directory mutual exclusion ─────────────────────────────────────
+# Concurrent pipelines that resolve to the SAME on-disk project_path (i.e. no
+# `repo` was passed, so they all share the env-configured PROJECT_PATH rather
+# than each getting an isolated tempfile.mkdtemp() clone) would otherwise run
+# `context`'s file lookups, `api-diff`'s japicmp calls, and adr-fix's git
+# checkout/commit/push concurrently in the *same working tree* — a real race
+# that can corrupt the checkout. Runs against a `repo`-triggered clone never
+# contend here since each gets a unique temp directory as its lock key.
+#
+# NOTE: this is a process-local lock. It serializes concurrent runs within one
+# pod. If PROJECT_PATH points at storage shared across multiple pod replicas
+# (e.g. a network mount), it does NOT protect against a different pod running
+# the same path at the same time — that would need a distributed lock (e.g.
+# a GCS-object-based mutex, mirroring how job_store.py uses generation
+# preconditions). Not needed for the common case of one pod or repo-per-clone.
+_project_locks: dict[str, Lock] = {}
+_project_locks_guard = Lock()
+
+
+def _project_lock(project_path: str) -> Lock:
+    """Return (creating if needed) the lock for a resolved project_path."""
+    with _project_locks_guard:
+        lock = _project_locks.get(project_path)
+        if lock is None:
+            lock = Lock()
+            _project_locks[project_path] = lock
+        return lock
 
 
 def _now() -> str:
@@ -664,94 +693,107 @@ def _run_full_pipeline(
         ckpt["resolved"] = resolved
         _checkpoint("context")
 
-    # Stage 3 — context
-    if "context" in ckpt:
-        context = ckpt["context"]
-        _stage_resumed("context", {"groups_count": len(context)})
-    else:
-        _check_cancelled(pipeline_id)
-        t = _stage_start("context")
-        context = locate_all_groups(project_path, resolved)
-        _stage_done("context", t, {"groups_count": len(context)})
-        ckpt["context"] = context
-        _checkpoint("api-diff")
+    # Stages 3–6 touch the on-disk project_path (context reads it, api-diff
+    # runs japicmp against it, adr-fix checks out/edits/commits/pushes in it)
+    # — serialize per-path so two pipelines sharing a non-cloned PROJECT_PATH
+    # can't race in the same working tree. See _project_lock's docstring.
+    _proj_key = str(project_path.resolve())
+    _lock = _project_lock(_proj_key)
+    if not _lock.acquire(blocking=False):
+        logger.info(f"[pipeline {pipeline_id}] waiting for project lock on {_proj_key} "
+                    f"(another run is using this working directory)")
+        _lock.acquire(blocking=True)
+    try:
+        # Stage 3 — context
+        if "context" in ckpt:
+            context = ckpt["context"]
+            _stage_resumed("context", {"groups_count": len(context)})
+        else:
+            _check_cancelled(pipeline_id)
+            t = _stage_start("context")
+            context = locate_all_groups(project_path, resolved)
+            _stage_done("context", t, {"groups_count": len(context)})
+            ckpt["context"] = context
+            _checkpoint("api-diff")
 
-    # Stage 4 — api diff
-    if "diffed" in ckpt:
-        diffed = ckpt["diffed"]
-        _stage_resumed("api-diff", {"groups_count": len(diffed)})
-    else:
-        _check_cancelled(pipeline_id)
-        t = _stage_start("api-diff")
-        diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
-        _stage_done("api-diff", t, {"groups_count": len(diffed)})
-        ckpt["diffed"] = diffed
-        _checkpoint("ai-reasoning")
+        # Stage 4 — api diff
+        if "diffed" in ckpt:
+            diffed = ckpt["diffed"]
+            _stage_resumed("api-diff", {"groups_count": len(diffed)})
+        else:
+            _check_cancelled(pipeline_id)
+            t = _stage_start("api-diff")
+            diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
+            _stage_done("api-diff", t, {"groups_count": len(diffed)})
+            ckpt["diffed"] = diffed
+            _checkpoint("ai-reasoning")
 
-    # Stage 5 — ai reasoning
-    if "reasoned" in ckpt:
-        reasoned = ckpt["reasoned"]
-        _stage_resumed("ai-reasoning", {
-            "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-            "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
-        })
-    else:
-        _check_cancelled(pipeline_id)
-        t = _stage_start("ai-reasoning")
-        reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
-        _stage_done("ai-reasoning", t, {
-            "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-            "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
-        })
-        ckpt["reasoned"] = reasoned
-        _checkpoint("adr-fix")
+        # Stage 5 — ai reasoning
+        if "reasoned" in ckpt:
+            reasoned = ckpt["reasoned"]
+            _stage_resumed("ai-reasoning", {
+                "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
+                "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+            })
+        else:
+            _check_cancelled(pipeline_id)
+            t = _stage_start("ai-reasoning")
+            reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
+            _stage_done("ai-reasoning", t, {
+                "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
+                "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+            })
+            ckpt["reasoned"] = reasoned
+            _checkpoint("adr-fix")
 
-    # Stage 6 — adr fix
-    # Side-effecting (git commit/push) — only ever run once. If a prior
-    # attempt already checkpointed adr_results, reuse them rather than
-    # risking a duplicate commit for groups that already succeeded.
-    if "adr_results" in ckpt:
-        adr_results = ckpt["adr_results"]
-        _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-        _stage_resumed("adr-fix", {"fixed": _adr_ok, "total": len(adr_results)})
-    else:
-        _check_cancelled(pipeline_id)
-        t = _stage_start("adr-fix")
-        adr_results: list[dict] = []
-        for group in reasoned:
-            _check_cancelled(pipeline_id)  # stop before pushing the next commit
-            artifact_id = group["parsed"]["artifact_id"]
-            if group.get("next_node") == "escalate":
-                adr_results.append({
-                    "artifact_id": artifact_id,
-                    "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
-                        error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
-                    ),
-                })
-                continue
-            if dry_run or not cfg.adr_path:
-                adr_results.append({
-                    "artifact_id": artifact_id,
-                    "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
-                        error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
-                    ),
-                })
-            else:
-                result = run_adr_fix(
-                    group, adr_path=cfg.adr_path,
-                    project_path=str(project_path),
-                    jira_prefix=cfg.jira_id_prefix,
-                    release_id=release_id,
-                )
-                adr_results.append({"artifact_id": artifact_id, "result": result})
-        _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-        _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
-        ckpt["adr_results"] = adr_results
-        _checkpoint("pr-agent")
+        # Stage 6 — adr fix
+        # Side-effecting (git commit/push) — only ever run once. If a prior
+        # attempt already checkpointed adr_results, reuse them rather than
+        # risking a duplicate commit for groups that already succeeded.
+        if "adr_results" in ckpt:
+            adr_results = ckpt["adr_results"]
+            _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+            _stage_resumed("adr-fix", {"fixed": _adr_ok, "total": len(adr_results)})
+        else:
+            _check_cancelled(pipeline_id)
+            t = _stage_start("adr-fix")
+            adr_results: list[dict] = []
+            for group in reasoned:
+                _check_cancelled(pipeline_id)  # stop before pushing the next commit
+                artifact_id = group["parsed"]["artifact_id"]
+                if group.get("next_node") == "escalate":
+                    adr_results.append({
+                        "artifact_id": artifact_id,
+                        "result": AdrResult(
+                            success=False, branch_name=None, commit_hash=None,
+                            build_time_seconds=None, pdf_path=None,
+                            error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
+                        ),
+                    })
+                    continue
+                if dry_run or not cfg.adr_path:
+                    adr_results.append({
+                        "artifact_id": artifact_id,
+                        "result": AdrResult(
+                            success=False, branch_name=None, commit_hash=None,
+                            build_time_seconds=None, pdf_path=None,
+                            error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
+                        ),
+                    })
+                else:
+                    result = run_adr_fix(
+                        group, adr_path=cfg.adr_path,
+                        project_path=str(project_path),
+                        jira_prefix=cfg.jira_id_prefix,
+                        release_id=release_id,
+                    )
+                    adr_results.append({"artifact_id": artifact_id, "result": result})
+            _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+            _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
+            ckpt["adr_results"] = adr_results
+            _checkpoint("pr-agent")
+    finally:
+        _lock.release()
 
     # Stage 7 — pr agent
     # Also side-effecting (opens PRs) — same reuse-on-resume rule as adr-fix.
@@ -828,8 +870,32 @@ async def startup_event():
 
 @app.get("/health", tags=["Utility"])
 def health():
-    """Liveness probe — always returns 200 OK."""
-    return {"ok": True, "service": "FortifyAI API"}
+    """Liveness probe — always returns 200 OK.
+
+    Also reports this pod's pipeline thread-pool load so `MAX_PIPELINE_WORKERS`
+    can be sized from real data: if `queued` is consistently > 0, concurrent
+    triggers are waiting on free workers and it's worth raising the env var
+    (or adding pod replicas, which requires GCS_BUCKET so job state is shared).
+    """
+    # ThreadPoolExecutor doesn't expose these as public API. Guarded because
+    # a liveness probe must never fail — if internals change across a Python
+    # version, we just omit the stats instead of breaking /health.
+    executor_stats: dict | None
+    try:
+        active = sum(1 for t in _EXECUTOR._threads if t.is_alive())
+        queued = _EXECUTOR._work_queue.qsize()
+        executor_stats = {
+            "max_workers": _MAX_WORKERS,
+            "active_workers": active,
+            "queued_tasks": queued,
+        }
+    except Exception:
+        executor_stats = None
+    return {
+        "ok": True,
+        "service": "FortifyAI API",
+        "executor": executor_stats,
+    }
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -2016,77 +2082,88 @@ def _run_until(
             _s_skip(s)
         return result
 
-    # Stage 2 — context
-    _check_cancelled(pipeline_id)
-    t = _s_start("context")
-    context_groups = locate_all_groups(project_path, resolved)
-    result["groups"] = context_groups
-    _s_done("context", t, {"groups_count": len(context_groups)})
-    if idx == 2:
-        for s in STAGE_ORDER[3:]:
-            _s_skip(s)
-        return result
+    # Stages 2–5 touch the on-disk project_path — same race as in
+    # _run_full_pipeline, so use the same per-path lock. A `with` block here
+    # (rather than the manual acquire/try/finally used above) because this
+    # function has several early `return result` points mid-span, and the
+    # context manager releases correctly on all of them.
+    _proj_key = str(project_path.resolve())
+    _lock = _project_lock(_proj_key)
+    if _lock.locked():
+        logger.info(f"[pipeline {pipeline_id}] waiting for project lock on {_proj_key} "
+                    f"(another run is using this working directory)")
+    with _lock:
+        # Stage 2 — context
+        _check_cancelled(pipeline_id)
+        t = _s_start("context")
+        context_groups = locate_all_groups(project_path, resolved)
+        result["groups"] = context_groups
+        _s_done("context", t, {"groups_count": len(context_groups)})
+        if idx == 2:
+            for s in STAGE_ORDER[3:]:
+                _s_skip(s)
+            return result
 
-    # Stage 3 — api diff
-    _check_cancelled(pipeline_id)
-    t = _s_start("api-diff")
-    diff_groups = run_api_diff_all_groups(
-        context_groups, project_path,
-        cfg.japicmp_jar_path or "/nonexistent/japicmp.jar",
-    )
-    result["groups"] = diff_groups
-    _s_done("api-diff", t, {"groups_count": len(diff_groups)})
-    if idx == 3:
-        for s in STAGE_ORDER[4:]:
-            _s_skip(s)
-        return result
+        # Stage 3 — api diff
+        _check_cancelled(pipeline_id)
+        t = _s_start("api-diff")
+        diff_groups = run_api_diff_all_groups(
+            context_groups, project_path,
+            cfg.japicmp_jar_path or "/nonexistent/japicmp.jar",
+        )
+        result["groups"] = diff_groups
+        _s_done("api-diff", t, {"groups_count": len(diff_groups)})
+        if idx == 3:
+            for s in STAGE_ORDER[4:]:
+                _s_skip(s)
+            return result
 
-    # Stage 4 — ai reasoning
-    _check_cancelled(pipeline_id)
-    t = _s_start("ai-reasoning")
-    reasoned = reason_all_groups(diff_groups, cfg.gcp_project, cfg.gcp_location)
-    result["groups"] = reasoned
-    _s_done("ai-reasoning", t, {
-        "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-        "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
-    })
-    if idx == 4:
-        for s in STAGE_ORDER[5:]:
-            _s_skip(s)
-        return result
+        # Stage 4 — ai reasoning
+        _check_cancelled(pipeline_id)
+        t = _s_start("ai-reasoning")
+        reasoned = reason_all_groups(diff_groups, cfg.gcp_project, cfg.gcp_location)
+        result["groups"] = reasoned
+        _s_done("ai-reasoning", t, {
+            "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
+            "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+        })
+        if idx == 4:
+            for s in STAGE_ORDER[5:]:
+                _s_skip(s)
+            return result
 
-    # Stage 5 — adr fix
-    _check_cancelled(pipeline_id)
-    t = _s_start("adr-fix")
-    adr_results: list[dict] = []
-    for group in reasoned:
-        _check_cancelled(pipeline_id)  # stop before pushing the next commit
-        artifact_id = group["parsed"]["artifact_id"]
-        if group.get("next_node") == "escalate" or not cfg.adr_path:
-            adr_results.append({
-                "artifact_id": artifact_id,
-                "result": AdrResult(
-                    success=False, branch_name=None, commit_hash=None,
-                    build_time_seconds=None, pdf_path=None,
-                    error_reason="Escalated or ADR_PATH not set",
-                ),
-            })
-        else:
-            adr_results.append({
-                "artifact_id": artifact_id,
-                "result": run_adr_fix(
-                    group, adr_path=cfg.adr_path,
-                    project_path=str(project_path),
-                    jira_prefix=cfg.jira_id_prefix,
-                    release_id=release_id,
-                ),
-            })
-    _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-    result["adr_results"] = adr_results
-    _s_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
-    if idx == 5:
-        _s_skip("pr-agent")
-        return result
+        # Stage 5 — adr fix
+        _check_cancelled(pipeline_id)
+        t = _s_start("adr-fix")
+        adr_results: list[dict] = []
+        for group in reasoned:
+            _check_cancelled(pipeline_id)  # stop before pushing the next commit
+            artifact_id = group["parsed"]["artifact_id"]
+            if group.get("next_node") == "escalate" or not cfg.adr_path:
+                adr_results.append({
+                    "artifact_id": artifact_id,
+                    "result": AdrResult(
+                        success=False, branch_name=None, commit_hash=None,
+                        build_time_seconds=None, pdf_path=None,
+                        error_reason="Escalated or ADR_PATH not set",
+                    ),
+                })
+            else:
+                adr_results.append({
+                    "artifact_id": artifact_id,
+                    "result": run_adr_fix(
+                        group, adr_path=cfg.adr_path,
+                        project_path=str(project_path),
+                        jira_prefix=cfg.jira_id_prefix,
+                        release_id=release_id,
+                    ),
+                })
+        _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+        result["adr_results"] = adr_results
+        _s_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
+        if idx == 5:
+            _s_skip("pr-agent")
+            return result
 
     # Stage 6 — pr agent
     _check_cancelled(pipeline_id)  # stop before opening PRs
