@@ -240,6 +240,13 @@ export class PipelineComponent {
   cancelRun() { this.state.cancelRun(); }
   deleteRun(id: string) { this.state.deleteRun(id); }
 
+  // ── Escalation report download ────────────────────────────────────────────
+  downloadEscalation(filename: string, event: Event) {
+    event.stopPropagation();
+    event.preventDefault();
+    this.state.downloadEscalation(filename);
+  }
+
   // ── Restart ───────────────────────────────────────────────────────────────
   restartRun(req: RunRequest) {
     this.repoUrl.set(req.repo_url);

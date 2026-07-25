@@ -679,6 +679,22 @@
               <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank"
                  class="outcome__link">{{ run.prUrl }}</a>
             </ng-template>
+
+            <!-- Escalation report(s) — Fortify runs with escalated deps -->
+            <div class="outcome__esc-list" *ngIf="run.escalationFiles && run.escalationFiles.length > 0">
+              <button *ngFor="let file of run.escalationFiles"
+                      type="button"
+                      class="outcome__esc-link"
+                      (click)="downloadEscalation(file, $event)">
+                <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+                  <path d="M6 1.5V8M6 8L3.5 5.5M6 8L8.5 5.5" stroke="currentColor" stroke-width="1.3"
+                        stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M1.5 9.5V10.2C1.5 10.6 1.8 10.9 2.2 10.9H9.8C10.2 10.9 10.5 10.6 10.5 10.2V9.5"
+                        stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                </svg>
+                Escalation Report — {{ file }}
+              </button>
+            </div>
           </div>
           <!-- Summary report link — Fortify runs only -->
           <a *ngIf="run.source === 'fortify' && (run.status === 'done' || run.status === 'error')"

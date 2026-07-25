@@ -1921,3 +1921,39 @@
   gap: 3px;
   margin-top: 2px;
 }
+
+/* Escalation report download links — stacked under the PR list/reason */
+.outcome__esc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.outcome__esc-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--status-warning, #b45309);
+  background: rgba(180,83,9,.08);
+  border: 1px solid rgba(180,83,9,.3);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.15s, border-color 0.15s;
+
+  svg { flex-shrink: 0; }
+
+  &:hover {
+    background: rgba(180,83,9,.15);
+    border-color: rgba(180,83,9,.5);
+  }
+}

@@ -81,6 +81,7 @@ interface PipelineResult {
     total_fixed?:     number;
     total_escalated?: number;
     total_failed?:    number;
+    escalation_files?: string[];   // paths written by the fortify-writeback stage
   };
 }
 
@@ -432,6 +433,20 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
             <div class="esc-card__body"
                  *ngIf="expandedId() === dep.parsed?.artifact_id">
               {{ dep.escalate_reason || dep.ai_reasoning?.reasoning || 'No safe version found.' }}
+              <div class="esc-card__report-row" *ngIf="escalationFileFor(dep) as file">
+                <button type="button"
+                        class="esc-card__report-btn"
+                        [disabled]="escalationDownloading() === file"
+                        (click)="downloadEscalationReport(file, $event)">
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+                    <path d="M6 1.5V8M6 8L3.5 5.5M6 8L8.5 5.5" stroke="currentColor" stroke-width="1.3"
+                          stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M1.5 9.5V10.2C1.5 10.6 1.8 10.9 2.2 10.9H9.8C10.2 10.9 10.5 10.6 10.5 10.2V9.5"
+                          stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                  </svg>
+                  {{ escalationDownloading() === file ? 'Downloading…' : 'Download Full Report' }}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -936,6 +951,31 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
       color: var(--text-muted);
       border-top: 1px solid var(--border);
     }
+    .esc-card__report-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 4px 10px;
+      font-size: 11.5px;
+      font-weight: 500;
+      font-family: inherit;
+      color: #854F0B;
+      background: rgba(180,83,9,.08);
+      border: 1px solid rgba(180,83,9,.3);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+    }
+    .esc-card__report-btn svg { flex-shrink: 0; }
+    .esc-card__report-btn:hover:not(:disabled) {
+      background: rgba(180,83,9,.15);
+      border-color: rgba(180,83,9,.5);
+    }
+    .esc-card__report-btn:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
 
     /* Stage pills */
     .stage-grid {
@@ -1254,5 +1294,47 @@ export class SummaryReportComponent implements OnInit {
 
   toggleExpanded(id: string): void {
     this.expandedId.update(cur => cur === id ? null : id);
+  }
+
+  // ── Escalation report download ────────────────────────────────────────────
+  // Escalation .txt filenames are written as escalation_{artifact_id}_{ts}.txt,
+  // so a substring match against the artifact_id reliably finds the file
+  // written for a given dependency without needing an explicit backend link.
+  private _escalationFiles = (): string[] =>
+    this.status()?.result?.summary?.escalation_files ?? [];
+
+  escalationFileFor(dep: DepGroup): string | null {
+    const artifactId = dep.parsed?.artifact_id ?? dep.artifact_id;
+    if (!artifactId) return null;
+    const match = this._escalationFiles().find(path => path.includes(artifactId));
+    return match ? (match.split('/').pop() ?? match) : null;
+  }
+
+  escalationDownloading = signal<string | null>(null);
+
+  async downloadEscalationReport(filename: string, event: Event): Promise<void> {
+    event.stopPropagation();
+    this.escalationDownloading.set(filename);
+    try {
+      const base = this.apiCfg.fortifyBaseUrl();
+      const resp = await fetch(`${base}/escalations/${encodeURIComponent(filename)}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      this._triggerDownload(data.content ?? '', filename);
+    } catch (err: any) {
+      this.fetchError.set(`Could not download escalation report: ${err.message}`);
+    } finally {
+      this.escalationDownloading.set(null);
+    }
+  }
+
+  private _triggerDownload(content: string, filename: string): void {
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 }

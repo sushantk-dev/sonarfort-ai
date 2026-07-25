@@ -72,6 +72,7 @@ export interface UiRun {
   confidencePercent?: string;   // e.g. "65%" — derived from avg confidence_score
   prUrl?:             string;     // first PR — kept for Sonar backwards compat
   prUrls?:            string[];   // all PRs — Fortify can fix multiple deps per run
+  escalationFiles?:   string[];   // escalation report filenames written by this run (Fortify only)
   ragHits?:           number;
   retries?:           number;
   tokens?:            { input: number; output: number };   // LLM token consumption (in/out)
@@ -490,6 +491,7 @@ export class PipelineStateService {
     let outcome:           string    | undefined;
     let prUrl:             string    | undefined;
     let prUrls:            string[]  | undefined;
+    let escalationFiles:   string[]  | undefined;
     let confidence:        ConfLabel | undefined;
     let confidencePercent: string    | undefined;
 
@@ -501,6 +503,13 @@ export class PipelineStateService {
       outcome = fixed > 0 ? 'pr_opened' : escalated > 0 ? 'escalated' : 'empty';
       prUrl   = allUrls[0];
       prUrls  = allUrls.length > 0 ? allUrls : undefined;
+
+      // Escalation report files — written by the fortify-writeback stage.
+      // Backend returns full paths (local disk) or gs:// URIs; the
+      // /escalations/{filename} endpoint only needs the basename.
+      const rawFiles: string[] = result.summary?.escalation_files ?? result.escalation_files ?? [];
+      const names = rawFiles.map((p: string) => p.split('/').pop()).filter(Boolean) as string[];
+      escalationFiles = names.length > 0 ? names : undefined;
     } else if (terminalStatus === 'error') {
       outcome = 'error';
     }
@@ -526,6 +535,7 @@ export class PipelineStateService {
         outcome:           outcome           ?? r.outcome,
         prUrl:             prUrl             ?? r.prUrl,
         prUrls:            prUrls            ?? r.prUrls,
+        escalationFiles:   escalationFiles   ?? r.escalationFiles,
         confidence:        confidence        ?? r.confidence,
         confidencePercent: confidencePercent ?? r.confidencePercent,
         startedAt:         r.startedAt ?? Date.now(),
@@ -787,6 +797,27 @@ export class PipelineStateService {
       request:    undefined,
       source:     'sonar',
     }));
+  }
+
+  // ── Escalation report download ────────────────────────────────────────────
+  // Fetches a single escalation report's content from the Fortify server and
+  // triggers a browser download — same pattern as EscalationsComponent's
+  // _downloadFortify, but callable from any run card without navigating away.
+  async downloadEscalation(filename: string): Promise<void> {
+    try {
+      const resp = await fetch(`${this.fortifyBase}/escalations/${encodeURIComponent(filename)}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const blob = new Blob([data.content ?? ''], { type: 'text/plain' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      this.error.set(`Could not download escalation report: ${err.message}`);
+    }
   }
 
   // ── Shared helpers ────────────────────────────────────────────────────────
