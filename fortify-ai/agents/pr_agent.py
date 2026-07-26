@@ -245,12 +245,32 @@ def _find_existing_pr(repo, branch_name: str, repo_owner: str):
 # ── PDF attachment ────────────────────────────────────────────────────────────
 
 def _attach_pdf(pr, pdf_path: Optional[str]) -> None:
-    """Post the ADR PDF report path as a PR comment."""
+    """
+    Post the ADR PDF report path as a PR comment.
+
+    pdf_path is an absolute path captured from ADR's stdout (see
+    adr_fix._parse_adr_output), scoped to the project_path/clone directory
+    that was active when adr-fix ran. If this pr-agent invocation is a
+    resumed run (api_server.py's POST /pipeline/resume/{pipeline_id}) that
+    re-entered at this stage, adr-fix itself was NOT re-run — its
+    checkpointed AdrResult (including this pdf_path) is reused as-is, but
+    the ORIGINAL clone directory it was generated under has already been
+    deleted (cleanup happens in the endpoint's `finally` block once that
+    run's request completes or fails). No amount of relative-pathing fixes
+    this — the file is genuinely gone, not just mislocated — so this is
+    logged at INFO (not swallowed at DEBUG) to make the gap visible rather
+    than silently dropping the attachment. Non-fatal either way.
+    """
     if not pdf_path:
         return
     p = Path(pdf_path)
     if not p.exists():
-        logger.debug(f"[PR] PDF not found at {pdf_path} — skipping attachment")
+        logger.info(
+            f"[PR] ADR PDF not found at {pdf_path} — skipping attachment. "
+            "Expected after a resumed pipeline run (the original clone "
+            "directory that generated it is already cleaned up); the fix "
+            "itself is unaffected."
+        )
         return
     comment = (
         f"📄 **ADR Scan Report** attached: `{p.name}`\n\n"

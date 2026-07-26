@@ -147,10 +147,23 @@ def _find_dep_in_pom(
 def _find_property_pom(
     all_poms: list[Path],
     prop_ref: str,
+    project_path: Path,
 ) -> Optional[str]:
     """
     Search all pom files to find which one declares a given ${property}.
-    Returns the pom path string or None.
+
+    Returns the pom path **relative to project_path** (matching pom_file's
+    convention), or None if not found.
+
+    Why relative matters: this value is persisted verbatim into
+    PomLocation.property_defined_in and can be checkpointed by the API
+    server's pipeline resume support (see api_server._run_full_pipeline).
+    A resumed run re-clones the repo into a NEW temp directory — an
+    absolute path captured against the original clone would point at a
+    directory that no longer exists by the time a downstream stage (e.g.
+    adr-fix, if resume re-enters before it has run) tries to open it.
+    Returning a relative path lets it resolve correctly against whichever
+    clone directory the pipeline is currently using.
     """
     m = re.match(r"\$\{(.+)\}", prop_ref)
     if not m:
@@ -165,7 +178,10 @@ def _find_property_pom(
             ns_prefix = f"{{{ns}}}" if ns else ""
             elem = root.find(f".//{ns_prefix}properties/{ns_prefix}{prop_name}")
             if elem is not None:
-                return str(pom_path)
+                try:
+                    return str(pom_path.relative_to(project_path))
+                except ValueError:
+                    return str(pom_path)
     return None
 
 
@@ -394,7 +410,7 @@ def locate_dependency(
         if match:
             # Resolve which pom declares the property if version is ${prop}
             if match["version_property"]:
-                prop_pom = _find_property_pom(all_poms, match["version_property"])
+                prop_pom = _find_property_pom(all_poms, match["version_property"], project_path)
                 match["property_defined_in"] = prop_pom
 
             # Make path relative to project root
