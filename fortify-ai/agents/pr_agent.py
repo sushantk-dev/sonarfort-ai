@@ -214,6 +214,34 @@ def _read_codeowners(repo, branch: str) -> list[str]:
     return []
 
 
+# ── Idempotency guard ─────────────────────────────────────────────────────────
+
+def _find_existing_pr(repo, branch_name: str, repo_owner: str):
+    """
+    Look for a PR that already exists for *branch_name*.
+
+    Why this matters: adr-fix and pr-agent are checkpointed independently
+    (see api_server._run_full_pipeline). If a pipeline is interrupted after
+    adr-fix has committed+pushed but before pr-agent finishes, a resume
+    re-enters at pr-agent with the SAME (already-pushed) branch_name from
+    the checkpoint. Without this guard, resuming — or any accidental
+    double-invocation of the pr-agent stage for the same branch — would
+    open a second, duplicate PR for a branch that's already covered.
+
+    Checks open PRs first, then closed/merged, since a resumed run could
+    be re-invoked after the original PR was already merged or closed.
+    Returns the matching PR object, or None if no PR exists for this branch.
+    """
+    head_ref = f"{repo_owner}:{branch_name}" if repo_owner else branch_name
+    for state in ("open", "closed"):
+        try:
+            for pr in repo.get_pulls(state=state, head=head_ref):
+                return pr
+        except Exception as exc:
+            logger.debug(f"[PR] Existing-PR lookup ({state}) failed for {head_ref}: {exc}")
+    return None
+
+
 # ── PDF attachment ────────────────────────────────────────────────────────────
 
 def _attach_pdf(pr, pdf_path: Optional[str]) -> None:
@@ -313,6 +341,19 @@ def create_pull_request(
     # API returns 422 {"field": "head", "code": "invalid"}.
     repo_owner = github_repo.split("/")[0] if "/" in github_repo else ""
     head_ref   = f"{repo_owner}:{branch_name}" if repo_owner else branch_name
+
+    # ── Idempotency check ─────────────────────────────────────────────────────
+    existing_pr = _find_existing_pr(repo, branch_name, repo_owner)
+    if existing_pr is not None:
+        logger.info(
+            f"[PR] ↩️  PR already exists for branch '{branch_name}' — "
+            f"reusing {existing_pr.html_url} instead of creating a duplicate"
+        )
+        return PrResult(
+            pr_url=existing_pr.html_url,
+            pr_number=existing_pr.number,
+            is_draft=bool(getattr(existing_pr, "draft", is_draft)),
+        )
 
     try:
         pr = repo.create_pull(

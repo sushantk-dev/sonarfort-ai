@@ -117,6 +117,12 @@ def _blank_job(pipeline_id: str, stages: list[str] | None = None) -> dict:
         # it in a separate blob) — always present so save/get/delete_checkpoint
         # don't need special-casing.
         "checkpoint":      None,
+        # Bumped on every update_job/update_stage call. Used by the orphan-job
+        # sweep (find_stale_running) to distinguish a job that is genuinely
+        # still working from one whose pod died silently (OOM kill, node
+        # loss) without ever reaching finish_job — a "running" job with no
+        # progress for longer than the sweep timeout is presumed orphaned.
+        "last_progress_at": _now(),
     }
 
 
@@ -193,6 +199,17 @@ class JobStore(ABC):
         """Best-effort cleanup once a job completes successfully and its
         checkpoint is no longer needed for a resume."""
 
+    @abstractmethod
+    def find_stale_running(self, timeout_seconds: float) -> list[dict]:
+        """
+        Return job docs with status == 'running' whose last_progress_at is
+        older than *timeout_seconds*. Used by the orphan-job sweep to find
+        jobs whose pod died (OOM kill, node eviction, hard crash) without
+        ever calling finish_job, so they don't stay stuck at 'running'
+        forever. Callers should finish_job(..., status='failed') on each
+        result — this does NOT mutate anything itself.
+        """
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GCS implementation
@@ -254,6 +271,7 @@ class GcsJobStore(JobStore):
         blob.metadata = {
             "started_at_epoch": str(self._epoch(job.get("started_at") or _now())),
             "status": str(job.get("status", "")),
+            "last_progress_epoch": str(self._epoch(job.get("last_progress_at") or _now())),
         }
         blob.upload_from_string(
             json.dumps(doc).encode("utf-8"),
@@ -331,11 +349,15 @@ class GcsJobStore(JobStore):
 
     def update_job(self, pipeline_id: str, **fields) -> None:
         fields.pop("result", None)  # result is written only via finish_job
-        self._mutate(pipeline_id, lambda d: d.update(fields), "update_job")
+        def _apply(doc: dict) -> None:
+            doc.update(fields)
+            doc["last_progress_at"] = _now()
+        self._mutate(pipeline_id, _apply, "update_job")
 
     def update_stage(self, pipeline_id: str, stage: str, **fields) -> None:
         def _apply(doc: dict) -> None:
             doc.setdefault("stages", {}).setdefault(stage, {}).update(fields)
+            doc["last_progress_at"] = _now()
         self._mutate(pipeline_id, _apply, "update_stage")
 
     def finish_job(
@@ -445,6 +467,43 @@ class GcsJobStore(JobStore):
         except Exception as exc:
             logger.debug(f"[JobStore] delete_checkpoint skipped for {pipeline_id}: {exc}")
 
+    # ── Orphan-job sweep support ───────────────────────────────────────────────
+
+    def find_stale_running(self, timeout_seconds: float) -> list[dict]:
+        """
+        Cheap two-pass scan: filter candidates using only blob metadata
+        (no downloads), then fetch the small job docs for just those
+        candidates. Safe to call frequently from a background sweep loop
+        without downloading every job in the bucket each time.
+        """
+        cutoff = time.time() - timeout_seconds
+        candidates: list[str] = []
+        for blob in self._client.list_blobs(self._bucket_name, prefix=self._prefix):
+            name = blob.name
+            if not name.endswith(".json") or name.endswith(".result.json") \
+                    or name.endswith(".checkpoint.json"):
+                continue
+            meta = blob.metadata or {}
+            if meta.get("status") != "running":
+                continue
+            try:
+                progress_epoch = float(meta.get("last_progress_epoch", ""))
+            except (TypeError, ValueError):
+                progress_epoch = blob.time_created.timestamp() if blob.time_created else time.time()
+            if progress_epoch < cutoff:
+                candidates.append(name[len(self._prefix):-len(".json")])
+
+        stale: list[dict] = []
+        for pid in candidates:
+            doc, _gen = self._read_doc(pid)
+            # Re-check status/timestamp on the freshly read doc — the blob
+            # metadata snapshot above can be a request or two stale.
+            if doc and doc.get("status") == "running":
+                progress_epoch = self._epoch(doc.get("last_progress_at") or _now())
+                if progress_epoch < cutoff:
+                    stale.append(doc)
+        return stale
+
     # ── Lazy TTL purge (backstop — prefer a bucket lifecycle rule) ───────────
 
     def _maybe_purge(self) -> None:
@@ -502,12 +561,14 @@ class NullJobStore(JobStore):
         with self._lock:
             if pipeline_id in self._jobs:
                 self._jobs[pipeline_id].update(fields)
+                self._jobs[pipeline_id]["last_progress_at"] = _now()
 
     def update_stage(self, pipeline_id: str, stage: str, **fields) -> None:
         with self._lock:
             job = self._jobs.get(pipeline_id)
             if job:
                 job["stages"][stage].update(fields)
+                job["last_progress_at"] = _now()
 
     def finish_job(
         self,
@@ -572,6 +633,25 @@ class NullJobStore(JobStore):
             j = self._jobs.get(pipeline_id)
             if j:
                 j["checkpoint"] = None
+
+    # ── Orphan-job sweep support ───────────────────────────────────────────────
+
+    def find_stale_running(self, timeout_seconds: float) -> list[dict]:
+        cutoff = time.time() - timeout_seconds
+        stale: list[dict] = []
+        with self._lock:
+            for j in self._jobs.values():
+                if j.get("status") != "running":
+                    continue
+                try:
+                    progress_epoch = datetime.fromisoformat(
+                        j.get("last_progress_at") or j.get("started_at")
+                    ).timestamp()
+                except Exception:
+                    continue
+                if progress_epoch < cutoff:
+                    stale.append(dict(j))
+        return stale
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

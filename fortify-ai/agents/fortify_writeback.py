@@ -329,6 +329,7 @@ def write_escalation_report(
     output_dir: str,
     gcp_project: str = "",
     gcp_location: str = "us-central1",
+    pipeline_id: str | None = None,
 ) -> Optional[str]:
     """
     Write the escalation report.
@@ -343,11 +344,26 @@ def write_escalation_report(
     Local mode (GCS_BUCKET unset — single-pod development only):
         {output_dir}/escalation_{artifact_id}_{ts}.txt
 
+    Idempotency: when *pipeline_id* is supplied (the api_server pipeline
+    runner always passes it), the filename is deterministic —
+    escalation_{artifact_id}_{pipeline_id}.txt — instead of timestamp-based,
+    and an existing report for that (artifact_id, pipeline_id) pair is
+    reused rather than regenerated. This matters because fortify-writeback
+    runs last and is NOT checkpoint-skippable the way earlier stages are:
+    if a resume re-enters the pipeline at fortify-writeback (or a caller
+    retries the same pipeline_id), the previous timestamp-based filename
+    scheme would silently write a second escalation report for the same
+    finding. Individual /stages/fortify-writeback calls (no pipeline_id)
+    keep the original timestamp-based filename for backward compatibility.
+
     Returns the GCS URI or local file path on success, None on failure.
     """
     artifact_id = group["parsed"]["artifact_id"]
-    ts          = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    filename    = f"escalation_{artifact_id}_{ts}.txt"
+    if pipeline_id:
+        filename = f"escalation_{artifact_id}_{pipeline_id}.txt"
+    else:
+        ts       = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"escalation_{artifact_id}_{ts}.txt"
     text        = _escalation_report(
         group, escalation_reason, adr_results, gcp_project, gcp_location
     )
@@ -381,6 +397,18 @@ def write_escalation_report(
             return None
         prefix    = _os.environ.get("GCS_ESCALATION_PREFIX", "escalations/").rstrip("/") + "/"
         blob_name = prefix + filename
+        if pipeline_id:
+            existing = bucket.blob(blob_name)
+            try:
+                if existing.exists():
+                    uri = f"gs://{bucket_name}/{blob_name}"
+                    logger.info(
+                        f"[Report] ↩️  Escalation report already exists for this "
+                        f"pipeline run — reusing {uri} instead of regenerating"
+                    )
+                    return uri
+            except Exception as exc:
+                logger.debug(f"[Report] Existence check failed for {blob_name}: {exc} — proceeding to write")
         try:
             blob = bucket.blob(blob_name)
             blob.metadata = esc_metadata
@@ -404,6 +432,12 @@ def write_escalation_report(
         return None
 
     file_path = out_dir / filename
+    if pipeline_id and file_path.exists():
+        logger.info(
+            f"[Report] ↩️  Escalation report already exists for this "
+            f"pipeline run — reusing {file_path} instead of regenerating"
+        )
+        return str(file_path)
     try:
         file_path.write_text(text, encoding="utf-8")
         logger.info(f"[Report] 📄 Escalation report written (local): {file_path}")
@@ -423,6 +457,7 @@ def run_all_reports(
     escalation_reason: Optional[str] = None,
     gcp_project: str = "",
     gcp_location: str = "us-central1",
+    pipeline_id: str | None = None,
 ) -> dict:
     """
     For each group:
@@ -464,7 +499,8 @@ def run_all_reports(
                 or "Automated fix was not possible"
             )
             path = write_escalation_report(
-                group, reason, adr_results, output_dir, gcp_project, gcp_location
+                group, reason, adr_results, output_dir, gcp_project, gcp_location,
+                pipeline_id=pipeline_id,
             )
             if path:
                 total_escalated += 1

@@ -18,6 +18,11 @@ Execution Modes:
     GET  /pipeline/status/{pipeline_id}/{stage_name}  — status of a single stage
          stage_name: triage | version-resolver | context | api-diff |
                      ai-reasoning | adr-fix | pr-agent | fortify-writeback
+    POST /pipeline/cancel/{pipeline_id}   — cooperative cancellation at the next stage boundary
+    POST /pipeline/resume/{pipeline_id}   — resume an interrupted/failed/cancelled run from its
+                                             last checkpointed stage (full-pipeline runs only)
+    POST /pipeline/sweep                  — manually trigger the orphan-job sweep (also runs
+                                             automatically in the background on every pod)
 
   INDIVIDUAL STAGES (can be called in isolation)
     POST /stages/triage            — Stage 1: filter/group raw vulnerabilities
@@ -90,6 +95,86 @@ _store = create_job_store()
 # Override MAX_PIPELINE_WORKERS env var to tune for your pod's CPU limit.
 _MAX_WORKERS = int(os.environ.get("MAX_PIPELINE_WORKERS", 8))
 _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="pipeline-worker")
+
+# ── Fault tolerance: active-pipeline registry ─────────────────────────────────
+# Tracks pipeline_ids currently executing on THIS pod (not a global view —
+# each pod only knows about its own in-flight work). Used by the shutdown
+# handler below to mark jobs "interrupted" instead of leaving them stuck at
+# "running" forever when the pod receives SIGTERM (k8s node drain, scale-down,
+# rolling deploy, OOM-adjacent eviction, etc.).
+_active_lock = Lock()
+_ACTIVE_PIPELINES: Dict[str, float] = {}   # pipeline_id -> time.time() when it started
+
+
+def _track_start(pipeline_id: str) -> None:
+    with _active_lock:
+        _ACTIVE_PIPELINES[pipeline_id] = time.time()
+
+
+def _track_end(pipeline_id: str) -> None:
+    with _active_lock:
+        _ACTIVE_PIPELINES.pop(pipeline_id, None)
+
+
+# Orphan-job sweep tuning — env-overridable.
+_ORPHAN_SWEEP_INTERVAL_SECONDS = int(os.environ.get("ORPHAN_SWEEP_INTERVAL_SECONDS", 300))
+_ORPHAN_SWEEP_TIMEOUT_SECONDS  = int(os.environ.get("ORPHAN_SWEEP_TIMEOUT_SECONDS", 1800))
+_orphan_sweep_task: "asyncio.Task | None" = None
+
+
+def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
+    """
+    Find jobs stuck at status='running' with no stage progress for longer
+    than *timeout_seconds* (default ORPHAN_SWEEP_TIMEOUT_SECONDS) and flip
+    them to 'failed'. This closes the "stuck forever" gap left when a pod
+    dies (OOM kill, node eviction, hard crash) mid-job without ever reaching
+    finish_job — no SIGTERM is delivered in that case, so the shutdown
+    handler below never runs.
+
+    The checkpoint (if any) is preserved — finish_job only clears it on
+    status='completed' — so a swept job still exposes a resumable
+    checkpoint via POST /pipeline/resume/{pipeline_id}.
+
+    Returns the list of pipeline_ids that were swept.
+    """
+    timeout = timeout_seconds if timeout_seconds is not None else _ORPHAN_SWEEP_TIMEOUT_SECONDS
+    swept: list[str] = []
+    try:
+        stale_jobs = _store.find_stale_running(timeout)
+    except Exception as exc:
+        print(f"[OrphanSweep] find_stale_running failed: {exc}")
+        return swept
+    for job in stale_jobs:
+        pid = job.get("pipeline_id")
+        if not pid:
+            continue
+        try:
+            _store.finish_job(
+                pid, "failed",
+                error=(
+                    f"No stage progress for over {int(timeout)}s — presumed "
+                    "orphaned (pod crash, OOM kill, or node eviction). "
+                    "Resume via POST /pipeline/resume/{pipeline_id} if a "
+                    "checkpoint exists."
+                ),
+            )
+            swept.append(pid)
+            print(f"[OrphanSweep] Marked orphaned job as failed: {pid}")
+        except Exception as exc:
+            print(f"[OrphanSweep] Failed to finish_job for {pid}: {exc}")
+    return swept
+
+
+async def _orphan_sweep_loop() -> None:
+    """Background task: periodically sweep orphaned 'running' jobs."""
+    while True:
+        try:
+            await asyncio.sleep(_ORPHAN_SWEEP_INTERVAL_SECONDS)
+            await asyncio.get_event_loop().run_in_executor(_EXECUTOR, _run_orphan_sweep)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"[OrphanSweep] loop iteration failed: {exc}")
 
 
 def _now() -> str:
@@ -521,11 +606,28 @@ def _run_full_pipeline(
     dry_run: bool = False,
     pipeline_id: str | None = None,
     max_upgrades: int = 0,
+    resume_checkpoint: dict | None = None,
 ) -> dict:
     """
     Execute the full pipeline and return a summary dict.
-    When *pipeline_id* is supplied, each stage updates the shared job store so
-    callers can poll /pipeline/status/{pipeline_id} for live progress.
+
+    When *pipeline_id* is supplied, each stage updates the shared job store
+    so callers can poll /pipeline/status/{pipeline_id} for live progress,
+    AND the full JSON-serializable output of every completed stage is
+    persisted via job_store.save_checkpoint (not just the lightweight
+    output_summary shown in status polls).
+
+    When *resume_checkpoint* is supplied (job_store.get_checkpoint for a
+    prior interrupted/failed run of the SAME pipeline_id — see
+    POST /pipeline/resume/{pipeline_id}), stages already present in the
+    checkpoint are skipped entirely and their persisted output is reused
+    instead of recomputed. This is what makes resuming safe for
+    side-effecting stages: adr-fix (git commit/push) and pr-agent (opens a
+    GitHub PR) are NOT re-run once checkpointed — only stages after the
+    checkpoint's resume_stage actually execute. pr-agent additionally
+    guards against duplicate PRs via branch-name lookup (see
+    pr_agent._find_existing_pr) in case a checkpoint boundary is ever
+    re-crossed.
     """
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
@@ -564,122 +666,172 @@ def _run_full_pipeline(
         if pipeline_id:
             _update_stage(pipeline_id, name, status="skipped")
 
+    # ── Resume bookkeeping ────────────────────────────────────────────────────
+    # `acc` accumulates every completed stage's full output (not the
+    # lightweight output_summary). `resume_stage` is the name of the next
+    # stage that had NOT yet started when the checkpoint was written — every
+    # stage before it in ALL_STAGE_NAMES is skipped and served from `acc`.
+    acc: dict = dict(resume_checkpoint) if resume_checkpoint else {}
+    resume_stage: str | None = acc.pop("resume_stage", None)
+
+    def _already_done(stage: str) -> bool:
+        return bool(resume_stage) and ALL_STAGE_NAMES.index(stage) < ALL_STAGE_NAMES.index(resume_stage)
+
+    def _checkpoint(next_stage: str, **fields) -> None:
+        acc.update(fields)
+        if pipeline_id:
+            _store.save_checkpoint(pipeline_id, resume_stage=next_stage, **acc)
+
+    if resume_stage and pipeline_id:
+        print(f"[Pipeline] Resuming {pipeline_id} from stage '{resume_stage}' "
+              f"(stages before it served from checkpoint, not recomputed)")
+
     project_path = Path(cfg.project_path) if cfg.project_path else Path(".")
     japicmp_path = cfg.japicmp_jar_path or "/nonexistent/japicmp.jar"
 
     # Stage 1 — triage
-    _check_cancelled(pipeline_id)
-    t = _stage_start("triage")
-    groups, triage_skipped = group_by_dependency(raw_vulns)
-    groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
-    if not groups:
+    if _already_done("triage"):
+        groups = acc["groups"]
+        triage_skipped = acc.get("triage_skipped", 0)
+    else:
+        _check_cancelled(pipeline_id)
+        t = _stage_start("triage")
+        groups, triage_skipped = group_by_dependency(raw_vulns)
+        groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
+        if not groups:
+            _stage_done("triage", t, {
+                "total_groups": 0, "groups_count": 0,
+                "total_skipped": triage_skipped,
+            })
+            for s in ["version-resolver", "context", "api-diff",
+                      "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback"]:
+                _stage_skip(s)
+            return {"status": "skipped", "reason": "No actionable findings"}
         _stage_done("triage", t, {
-            "total_groups": 0, "groups_count": 0,
+            "total_groups": len(groups), "groups_count": len(groups),
             "total_skipped": triage_skipped,
         })
-        for s in ["version-resolver", "context", "api-diff",
-                  "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback"]:
-            _stage_skip(s)
-        return {"status": "skipped", "reason": "No actionable findings"}
-    _stage_done("triage", t, {
-        "total_groups": len(groups), "groups_count": len(groups),
-        "total_skipped": triage_skipped,
-    })
+        _checkpoint("version-resolver", groups=groups, triage_skipped=triage_skipped)
 
     # Stage 2 — version resolver
-    _check_cancelled(pipeline_id)
-    t = _stage_start("version-resolver")
-    resolved = resolve_all_groups(client, release_id, groups)
-    _stage_done("version-resolver", t, {"groups_count": len(resolved)})
+    if _already_done("version-resolver"):
+        resolved = acc["resolved"]
+    else:
+        _check_cancelled(pipeline_id)
+        t = _stage_start("version-resolver")
+        resolved = resolve_all_groups(client, release_id, groups)
+        _stage_done("version-resolver", t, {"groups_count": len(resolved)})
+        _checkpoint("context", resolved=resolved)
 
     # Stage 3 — context
-    _check_cancelled(pipeline_id)
-    t = _stage_start("context")
-    context = locate_all_groups(project_path, resolved)
-    _stage_done("context", t, {"groups_count": len(context)})
+    if _already_done("context"):
+        context = acc["context"]
+    else:
+        _check_cancelled(pipeline_id)
+        t = _stage_start("context")
+        context = locate_all_groups(project_path, resolved)
+        _stage_done("context", t, {"groups_count": len(context)})
+        _checkpoint("api-diff", context=context)
 
     # Stage 4 — api diff
-    _check_cancelled(pipeline_id)
-    t = _stage_start("api-diff")
-    diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
-    _stage_done("api-diff", t, {"groups_count": len(diffed)})
+    if _already_done("api-diff"):
+        diffed = acc["diffed"]
+    else:
+        _check_cancelled(pipeline_id)
+        t = _stage_start("api-diff")
+        diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
+        _stage_done("api-diff", t, {"groups_count": len(diffed)})
+        _checkpoint("ai-reasoning", diffed=diffed)
 
     # Stage 5 — ai reasoning
-    _check_cancelled(pipeline_id)
-    t = _stage_start("ai-reasoning")
-    try:
-        reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
-    except Exception as exc:
-        # A fatal AI reasoning error (permission denied, auth, quota, etc.)
-        # must stop the pipeline — mark the stage failed (not left stuck at
-        # "running") and re-raise so the caller marks the whole job failed.
-        _stage_fail("ai-reasoning", t, str(exc))
-        raise
-    _stage_done("ai-reasoning", t, {
-        "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
-        "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
-    })
-
-    # Stage 6 — adr fix
-    _check_cancelled(pipeline_id)
-    t = _stage_start("adr-fix")
-    adr_results: list[dict] = []
-    for group in reasoned:
-        _check_cancelled(pipeline_id)  # stop before pushing the next commit
-        artifact_id = group["parsed"]["artifact_id"]
-        if group.get("next_node") == "escalate":
-            adr_results.append({
-                "artifact_id": artifact_id,
-                "result": AdrResult(
-                    success=False, branch_name=None, commit_hash=None,
-                    build_time_seconds=None, pdf_path=None,
-                    error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
-                ),
-            })
-            continue
-        if dry_run or not cfg.adr_path:
-            adr_results.append({
-                "artifact_id": artifact_id,
-                "result": AdrResult(
-                    success=False, branch_name=None, commit_hash=None,
-                    build_time_seconds=None, pdf_path=None,
-                    error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
-                ),
-            })
-        else:
-            result = run_adr_fix(
-                group, adr_path=cfg.adr_path,
-                project_path=str(project_path),
-                jira_prefix=cfg.jira_id_prefix,
-                release_id=release_id,
-            )
-            adr_results.append({"artifact_id": artifact_id, "result": result})
-    _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-    _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
-
-    # Stage 7 — pr agent
-    _check_cancelled(pipeline_id)  # stop before opening PRs
-    pr_results = []
-    if not dry_run and cfg.github_token and cfg.github_repo:
-        t = _stage_start("pr-agent")
-        pr_results = create_prs_for_all_groups(
-            groups=reasoned, adr_results=adr_results,
-            release_id=release_id,
-            github_token=cfg.github_token,
-            github_repo=cfg.github_repo,
-            reviewers=cfg.get_reviewers(),
-        )
-        _stage_done("pr-agent", t, {"prs_created": len(pr_results)})
+    if _already_done("ai-reasoning"):
+        reasoned = acc["reasoned"]
     else:
-        _stage_skip("pr-agent")
+        _check_cancelled(pipeline_id)
+        t = _stage_start("ai-reasoning")
+        try:
+            reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
+        except Exception as exc:
+            # A fatal AI reasoning error (permission denied, auth, quota, etc.)
+            # must stop the pipeline — mark the stage failed (not left stuck at
+            # "running") and re-raise so the caller marks the whole job failed.
+            _stage_fail("ai-reasoning", t, str(exc))
+            raise
+        _stage_done("ai-reasoning", t, {
+            "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
+            "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
+        })
+        _checkpoint("adr-fix", reasoned=reasoned)
 
-    # Stage 8 — writeback + summary
+    # Stage 6 — adr fix (side-effecting: commits + pushes — never re-run once checkpointed)
+    if _already_done("adr-fix"):
+        adr_results = acc["adr_results"]
+    else:
+        _check_cancelled(pipeline_id)
+        t = _stage_start("adr-fix")
+        adr_results: list[dict] = []
+        for group in reasoned:
+            _check_cancelled(pipeline_id)  # stop before pushing the next commit
+            artifact_id = group["parsed"]["artifact_id"]
+            if group.get("next_node") == "escalate":
+                adr_results.append({
+                    "artifact_id": artifact_id,
+                    "result": AdrResult(
+                        success=False, branch_name=None, commit_hash=None,
+                        build_time_seconds=None, pdf_path=None,
+                        error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
+                    ),
+                })
+                continue
+            if dry_run or not cfg.adr_path:
+                adr_results.append({
+                    "artifact_id": artifact_id,
+                    "result": AdrResult(
+                        success=False, branch_name=None, commit_hash=None,
+                        build_time_seconds=None, pdf_path=None,
+                        error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
+                    ),
+                })
+            else:
+                result = run_adr_fix(
+                    group, adr_path=cfg.adr_path,
+                    project_path=str(project_path),
+                    jira_prefix=cfg.jira_id_prefix,
+                    release_id=release_id,
+                )
+                adr_results.append({"artifact_id": artifact_id, "result": result})
+        _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+        _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
+        _checkpoint("pr-agent", adr_results=adr_results)
+
+    # Stage 7 — pr agent (side-effecting: opens PRs — idempotent via branch-name lookup)
+    if _already_done("pr-agent"):
+        pr_results = acc.get("pr_results", [])
+    else:
+        _check_cancelled(pipeline_id)  # stop before opening PRs
+        pr_results = []
+        if not dry_run and cfg.github_token and cfg.github_repo:
+            t = _stage_start("pr-agent")
+            pr_results = create_prs_for_all_groups(
+                groups=reasoned, adr_results=adr_results,
+                release_id=release_id,
+                github_token=cfg.github_token,
+                github_repo=cfg.github_repo,
+                reviewers=cfg.get_reviewers(),
+            )
+            _stage_done("pr-agent", t, {"prs_created": len(pr_results)})
+        else:
+            _stage_skip("pr-agent")
+        _checkpoint("fortify-writeback", pr_results=pr_results)
+
+    # Stage 8 — writeback + summary (idempotent — deterministic filenames keyed by pipeline_id)
     _check_cancelled(pipeline_id)
     if not dry_run:
         t = _stage_start("fortify-writeback")
         summary = run_all_reports(
             groups=reasoned, adr_results=adr_results,
             pr_results=pr_results, output_dir=cfg.adr_output_dir,
+            pipeline_id=pipeline_id,
         )
         _stage_done("fortify-writeback", t, summary)
     else:
@@ -712,6 +864,71 @@ async def startup_event():
     except Exception as exc:
         # Non-fatal — server still starts; token can be fetched via POST /auth/token
         print(f"[Startup] Fortify token fetch error (non-fatal): {exc}")
+
+    # Start the background orphan-job sweep (see _run_orphan_sweep / plan
+    # item "orphan-job sweep"). Runs on every pod; each sweep is a cheap
+    # metadata-only scan so redundant concurrent sweeps across pods are
+    # harmless — worst case, two pods finish_job the same already-stale
+    # job, and the second write is a no-op overwrite of the same status.
+    global _orphan_sweep_task
+    _orphan_sweep_task = asyncio.create_task(_orphan_sweep_loop())
+    print(
+        f"[Startup] Orphan-job sweep running every {_ORPHAN_SWEEP_INTERVAL_SECONDS}s "
+        f"(timeout={_ORPHAN_SWEEP_TIMEOUT_SECONDS}s)"
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Runs when the ASGI server begins graceful shutdown — uvicorn invokes the
+    lifespan 'shutdown' event on receiving SIGTERM (the signal k8s sends on
+    pod termination: node drain, scale-down, rolling deploy, preemptible/spot
+    reclaim). This is the highest-leverage fault-tolerance fix: without it, a
+    pipeline caught mid-run when the pod dies is left stuck at status
+    'running' forever, with no indication anything went wrong until the
+    orphan sweep's timeout eventually catches it.
+
+    Two things happen for every pipeline_id still active on this pod:
+      1. request_cancel — gives any in-flight run a chance to stop cleanly
+         at the next stage boundary (_check_cancelled) if the remaining
+         terminationGracePeriodSeconds allows it.
+      2. finish_job(..., status='interrupted') — marks the job honestly
+         rather than leaving it at 'running'. The checkpoint written after
+         the last completed stage (see _run_full_pipeline) is NOT cleared,
+         so POST /pipeline/resume/{pipeline_id} can continue the job on
+         whichever pod picks it up next instead of restarting from triage.
+
+    Note: this only fires for a graceful SIGTERM within the pod's
+    terminationGracePeriodSeconds. A hard kill (SIGKILL / OOM kill) skips
+    application shutdown entirely — that failure mode is covered by the
+    orphan-job sweep instead (see _run_orphan_sweep).
+    """
+    with _active_lock:
+        pids = list(_ACTIVE_PIPELINES.keys())
+
+    if pids:
+        print(f"[Shutdown] SIGTERM received — {len(pids)} pipeline(s) still active on this pod: {pids}")
+
+    for pid in pids:
+        try:
+            _store.request_cancel(pid)
+        except Exception as exc:
+            print(f"[Shutdown] request_cancel failed for {pid}: {exc}")
+        try:
+            _store.finish_job(
+                pid, "interrupted",
+                error=(
+                    "Pod received SIGTERM and shut down before this pipeline "
+                    "finished. Resume via POST /pipeline/resume/{pipeline_id} "
+                    "to continue from the last completed stage."
+                ),
+            )
+        except Exception as exc:
+            print(f"[Shutdown] finish_job(interrupted) failed for {pid}: {exc}")
+
+    if _orphan_sweep_task is not None:
+        _orphan_sweep_task.cancel()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITY ENDPOINTS
@@ -1038,6 +1255,7 @@ async def pipeline_live(req: LivePipelineRequest):
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
         _store.update_job(pid, status="running")
+        _track_start(pid)
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1048,6 +1266,19 @@ async def pipeline_live(req: LivePipelineRequest):
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, req.release_id, None, None),
             )
+            # Capture everything a resume needs to reconstruct cfg + refetch
+            # vulnerabilities, using the RESOLVED release_id (not the raw
+            # request) so a later resume targets the exact same release.
+            _store.update_job(pid, resume_meta={
+                "release_id": release_id,
+                "report_path": None,
+                "app_name": None,
+                "app_id": None,
+                "repo": req.repo,
+                "dry_run": False,
+                "max_upgrades": req.max_upgrades,
+                "config_overrides": req.config.model_dump(),
+            })
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1062,6 +1293,7 @@ async def pipeline_live(req: LivePipelineRequest):
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
+            _track_end(pid)
             if clone_dir:
                 import shutil
                 shutil.rmtree(clone_dir, ignore_errors=True)
@@ -1089,6 +1321,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
         _store.update_job(pid, status="running")
+        _track_start(pid)
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1099,6 +1332,16 @@ async def pipeline_offline(req: OfflinePipelineRequest):
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, req.release_id, req.report_path, None),
             )
+            _store.update_job(pid, resume_meta={
+                "release_id": release_id,
+                "report_path": req.report_path,
+                "app_name": None,
+                "app_id": None,
+                "repo": req.repo,
+                "dry_run": False,
+                "max_upgrades": req.max_upgrades,
+                "config_overrides": req.config.model_dump(),
+            })
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1113,6 +1356,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
+            _track_end(pid)
             if clone_dir:
                 import shutil
                 shutil.rmtree(clone_dir, ignore_errors=True)
@@ -1151,6 +1395,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
         _store.update_job(pid, status="running")
+        _track_start(pid)
         try:
             cfg = _apply_overrides(load_config(), req.config)
 
@@ -1165,6 +1410,18 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, 0, None, req.app_name),
             )
+            # Store the RESOLVED release_id (not app_name) so a resume hits
+            # the exact same release even if a newer one has since appeared.
+            _store.update_job(pid, resume_meta={
+                "release_id": release_id,
+                "report_path": None,
+                "app_name": None,
+                "app_id": None,
+                "repo": req.repo,
+                "dry_run": False,
+                "max_upgrades": req.max_upgrades,
+                "config_overrides": req.config.model_dump(),
+            })
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1179,6 +1436,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
+            _track_end(pid)
             # Always remove the temp clone — mirrors CLI cleanup behaviour
             if clone_dir:
                 import shutil
@@ -1210,6 +1468,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
         _store.update_job(pid, status="running")
+        _track_start(pid)
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1220,6 +1479,16 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
                 _EXECUTOR,
                 lambda: _resolve_vulnerabilities(cfg, 0, None, None, req.app_id),
             )
+            _store.update_job(pid, resume_meta={
+                "release_id": release_id,
+                "report_path": None,
+                "app_name": None,
+                "app_id": None,
+                "repo": req.repo,
+                "dry_run": False,
+                "max_upgrades": req.max_upgrades,
+                "config_overrides": req.config.model_dump(),
+            })
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1235,6 +1504,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
+            _track_end(pid)
             if clone_dir:
                 import shutil
                 shutil.rmtree(clone_dir, ignore_errors=True)
@@ -1263,6 +1533,7 @@ async def pipeline_dry_run(req: DryRunRequest):
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
         _store.update_job(pid, status="running")
+        _track_start(pid)
         try:
             cfg = _apply_overrides(load_config(), req.config)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1276,6 +1547,16 @@ async def pipeline_dry_run(req: DryRunRequest):
                     getattr(req, "app_id", None),
                 ),
             )
+            _store.update_job(pid, resume_meta={
+                "release_id": release_id,
+                "report_path": req.report_path,
+                "app_name": None,
+                "app_id": None,
+                "repo": req.repo,
+                "dry_run": True,
+                "max_upgrades": req.max_upgrades,
+                "config_overrides": req.config.model_dump(),
+            })
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1290,6 +1571,7 @@ async def pipeline_dry_run(req: DryRunRequest):
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
         finally:
+            _track_end(pid)
             if clone_dir:
                 import shutil
                 shutil.rmtree(clone_dir, ignore_errors=True)
@@ -1308,12 +1590,19 @@ def pipeline_status(pipeline_id: str):
     Return the overall status of a pipeline job **and** the per-stage breakdown.
 
     **Overall status values**
-    | Value       | Meaning                                    |
-    |-------------|--------------------------------------------|
-    | `queued`    | Accepted but thread not yet started        |
-    | `running`   | At least one stage is executing            |
-    | `completed` | All stages finished successfully           |
-    | `failed`    | Pipeline aborted due to an unhandled error |
+    | Value         | Meaning                                                        |
+    |---------------|-----------------------------------------------------------------|
+    | `queued`      | Accepted but thread not yet started                            |
+    | `running`     | At least one stage is executing                                |
+    | `completed`   | All stages finished successfully                                |
+    | `failed`      | Pipeline aborted due to an unhandled error                      |
+    | `cancelled`   | Stopped via POST /pipeline/cancel/{pipeline_id}                 |
+    | `interrupted` | Pod received SIGTERM mid-run (see shutdown_event)               |
+
+    `failed` / `cancelled` / `interrupted` jobs that have at least one
+    completed stage carry a `resume_stage` field and can be continued via
+    **POST /pipeline/resume/{pipeline_id}** instead of restarting from
+    triage — see that endpoint's docstring for requirements.
 
     **Per-stage status values:** `pending` · `running` · `completed` · `skipped` · `failed`
 
@@ -1389,6 +1678,135 @@ def cancel_pipeline(pipeline_id: str):
         "message": "Cancellation requested — the run will stop at the next stage boundary",
         "status": "cancelling",
     })
+
+
+@app.post("/pipeline/resume/{pipeline_id}", tags=["Pipeline Status"])
+async def resume_pipeline(pipeline_id: str):
+    """
+    Resume an interrupted, failed, or cancelled pipeline run from its last
+    checkpointed stage instead of restarting from triage.
+
+    Requires:
+      - the job to exist and NOT currently be 'running' or 'completed'
+      - `resume_meta` captured at job creation (only full-pipeline runs —
+        /pipeline/live, /offline, /app-name, /app-id, /dry-run — capture
+        this; individual /stages/* calls and partial /pipeline/until/*
+        runs do not)
+      - a checkpoint (at least one stage must have completed)
+
+    Side-effecting stages already checkpointed (adr-fix, pr-agent) are
+    reused as-is and NOT re-run — see `_run_full_pipeline`'s
+    `resume_checkpoint` handling and `pr_agent._find_existing_pr` for the
+    duplicate-PR guard.
+
+    Returns a *pipeline_id* (the SAME one — resume continues the existing
+    job record rather than minting a new one) immediately; poll
+    **GET /pipeline/status/{pipeline_id}** as usual.
+    """
+    job = _store.get_job(pipeline_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+
+    if job.get("status") in ("running", "completed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot resume a job with status '{job['status']}'",
+        )
+
+    resume_meta = job.get("resume_meta")
+    if not resume_meta:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This job has no resume metadata — it was created before "
+                "resume support existed, or via an individual stage / "
+                "partial-pipeline endpoint that doesn't capture it. "
+                "Start a new pipeline run instead."
+            ),
+        )
+
+    checkpoint = _store.get_checkpoint(pipeline_id)
+    if not checkpoint:
+        raise HTTPException(
+            status_code=400,
+            detail="No checkpoint found for this job — no stage completed "
+                   "yet, so there is nothing to resume from. Start a new "
+                   "pipeline run instead.",
+        )
+
+    pid = pipeline_id
+    t0 = time.time()
+    _store.update_job(pid, status="running", cancel_requested=False, error=None)
+
+    async def _run():
+        loop = asyncio.get_event_loop()
+        clone_dir: str | None = None
+        _track_start(pid)
+        try:
+            cfg = _apply_overrides(
+                load_config(), ConfigOverrides(**resume_meta.get("config_overrides") or {}),
+            )
+            cfg, clone_dir = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _clone_repo_if_needed(cfg, resume_meta.get("repo")),
+            )
+            # Re-fetch vulnerabilities/client for API completeness even though
+            # the triage stage that consumes them will be skipped (it's
+            # already in the checkpoint) — keeps this code path identical to
+            # a fresh run rather than special-casing which stages need what.
+            client, raw_vulns, release_id, _app_id = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _resolve_vulnerabilities(
+                    cfg, resume_meta.get("release_id", 0),
+                    resume_meta.get("report_path"), resume_meta.get("app_name"),
+                    resume_meta.get("app_id"),
+                ),
+            )
+            result = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: _run_full_pipeline(
+                    cfg, client, raw_vulns, release_id,
+                    dry_run=resume_meta.get("dry_run", False),
+                    max_upgrades=resume_meta.get("max_upgrades", 0),
+                    pipeline_id=pid,
+                    resume_checkpoint=checkpoint,
+                ),
+            )
+            if resume_meta.get("repo"):
+                result["repo"] = resume_meta["repo"]
+            _finish_job(pid, "completed", result=result, t0=t0)
+        except PipelineCancelled:
+            _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
+        except Exception as exc:
+            _finish_job(pid, "failed", error=str(exc), t0=t0)
+        finally:
+            _track_end(pid)
+            if clone_dir:
+                import shutil
+                shutil.rmtree(clone_dir, ignore_errors=True)
+
+    asyncio.create_task(_run())
+    return ok({
+        "pipeline_id": pid,
+        "status": "queued",
+        "resuming_from_stage": checkpoint.get("resume_stage"),
+    })
+
+
+@app.post("/pipeline/sweep", tags=["Pipeline Status"])
+def trigger_orphan_sweep(timeout_seconds: Optional[float] = Query(default=None)):
+    """
+    Manually trigger the orphan-job sweep (also runs automatically every
+    ORPHAN_SWEEP_INTERVAL_SECONDS on every pod — see startup_event).
+
+    Flips any job stuck at status='running' with no stage progress for
+    longer than `timeout_seconds` (default ORPHAN_SWEEP_TIMEOUT_SECONDS) to
+    'failed'. Safe to call from an external scheduler (e.g. a k8s CronJob)
+    as a belt-and-braces backstop alongside the built-in background loop.
+    Checkpoints are preserved, so swept jobs remain resumable.
+    """
+    swept = _run_orphan_sweep(timeout_seconds)
+    return ok({"swept_pipeline_ids": swept, "count": len(swept)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
