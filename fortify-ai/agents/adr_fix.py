@@ -27,6 +27,7 @@ Console output (done-when):
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -81,10 +82,21 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
         "build_time_seconds": None,
         "fixes_applied": None,   # int parsed from "Fixes applied : N"
         "findings_count": None,  # int parsed from "Findings       : N unique package(s)"
+        "machine_result": None,  # dict parsed from "ADR_MACHINE_RESULT:{...}" line, if present
     }
 
     for line in combined.splitlines():
         line_s = line.strip()
+
+        # Per-dependency machine-readable result (preferred source of truth —
+        # see _parse_adr_output usage below for how it overrides the fallback
+        # count-based heuristics).
+        if line_s.startswith("ADR_MACHINE_RESULT:"):
+            try:
+                result["machine_result"] = json.loads(line_s[len("ADR_MACHINE_RESULT:"):])
+            except json.JSONDecodeError:
+                pass
+            continue
 
         # Branch name
         m = re.search(
@@ -169,6 +181,83 @@ def _extract_maven_error(stdout: str, stderr: str) -> str:
         return "\n".join(error_lines)
     # fallback: return everything we have
     return combined.strip()[-3000:] if combined.strip() else "(no output captured — check adr_fortify.py directly)"
+
+
+# ── Precise outcome messages ──────────────────────────────────────────────────
+# One template per possible per-dependency status reported in the
+# ADR_MACHINE_RESULT line. Each describes exactly what happened — no generic
+# "no matching dependency" catch-all covering unrelated outcomes.
+_STATUS_MESSAGES = {
+    "not_found": (
+        "No dependency matching '{artifact}' (checked version {current}) was found "
+        "in any pom.xml — skipping commit and PR."
+    ),
+    "already_safe": (
+        "'{artifact}' is already at the safe version {safe} in {occurrences} "
+        "location(s) — no update needed, skipping commit and PR."
+    ),
+    "no_safe_version": (
+        "'{artifact}' (current version {current}) was found, but no safe version "
+        "could be resolved for it — manual review required, skipping commit and PR."
+    ),
+    "manual_pattern": (
+        "'{artifact}' version {current} was located in pom.xml but could not be "
+        "safely rewritten automatically — manual update required, skipping commit and PR."
+    ),
+    "skipped_by_flag": (
+        "'{artifact}' was excluded from auto-fix via --skip — manual review required, "
+        "skipping commit and PR."
+    ),
+    "pending_depmanagement_pin": (
+        "'{artifact}' {current} is managed by a parent/BOM and needs a "
+        "dependencyManagement pin, but the pin could not be confirmed — "
+        "manual review required, skipping commit and PR."
+    ),
+    "unresolved": (
+        "'{artifact}' (current version {current}) was located in pom.xml, but its "
+        "fix outcome could not be determined — check the ADR log or PDF report, "
+        "skipping commit and PR."
+    ),
+}
+
+
+def _build_no_fix_reason(
+    artifact_id: str,
+    current_version: str,
+    coord_key: str,
+    coord_key_bare: str,
+    machine_result: dict | None,
+    findings_count: "int | None",
+) -> str:
+    """
+    Build a precise, status-specific reason for why zero fixes were applied.
+
+    Prefers the per-dependency status from ADR_MACHINE_RESULT (exact — reflects
+    what actually happened to this dependency). Falls back to a generic,
+    count-based message only if the running adr_fortify.py didn't emit that
+    line (e.g. an older version).
+    """
+    entry = None
+    if machine_result:
+        entry = machine_result.get(coord_key) or machine_result.get(coord_key_bare)
+
+    if entry:
+        status   = entry.get("status", "unresolved")
+        template = _STATUS_MESSAGES.get(status, _STATUS_MESSAGES["unresolved"])
+        versions = entry.get("current_versions") or [current_version]
+        return template.format(
+            artifact=artifact_id,
+            current=", ".join(versions),
+            safe=entry.get("safe_version", "?"),
+            occurrences=entry.get("occurrences", 0),
+        )
+
+    # Fallback: no machine-readable result available at all.
+    return (
+        f"No fix was applied for '{artifact_id}' (checked version {current_version}) "
+        f"(Findings: {findings_count if findings_count is not None else 'unknown'}, "
+        f"Fixes applied: 0) — skipping commit and PR."
+    )
 
 
 # ── ADR invocation ────────────────────────────────────────────────────────────
@@ -297,15 +386,15 @@ def run_adr_fix(
     if success:
         parsed_out = _parse_adr_output(stdout, stderr)
 
-        # ADR exited 0 but made no changes — dependency not found in any pom.xml.
-        # Treat as a no-op: do NOT create a branch, commit, or PR.
+        # ADR exited 0 but made no changes. Treat as a no-op: do NOT create a
+        # branch, commit, or PR — but report exactly why, per-dependency.
         fixes_applied  = parsed_out["fixes_applied"]
         findings_count = parsed_out["findings_count"]
+        machine_result = parsed_out["machine_result"]
         if fixes_applied is not None and fixes_applied == 0:
-            reason = (
-                f"ADR found no matching dependency for '{artifact_id}' in any pom.xml "
-                f"(Findings: {findings_count if findings_count is not None else 'unknown'}, "
-                f"Fixes applied: 0) — skipping commit and PR."
+            reason = _build_no_fix_reason(
+                artifact_id, current_version, coord_key, coord_key_bare,
+                machine_result, findings_count,
             )
             logger.warning(f"[ADR Fix] ⚠️  {reason}")
             return AdrResult(

@@ -544,12 +544,28 @@ def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
 
 
 def apply_fixes(content: str, findings: list) -> tuple:
-    applied, skipped = [], []
+    """Returns (content, applied, skipped, results).
+
+    `results` is a list of dicts — one per finding actually decided here
+    (transitive findings are excluded, they're handled in
+    apply_transitive_fixes) — each carrying a machine-readable `status` code
+    so callers can report a precise outcome per dependency instead of just
+    aggregate applied/skipped counts. Status codes:
+      fixed                      -- version literal replaced in this pom.xml
+      already_safe                -- current version already >= safe version
+      no_safe_version              -- no safe_version was supplied to fix to
+      manual_pattern                -- version string found but couldn't be rewritten
+      pending_depmanagement_pin      -- version managed by parent/BOM; handed to
+                                        apply_transitive_fixes for DM pinning
+    """
+    applied, skipped, results = [], [], []
 
     for f in findings:
-        dep    = f["dep"]
-        latest = f.get("safe_version", "")
-        label  = f"{dep['groupId']}:{dep['artifactId']}  {dep['version']} -> {latest}"
+        dep        = f["dep"]
+        latest     = f.get("safe_version", "")
+        coord      = f"{dep['groupId']}:{dep['artifactId']}"
+        label      = f"{coord}  {dep['version']} -> {latest}"
+        target_key = dep.get("_target_key")
 
         if dep.get("transitive"):
             # Transitive fixes are handled separately in apply_transitive_fixes()
@@ -557,27 +573,42 @@ def apply_fixes(content: str, findings: list) -> tuple:
             continue
 
         if not latest:
-            skipped.append(f"{dep['groupId']}:{dep['artifactId']}  "
+            skipped.append(f"{coord}  "
                            f"(Maven Central returned no version -- update manually)")
+            results.append({"target_key": target_key, "coord": coord,
+                             "current_version": dep["version"], "safe_version": latest,
+                             "status": "no_safe_version"})
             continue
         if latest == dep["version"]:
             skipped.append(f"{label}  (already on latest)")
+            results.append({"target_key": target_key, "coord": coord,
+                             "current_version": dep["version"], "safe_version": latest,
+                             "status": "already_safe"})
             continue
 
         new = _upgrade_version(content, dep, latest)
         if new != content:
             content = new
             applied.append(label)
+            results.append({"target_key": target_key, "coord": coord,
+                             "current_version": dep["version"], "safe_version": latest,
+                             "status": "fixed"})
         else:
             # Version literal not in this pom.xml — likely managed by a parent BOM or
             # ancestor property.  Flag it for dependencyManagement pinning instead of
             # reporting as unfixable.
             if dep["version"] not in content:
                 dep["_needs_depmanagement_pin"] = True
+                results.append({"target_key": target_key, "coord": coord,
+                                 "current_version": dep["version"], "safe_version": latest,
+                                 "status": "pending_depmanagement_pin"})
             else:
                 skipped.append(f"{label}  (pattern not matched -- update manually)")
+                results.append({"target_key": target_key, "coord": coord,
+                                 "current_version": dep["version"], "safe_version": latest,
+                                 "status": "manual_pattern"})
 
-    return content, applied, skipped
+    return content, applied, skipped, results
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1345,6 +1376,41 @@ def main():
             print(f"{C.RED}[ERROR] --target-versions is not valid JSON: {exc}{C.RESET}")
             sys.exit(1)
 
+    # ── Per-target-dependency status tracker ───────────────────────────────────
+    # Keyed the same way as _target_map (full "groupId:artifactId" and/or bare
+    # "artifactId" keys). Updated as each key is matched/fixed/skipped across
+    # every module, then emitted as a single machine-readable summary line at
+    # the end of the run so callers get a precise, per-dependency outcome
+    # instead of guessing from aggregate counts.
+    _STATUS_PRIORITY = {
+        "fixed": 6, "transitive_pinned": 6,
+        "pending_depmanagement_pin": 5,
+        "already_safe": 4,
+        "manual_pattern": 3, "skipped_by_flag": 3,
+        "no_safe_version": 2,
+        "matched": 1,
+        "not_found": 0,
+    }
+
+    def _upgrade_status(entry: dict, new_status: str):
+        if _STATUS_PRIORITY.get(new_status, 0) >= _STATUS_PRIORITY.get(entry["status"], -1):
+            entry["status"] = new_status
+
+    def _resolve_target_key(coord: str) -> "str | None":
+        """Given a 'groupId:artifactId' coord, find which _target_map key it satisfies."""
+        if coord in _target_map:
+            return coord
+        aid = coord.split(":")[-1]
+        if aid in _target_map:
+            return aid
+        return None
+
+    _target_status: dict = {
+        k: {"safe_version": v.get("safe_version", ""), "status": "not_found",
+            "current_versions": [], "occurrences": 0}
+        for k, v in _target_map.items()
+    }
+
     if not _target_map:
         print(f"{C.YELLOW}[WARN] --target-versions not provided — no deps will be fixed. "
               f"Use --scan for a read-only report.{C.RESET}")
@@ -1573,12 +1639,19 @@ def main():
         if _target_map:
             for dep in deps:
                 coord = f"{dep['groupId']}:{dep['artifactId']}"
-                target = _target_map.get(coord) or _target_map.get(dep['artifactId'])
+                matched_key = _resolve_target_key(coord)
+                target = _target_map.get(matched_key) if matched_key else None
                 if target:
                     dep["safe_version"]   = target.get("safe_version", "")
                     dep["severity"]       = target.get("severity", "High")
                     dep["cve_id"]         = target.get("cve_id", "")
                     dep["latest_version"] = target.get("safe_version", "")
+                    dep["_target_key"]    = matched_key
+                    st = _target_status[matched_key]
+                    st["occurrences"] += 1
+                    if dep["version"] not in st["current_versions"]:
+                        st["current_versions"].append(dep["version"])
+                    _upgrade_status(st, "matched")
                     print(f"  {C.CYAN}[Fortify]{C.RESET}  Matched '{coord}' → safe version {dep['safe_version']}")
 
             # Warn about any target keys that matched nothing in the parsed deps
@@ -1639,7 +1712,7 @@ def main():
         t0 = time.time()
         fix_findings = [f for f in findings if f["dep"]["artifactId"] not in skip_set]
         skipped_by_flag = [f for f in findings if f["dep"]["artifactId"] in skip_set]
-        content, applied, skipped = apply_fixes(content, fix_findings)
+        content, applied, skipped, fix_results = apply_fixes(content, fix_findings)
         for f in skipped_by_flag:
             art = f["dep"]["artifactId"]
             msg = f"{f['dep']['groupId']}:{art} skipped (--skip flag)"
@@ -1647,12 +1720,23 @@ def main():
                 print(f"  {C.YELLOW}[SKIP ]{C.RESET}  {msg}  (applies to all modules)")
                 _printed_flag_skips.add(art)
             all_skipped.append((pom_path, msg))
+            tk = f["dep"].get("_target_key")
+            if tk:
+                _upgrade_status(_target_status[tk], "skipped_by_flag")
         for msg in applied:
             print(f"  {C.GREEN}[FIXED]{C.RESET}  {msg}")
             all_applied.append((pom_path, msg))
         for msg in skipped:
             print(f"  {C.YELLOW}[SKIP ]{C.RESET}  {msg}")
             all_skipped.append((pom_path, msg))
+        for r in fix_results:
+            tk = r["target_key"]
+            if not tk:
+                continue
+            st = _target_status[tk]
+            _upgrade_status(st, r["status"])
+            if r["current_version"] not in st["current_versions"]:
+                st["current_versions"].append(r["current_version"])
 
         if applied:
             backup_path = f"{pom_path}.bak_{timestamp}"
@@ -1688,10 +1772,19 @@ def main():
             for msg in t_injected:
                 print(f"  {C.GREEN}[TRANS ]{C.RESET}  {msg}")
                 all_applied.append((root_pom_path, msg))
+                tk = _resolve_target_key(msg.split("  ")[0])
+                if tk:
+                    _upgrade_status(_target_status[tk], "transitive_pinned")
             for msg in t_already_ok:
                 print(f"  {C.GRAY}[OK    ]{C.RESET}  {msg}")
+                tk = _resolve_target_key(msg.split("  ")[0])
+                if tk:
+                    _upgrade_status(_target_status[tk], "already_safe")
             for msg in t_no_safe:
                 print(f"  {C.YELLOW}[MANUAL]{C.RESET}  {msg}")
+                tk = _resolve_target_key(msg.split("  ")[0])
+                if tk:
+                    _upgrade_status(_target_status[tk], "no_safe_version")
             if new_root != root_content:
                 backup_root = f"{root_pom_path}.bak_{timestamp}"
                 if backup_root not in all_backups:
@@ -1965,6 +2058,24 @@ def main():
         print(f"  {C.YELLOW}│{C.RESET}  {C.BOLD}  {step.format(base_branch=_base_branch)}{C.RESET}")
     print(f"  {C.YELLOW}└{'─' * (W - 2)}{C.RESET}")
     print()
+
+    # ── Machine-readable per-dependency result ─────────────────────────────────
+    # One deterministic, uncolored line callers (e.g. adr_fix.py) can grep for
+    # and json.loads to build a precise, specific message instead of guessing
+    # from aggregate applied/skipped counts. "not_found" means the key never
+    # matched anything in any pom.xml across the whole scan; any other status
+    # means it was located and this is its actual fix outcome.
+    if _target_map:
+        _status_payload = {
+            k: {
+                "safe_version":     v["safe_version"],
+                "current_versions": v["current_versions"],
+                "occurrences":      v["occurrences"],
+                "status":           v["status"] if v["status"] != "matched" else "unresolved",
+            }
+            for k, v in _target_status.items()
+        }
+        print(f"ADR_MACHINE_RESULT:{json.dumps(_status_payload, separators=(',', ':'))}")
 
 
 if __name__ == "__main__":
