@@ -14,6 +14,11 @@ export const routes: Routes = [
       import('./features/pipeline/pipeline.component').then(m => m.PipelineComponent),
   },
   {
+    path: 'activity',
+    loadComponent: () =>
+      import('./features/activity/activity.component').then(m => m.ActivityComponent),
+  },
+  {
     path: 'pipeline/summary/:pipelineId',
     loadComponent: () =>
       import('./features/pipeline/summary-report.component').then(m => m.SummaryReportComponent),

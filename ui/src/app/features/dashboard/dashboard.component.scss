@@ -120,8 +120,8 @@
   flex-shrink: 0;
 }
 
-// ── Fortify pipeline — second flow section ────────────────────────────────
-.flow-section--fortify {
+// ── Second flow section gets the gap, regardless of which one it is ──────
+.flow-section + .flow-section {
   margin-top: 16px;
 }
 

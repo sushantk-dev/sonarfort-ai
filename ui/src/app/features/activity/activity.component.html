@@ -1,0 +1,155 @@
+<div class="page">
+
+  <!-- ── Header ── -->
+  <div class="page-header">
+    <div>
+      <h1>Activity</h1>
+      <p class="meta">
+        Every Fortify pipeline run — running, completed, and failed — across
+        <strong>all users</strong>. Backed by the shared job store, refreshed
+        automatically every 20s.
+      </p>
+    </div>
+    <div class="header-actions">
+      <button class="refresh-btn" (click)="refresh()" title="Refresh outputs (PRs / escalation reports)">
+        <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
+          <path d="M12 4.5A5 5 0 1 0 12.8 8" stroke="currentColor" stroke-width="1.3"
+                stroke-linecap="round" fill="none"/>
+          <path d="M12.3 1.8V4.9H9.2" stroke="currentColor" stroke-width="1.3"
+                stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        </svg>
+        Refresh
+      </button>
+      <a routerLink="/pipeline" class="run-btn">
+        <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+          <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
+        </svg>
+        Run Pipeline
+      </a>
+    </div>
+  </div>
+
+  <!-- ── Filter tabs ── -->
+  <div class="filter-bar">
+    <div class="filter-tabs">
+      <button class="filter-tab" [class.filter-tab--active]="filter() === 'all'"
+              (click)="setFilter('all')">
+        All <span class="count">{{ counts().all }}</span>
+      </button>
+      <button class="filter-tab filter-tab--running" [class.filter-tab--active]="filter() === 'running'"
+              (click)="setFilter('running')">
+        Running <span class="count">{{ counts().running }}</span>
+      </button>
+      <button class="filter-tab filter-tab--done" [class.filter-tab--active]="filter() === 'done'"
+              (click)="setFilter('done')">
+        Completed <span class="count">{{ counts().done }}</span>
+      </button>
+      <button class="filter-tab filter-tab--error" [class.filter-tab--active]="filter() === 'error'"
+              (click)="setFilter('error')">
+        Failed <span class="count">{{ counts().error }}</span>
+      </button>
+      <button class="filter-tab" [class.filter-tab--active]="filter() === 'cancelled'"
+              (click)="setFilter('cancelled')">
+        Cancelled <span class="count">{{ counts().cancelled }}</span>
+      </button>
+    </div>
+
+    <input
+      class="search-input"
+      type="text"
+      placeholder="Search by id, release, app, or repo…"
+      [value]="search()"
+      (input)="search.set($any($event.target).value)"
+    />
+  </div>
+
+  <!-- ── Runs table ── -->
+  <div class="runs-table" *ngIf="filteredRuns().length > 0; else empty">
+    <div class="runs-table__head">
+      <span class="col col--status">Status</span>
+      <span class="col col--run">Run</span>
+      <span class="col col--stages">Stages</span>
+      <span class="col col--started">Started</span>
+      <span class="col col--output">Output</span>
+      <span class="col col--actions">Actions</span>
+    </div>
+
+    <div class="runs-table__row" *ngFor="let run of filteredRuns()">
+
+      <!-- Status -->
+      <div class="col col--status">
+        <span class="status-dot" [class.status-dot--running]="run.status === 'running'"
+              [class.status-dot--queued]="run.status === 'queued'"
+              [class.status-dot--done]="run.status === 'done'"
+              [class.status-dot--error]="run.status === 'error'"
+              [class.status-dot--cancelled]="run.status === 'cancelled'"></span>
+        {{ statusLabel(run) }}
+      </div>
+
+      <!-- Run identity -->
+      <div class="col col--run">
+        <div class="run-name">{{ run.ruleKey }}</div>
+        <div class="run-sub">
+          <span class="run-id">{{ run.id }}</span>
+          <span *ngIf="run.component">· {{ run.component }}</span>
+        </div>
+      </div>
+
+      <!-- Stage progress -->
+      <div class="col col--stages">
+        <div class="stage-bar">
+          <div class="stage-bar__fill"
+               [style.width.%]="stagesTotal(run) ? (stagesDone(run) / stagesTotal(run) * 100) : 0"
+               [class.stage-bar__fill--error]="run.status === 'error'"></div>
+        </div>
+        <span class="stage-count">{{ stagesDone(run) }}/{{ stagesTotal(run) }}</span>
+      </div>
+
+      <!-- Started -->
+      <div class="col col--started">{{ elapsedLabel(run) }}</div>
+
+      <!-- Output: PRs + escalation reports -->
+      <div class="col col--output">
+        <ng-container *ngIf="run.prUrls?.length; else noPr">
+          <a *ngFor="let url of run.prUrls" [href]="url" target="_blank" rel="noopener"
+             class="output-chip output-chip--pr" (click)="$event.stopPropagation()">
+            PR ↗
+          </a>
+        </ng-container>
+        <ng-template #noPr>
+          <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank" rel="noopener"
+             class="output-chip output-chip--pr" (click)="$event.stopPropagation()">PR ↗</a>
+        </ng-template>
+
+        <button *ngFor="let file of run.escalationFiles"
+                class="output-chip output-chip--escalation"
+                (click)="downloadEscalation(file, $event)">
+          Escalation ⬇
+        </button>
+
+        <span *ngIf="run.outcome" class="badge {{ $any(run.outcome) | outcomeClass }}">
+          {{ $any(run.outcome) | outcomeLabel }}
+        </span>
+
+        <span *ngIf="!run.prUrls?.length && !run.prUrl && !run.escalationFiles?.length && !run.outcome
+                      && (run.status === 'running' || run.status === 'queued')"
+              class="output-pending">pending…</span>
+      </div>
+
+      <!-- Actions -->
+      <div class="col col--actions">
+        <a [routerLink]="['/pipeline/summary', run.id]" class="action-link">Details</a>
+        <button *ngIf="canResume(run)" class="action-link action-link--resume" (click)="resume(run)">
+          Resume
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <ng-template #empty>
+    <div class="empty-state">
+      <p>No runs match this filter yet.</p>
+    </div>
+  </ng-template>
+
+</div>

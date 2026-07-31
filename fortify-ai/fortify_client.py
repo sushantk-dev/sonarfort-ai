@@ -81,19 +81,32 @@ class FortifyClient:
     _PAGE_SIZE = 50          # items per page for paginated endpoints
     _REQUEST_TIMEOUT = 60    # seconds per HTTP call
 
-    def __init__(self, base_url: str, api_token: str) -> None:
+    def __init__(self, base_url: str, api_token: str, persist_token: bool = True) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = self._build_session(api_token)
+        # Remembered so a later 401-triggered _refresh_session() knows
+        # whether the refreshed token is allowed to become the shared
+        # env/GCS fallback (see fortify_auth.ensure_token).
+        self._persist_token = persist_token
 
     # ── Constructor helpers ───────────────────────────────────────────────────
 
     @classmethod
-    def from_config(cls, config: FortifyAIConfig) -> "FortifyClient":
+    def from_config(cls, config: FortifyAIConfig, persist_token: bool = True) -> "FortifyClient":
+        """
+        ``persist_token`` — pass False when *config* carries per-request
+        Fortify credentials that don't belong to the server's own default
+        account (e.g. a user-supplied username/password for a single
+        pipeline run). This keeps the freshly-fetched token out of the
+        shared env/GCS fallback that other, un-credentialed requests would
+        otherwise pick up. Defaults to True for backward compatibility.
+        """
         from fortify_auth import ensure_token  # local import avoids circular dep
-        config = ensure_token(config)          # proactive refresh — no-op if fresh
+        config = ensure_token(config, persist_token=persist_token)  # proactive refresh — no-op if fresh
         return cls(
             base_url=config.fortify_base_url,
             api_token=config.fortify_api_token,
+            persist_token=persist_token,
         )
 
     @staticmethod
@@ -132,7 +145,7 @@ class FortifyClient:
         """
         from fortify_auth import ensure_token, invalidate_cache
         invalidate_cache(config)
-        config = ensure_token(config)
+        config = ensure_token(config, persist_token=self._persist_token)
         self._session.headers.update({
             "Authorization": f"Bearer {config.fortify_api_token}",
         })

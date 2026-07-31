@@ -228,6 +228,18 @@ export class ApiService {
     return this.http.post<any>(`${this.fortifyBase}/pipeline/resume/${pipelineId}`, {});
   }
 
+  /**
+   * List Fortify pipeline jobs across ALL users — backed by the shared
+   * (GCS) job store, not this browser's localStorage. This is what lets
+   * one user see runs that a teammate started (running, completed, or
+   * failed) instead of only the ones they personally kicked off.
+   */
+  listFortifyRuns(limit = 100, offset = 0): Observable<{ data: { jobs: any[]; count: number } }> {
+    return this.http.get<any>(
+      `${this.fortifyBase}/pipeline/runs?limit=${limit}&offset=${offset}`
+    );
+  }
+
   // ── Escalations ──────────────────────────────────────────────────────────
 
   listEscalations(): Observable<{ escalations: any[]; total: number }> {

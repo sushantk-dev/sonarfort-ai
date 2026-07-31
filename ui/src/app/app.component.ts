@@ -45,6 +45,14 @@ import { RouterOutlet, RouterLink, RouterLinkActive } from '@angular/router';
             Pipeline
           </a>
 
+          <a routerLink="/activity" routerLinkActive="is-active" class="nav-link">
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+              <path d="M1.5 8.5L4.5 8.5L6 12L8 2.5L9.5 8.5L13.5 8.5" stroke="currentColor" stroke-width="1.4"
+                    stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+            </svg>
+            Activity
+          </a>
+
           <a routerLink="/issues" routerLinkActive="is-active" class="nav-link">
             <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
               <rect x="1.5" y="3" width="12" height="1.4" rx=".7" fill="currentColor"/>

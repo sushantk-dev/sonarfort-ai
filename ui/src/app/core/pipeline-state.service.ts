@@ -29,6 +29,11 @@ const FORTIFY_STAGE_ORDER = Object.keys(FORTIFY_STAGE_LABELS);
 const POLL_MS        = 30000;  // poll interval while running
 const QUEUED_POLL_MS = 30000;  // poll interval — same cadence whether queued or running
 
+// Poll interval for the shared "all users" Fortify runs list (GET /pipeline/runs).
+// Independent of QUEUED_POLL_MS above, which only tracks pipelines *this*
+// browser started — this one is what surfaces teammates' runs.
+const ALL_RUNS_POLL_MS = 20000;
+
 // ── localStorage key for Fortify runs that survived a page reload ─────────────
 const FORTIFY_ACTIVE_KEY = 'sonarfort_fortify_active_runs';
 
@@ -128,6 +133,10 @@ export class PipelineStateService {
   // FIX 2: queue of Fortify runs waiting for the current run to finish
   private _fortifyQueue: Array<{ pipelineId: string; mode: FortifyMode; body: Record<string, unknown> }> = [];
 
+  // Polls GET /pipeline/runs on the Fortify server — the shared, GCS-backed
+  // job list that includes runs started by *any* user, not just this browser.
+  private _allRunsPoll?: Subscription;
+
   get allRuns()  { return this.runs(); }
   get canCancel(){ return this.running() && !!this._activeRunId; }
 
@@ -145,6 +154,12 @@ export class PipelineStateService {
       this.runs.set(history);
       this.selected.set(history[0]);
     }
+
+    // ── Step 1b: Start polling the shared "all users" Fortify runs list.
+    // Independent of the Sonar fetch below — this is what lets a run
+    // started by a teammate (on a different browser/machine) show up here,
+    // instead of only ever seeing runs this browser itself kicked off.
+    this._startAllFortifyRunsPolling();
 
     // ── Step 2: Fetch live Sonar runs from backend and merge ──────────────────
     this.api.listRuns().subscribe({
@@ -752,6 +767,134 @@ export class PipelineStateService {
     if (newCards[0]) this.selected.set(newCards[0]);
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // ALL-USERS FORTIFY RUNS — GET /pipeline/runs (shared job store)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Start (or restart) periodic polling of the shared Fortify runs list. */
+  private _startAllFortifyRunsPolling() {
+    this._allRunsPoll?.unsubscribe();
+    this._allRunsPoll = timer(0, ALL_RUNS_POLL_MS)
+      .pipe(switchMap(() => this.api.listFortifyRuns()))
+      .subscribe({
+        next: resp => this._mergeBackendFortifyJobs(resp),
+        // Best-effort — a Fortify server hiccup shouldn't surface an error
+        // banner for a background list refresh.
+        error: () => {},
+      });
+  }
+
+  /** Merge jobs from GET /pipeline/runs into the shared `runs` signal. */
+  private _mergeBackendFortifyJobs(resp: any) {
+    const jobs: any[] = resp?.data?.jobs ?? resp?.jobs ?? [];
+    if (jobs.length === 0) return;
+
+    this.runs.update(rs => {
+      const byId = new Map(rs.map(r => [r.id, r] as const));
+      for (const job of jobs) {
+        const id = job?.pipeline_id;
+        if (!id) continue;
+
+        // Don't stomp on a run *this* browser is actively driving — its
+        // locally-polled state (from _applyFortifyStatus) is more current
+        // and includes fields (outcome, PR urls, etc.) this listing omits.
+        if (this._fortifyPolls.has(id) || id === this._activeRunId) continue;
+
+        const mapped   = this._backendFortifyJobToUiRun(job);
+        const existing = byId.get(id);
+        // Prefer whichever side actually has richer data instead of blindly
+        // overwriting — the list endpoint omits result-derived fields
+        // (PR urls, confidence, escalation files) that a prior live poll
+        // or history entry for this same id may already have captured.
+        byId.set(id, existing ? {
+          ...existing,
+          ...mapped,
+          outcome:            mapped.outcome            ?? existing.outcome,
+          prUrl:              existing.prUrl             ?? mapped.prUrl,
+          prUrls:             existing.prUrls            ?? mapped.prUrls,
+          escalationFiles:    existing.escalationFiles    ?? mapped.escalationFiles,
+          confidence:         existing.confidence         ?? mapped.confidence,
+          confidencePercent:  existing.confidencePercent  ?? mapped.confidencePercent,
+          startedAt:          existing.startedAt          ?? mapped.startedAt,
+        } : mapped);
+      }
+      return Array.from(byId.values()).sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+    });
+
+    if (!this.selected() && this.runs().length > 0) {
+      this.selected.set(this.runs()[0]);
+    }
+  }
+
+  /** Map a job doc from GET /pipeline/runs (or /pipeline/status) → UiRun. */
+  private _backendFortifyJobToUiRun(job: any): UiRun {
+    const backendStatus = job.status;
+    const status: UiRun['status'] =
+      backendStatus === 'completed'   ? 'done'
+      : backendStatus === 'failed'      ? 'error'
+      : backendStatus === 'interrupted' ? 'error'
+      : backendStatus === 'cancelled'   ? 'cancelled'
+      : backendStatus === 'running'     ? 'running'
+      : 'queued';
+
+    const stages: Record<string, any> = job.stages ?? {};
+    const steps: PipelineStep[] = FORTIFY_STAGE_ORDER.map(key => {
+      const s = stages[key] ?? {};
+      const apiStatus: string = s.status ?? 'pending';
+      const uiStatus =
+        apiStatus === 'completed' ? 'done'
+        : apiStatus === 'failed'  ? 'error'
+        : apiStatus === 'running' ? 'running'
+        : apiStatus === 'skipped' ? 'done'
+        : 'pending';
+      const ms = s.elapsed_seconds != null ? Math.round(s.elapsed_seconds * 1000) : 0;
+      const summary = s.output_summary;
+      let detail = s.error ?? '';
+      if (!detail && summary) detail = this._summariseStageOutput(key, summary);
+      return { label: FORTIFY_STAGE_LABELS[key], status: uiStatus as any, detail, ms };
+    });
+
+    // Other users' jobs don't carry the original request body (that only
+    // ever lived in the requester's browser) — fall back to resume_meta,
+    // which the backend captures server-side for every full-pipeline run.
+    const meta = job.resume_meta ?? {};
+    const ruleKey =
+      meta.app_name    ? String(meta.app_name)
+      : meta.release_id  ? `Release ${meta.release_id}`
+      : meta.report_path ? `Offline · ${String(meta.report_path).split('/').pop()}`
+      : 'Fortify pipeline';
+    const component = meta.repo ?? '';
+
+    const outcome = status === 'error' ? 'error' : status === 'cancelled' ? 'cancelled' : undefined;
+
+    return {
+      id:         job.pipeline_id,
+      ruleKey,
+      severity:   'FORTIFY',
+      component,
+      steps,
+      live:       true,
+      status,
+      outcome,
+      source:     'fortify',
+      startedAt:  job.started_at ? new Date(job.started_at).getTime() : undefined,
+    };
+  }
+
+  /**
+   * Fetch the full detail (PR urls, escalation files, confidence, outcome)
+   * for one pipeline_id and merge it into `runs`/`selected`. GET
+   * /pipeline/runs deliberately omits this (it's a heavy, separate GCS
+   * blob) — call this on demand, e.g. for rows a dashboard is displaying,
+   * rather than for every job on every list poll.
+   */
+  hydrateRunDetail(pipelineId: string): void {
+    this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`).subscribe({
+      next: resp => this._applyFortifyStatus(pipelineId, resp),
+      error: () => {},
+    });
+  }
+
   // ── Backend run hydration ─────────────────────────────────────────────────
   private _backendRunToUiRun(r: any): UiRun {
     const first = Array.isArray(r.results) ? r.results[0] : undefined;
@@ -901,7 +1044,16 @@ export class PipelineStateService {
    */
   resumeFortifyRun(pipelineId: string) {
     const run = this.runs().find(r => r.id === pipelineId);
-    if (!run || !this.canResume(run) || !run.fortifyRequest) return;
+    if (!run || !this.canResume(run)) return;
+
+    // A run discovered via the shared all-users list (GET /pipeline/runs)
+    // never had a local fortifyRequest captured — that only exists for
+    // runs *this* browser originally submitted. The backend resume call
+    // itself doesn't need it (it re-reads resume_meta server-side), so
+    // fall back to a generic placeholder purely for local queue/poll
+    // bookkeeping below.
+    const mode: FortifyMode = run.fortifyRequest?.mode ?? 'live';
+    const body: Record<string, unknown> = run.fortifyRequest?.body ?? {};
 
     this.error.set(null);
 
@@ -922,15 +1074,11 @@ export class PipelineStateService {
         const sonarRunActive = !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
         if (sonarRunActive) {
           this.runs.update(rs => rs.map(r => r.id === pipelineId ? { ...r, status: 'queued' as const } : r));
-          this._fortifyQueue.push({
-            pipelineId,
-            mode: run.fortifyRequest!.mode,
-            body: run.fortifyRequest!.body,
-          });
+          this._fortifyQueue.push({ pipelineId, mode, body });
           return;
         }
 
-        this._persistFortifyRun(pipelineId, run.fortifyRequest!.mode, run.fortifyRequest!.body);
+        this._persistFortifyRun(pipelineId, mode, body);
         this._startFortifyPoll(pipelineId);
         this.running.set(true);
         this._activeRunId = pipelineId;

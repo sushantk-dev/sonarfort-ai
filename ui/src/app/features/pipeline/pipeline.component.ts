@@ -44,7 +44,7 @@ export class PipelineComponent {
   }
 
   // ── Source tab: 'sonar' | 'fortify' | 'both' ─────────────────────────────
-  activeSource = signal<'sonar' | 'fortify'>('sonar');
+  activeSource = signal<'sonar' | 'fortify'>('fortify');
 
   // ── Pipeline step labels ──────────────────────────────────────────────────
   readonly FORTIFY_STEPS = [
@@ -90,6 +90,24 @@ export class PipelineComponent {
   fortifyReportPath  = signal('');       // offline mode: path to JSON report
   fortifyMaxUpgrades = signal(0);        // 0 = no limit
   showFortifyForm    = signal(false);
+
+  // ── Per-run credentials — never persisted, cleared after each submit ──────
+  // Each Fortify run can use a different GitHub PAT / Fortify account, so
+  // these live on the form rather than in global Settings/config.
+  fortifyGithubToken = signal('');       // GitHub PAT used for clone + PR for THIS run
+  fortifyUsername    = signal('');       // Fortify OAuth username, WITHOUT the "equifax\" prefix
+  fortifyPassword     = signal('');       // Fortify OAuth password for THIS run
+
+  private readonly FORTIFY_DOMAIN_PREFIX = 'equifax\\';
+
+  /** Prepend the "equifax\" domain prefix expected by Fortify OAuth, once. */
+  private _domainQualify(username: string): string {
+    const trimmed = username.trim();
+    if (!trimmed) return '';
+    return trimmed.toLowerCase().startsWith(this.FORTIFY_DOMAIN_PREFIX.toLowerCase())
+      ? trimmed
+      : `${this.FORTIFY_DOMAIN_PREFIX}${trimmed}`;
+  }
 
   // ── Severity multi-select — all enabled by default ────────────────────────
   selectedSevs = signal<Set<string>>(
@@ -198,11 +216,24 @@ export class PipelineComponent {
     // Uses fortifyBaseUrl — routes to separate Fortify port if configured
     const baseUrl  = this.apiCfg.fortifyBaseUrl();
 
+    // Per-run credential overrides — only sent when the user actually filled
+    // them in, so an empty field falls back to the server's env-configured
+    // defaults instead of clobbering them with an empty string.
+    const credConfig: Record<string, unknown> = {
+      ...(this.fortifyGithubToken().trim() ? { github_token: this.fortifyGithubToken().trim() } : {}),
+      ...(this.fortifyUsername().trim()    ? { fortify_username: this._domainQualify(this.fortifyUsername()) } : {}),
+      ...(this.fortifyPassword().trim()    ? { fortify_password: this.fortifyPassword() } : {}),
+    };
+
     let body: Record<string, unknown> = {
       max_upgrades: this.fortifyMaxUpgrades() || 0,
       ...(this.fortifyGithubRepo() ? { repo: this.fortifyGithubRepo() } : {}),
-      config: {},
+      config: credConfig,
     };
+
+    // Don't linger with plaintext credentials in memory / the DOM any longer
+    // than needed — the values are already captured in credConfig above.
+    this.fortifyPassword.set('');
 
     switch (mode) {
       case 'live':

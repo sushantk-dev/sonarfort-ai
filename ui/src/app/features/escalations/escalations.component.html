@@ -6,16 +6,18 @@
       <h1>Escalations</h1>
       <p class="meta">Issues that could not be auto-fixed — require manual review</p>
     </div>
-    <button class="refresh-btn" (click)="load()" [disabled]="loading() || fortifyLoading()">
-      <svg width="13" height="13" viewBox="0 0 13 13" fill="none"
-           [class.spinning]="loading() || fortifyLoading()">
-        <path d="M2 6.5A4.5 4.5 0 1 1 6.5 11" stroke="currentColor" stroke-width="1.4"
-              stroke-linecap="round"/>
-        <path d="M2 4V7H5" stroke="currentColor" stroke-width="1.4"
-              stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      Refresh
-    </button>
+    <div class="header-actions" style="display:flex;align-items:center;gap:8px;">
+      <button class="refresh-btn" (click)="load()" [disabled]="loading() || fortifyLoading()">
+        <svg width="13" height="13" viewBox="0 0 13 13" fill="none"
+             [class.spinning]="loading() || fortifyLoading()">
+          <path d="M2 6.5A4.5 4.5 0 1 1 6.5 11" stroke="currentColor" stroke-width="1.4"
+                stroke-linecap="round"/>
+          <path d="M2 4V7H5" stroke="currentColor" stroke-width="1.4"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Refresh
+      </button>
+    </div>
   </div>
 
   <!-- ── Source tab switcher ── -->

@@ -119,7 +119,7 @@ def invalidate_cache(cfg: FortifyAIConfig) -> None:
 # Public proactive-refresh API
 # ===============================================================================
 
-def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
+def ensure_token(cfg: FortifyAIConfig, persist_token: bool = True) -> FortifyAIConfig:
     """
     Return a *new* ``FortifyAIConfig`` with a guaranteed-fresh Bearer token.
 
@@ -131,9 +131,29 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
        -> return a copy with the cached token injected.
     3. Cache miss or token within ``_EXPIRY_BUFFER_SECS`` of expiry
        -> fetch a fresh token, update the cache, return a copy with the new
-       token injected and set it in the process environment.
+       token injected. Also written to the shared process environment (and
+       shared GCS runtime config, if configured) -- but ONLY when
+       ``persist_token`` is True.
     4. OAuth credentials missing **and** ``fortify_api_token`` is already set
        -> assume the caller manages the token manually; return ``cfg`` unchanged.
+
+    ``persist_token``
+    ~~~~~~~~~~~~~~~~~
+    The in-process cache (keyed by ``(base_url, username)``) is ALWAYS
+    updated regardless of this flag -- that's what makes repeated calls for
+    the same credentials cheap and keeps concurrent users/runs correctly
+    isolated from each other.
+
+    The shared env/GCS writeback in ``write_token_to_env`` is different: it
+    becomes the *fallback* token for any future request that doesn't supply
+    its own credentials. Pass ``persist_token=False`` whenever ``cfg``
+    carries one-off, per-request Fortify credentials (e.g. a user-supplied
+    username/password for a single pipeline run) so that one run's token
+    never leaks into becoming everyone else's default.
+
+    Only refreshes of the server's own env-configured default credentials
+    should pass ``persist_token=True`` (the default, for backward
+    compatibility with existing callers that don't pass per-request creds).
 
     The returned config is a Pydantic ``model_copy`` -- the original ``cfg``
     is never mutated.
@@ -167,11 +187,17 @@ def ensure_token(cfg: FortifyAIConfig) -> FortifyAIConfig:
     # Fetch a fresh token from the OAuth endpoint
     logger.info("[FortifyAuth] Token missing or near expiry -- fetching fresh token.")
     token_data   = fetch_token(cfg)
-    access_token = _store_token(cfg, token_data)
+    access_token = _store_token(cfg, token_data)  # always updates the in-process cache
 
-    # Set the new token in the process environment so the next fresh
-    # FortifyAIConfig() read (e.g. a future load_config() call) sees it too
-    write_token_to_env(access_token)
+    if persist_token:
+        # Set the new token in the process environment so the next fresh
+        # FortifyAIConfig() read (e.g. a future load_config() call) sees it too
+        write_token_to_env(access_token)
+    else:
+        logger.debug(
+            "[FortifyAuth] persist_token=False -- token cached in-process for "
+            "this account only; NOT written to shared env/GCS config."
+        )
 
     return cfg.model_copy(update={"fortify_api_token": access_token})
 

@@ -250,6 +250,18 @@ class ConfigOverrides(BaseModel):
     """Optional per-request overrides for any FortifyAIConfig field."""
     fortify_base_url: Optional[str] = None
     fortify_api_token: Optional[str] = None
+    fortify_username: Optional[str] = Field(
+        default=None,
+        description=(
+            "Fortify OAuth username for this run only (overrides FORTIFY_USERNAME). "
+            "The client is expected to send the fully-qualified value already "
+            "prefixed with the 'equifax\\\\' domain, e.g. 'equifax\\\\jdoe'."
+        ),
+    )
+    fortify_password: Optional[str] = Field(
+        default=None,
+        description="Fortify OAuth password for this run only (overrides FORTIFY_PASSWORD).",
+    )
     github_token: Optional[str] = None
     github_repo: Optional[str] = None
     project_path: Optional[str] = None
@@ -501,12 +513,31 @@ def _apply_overrides(cfg: FortifyAIConfig, overrides: ConfigOverrides) -> Fortif
     return FortifyAIConfig(**data)
 
 
+def _should_persist_token(overrides: ConfigOverrides) -> bool:
+    """
+    Decide whether a freshly-fetched Fortify OAuth token may be written to
+    the shared process environment / GCS runtime config (see
+    fortify_auth.write_token_to_env).
+
+    That writeback is a *global* fallback used by any future request that
+    doesn't supply its own credentials. If THIS request supplied a
+    per-run fortify_username/fortify_password override, the token it
+    produces belongs to that one user/run and must never become the
+    default other users' un-credentialed runs silently pick up.
+
+    Only the server's own env-configured default credentials (no override
+    present) are allowed to refresh the shared fallback token.
+    """
+    return not (overrides.fortify_username or overrides.fortify_password)
+
+
 def _resolve_vulnerabilities(
     cfg: FortifyAIConfig,
     release_id: int,
     report_path: str | None,
     app_name: str | None,
     app_id: int | None = None,
+    persist_token: bool = True,
 ):
     """
     Returns (client, raw_vulns, resolved_release_id, resolved_app_id).
@@ -516,6 +547,12 @@ def _resolve_vulnerabilities(
       2. release_id   — direct, fastest
       3. app_id       — skips name lookup, calls GET /releases?limit=1
       4. app_name     — name → app_id → release_id (two API calls)
+
+    ``persist_token`` controls whether a freshly-fetched OAuth token gets
+    written to the shared process env / GCS config — see
+    ``_should_persist_token``. Pass False whenever ``cfg`` carries
+    per-request Fortify credentials that don't belong to the server's
+    own default account.
     """
     from fortify_client import FortifyClient
     from offline_loader import load_report, NullFortifyClient
@@ -526,7 +563,7 @@ def _resolve_vulnerabilities(
         client = NullFortifyClient(raw_vulns)
         return client, raw_vulns, effective_release_id, None
 
-    client = FortifyClient.from_config(cfg)
+    client = FortifyClient.from_config(cfg, persist_token=persist_token)
     resolved_app_id: int | None = app_id
 
     if app_name and not app_id:
@@ -1264,7 +1301,10 @@ async def pipeline_live(req: LivePipelineRequest):
             )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
-                lambda: _resolve_vulnerabilities(cfg, req.release_id, None, None),
+                lambda: _resolve_vulnerabilities(
+                    cfg, req.release_id, None, None,
+                    persist_token=_should_persist_token(req.config),
+                ),
             )
             # Capture everything a resume needs to reconstruct cfg + refetch
             # vulnerabilities, using the RESOLVED release_id (not the raw
@@ -1330,7 +1370,10 @@ async def pipeline_offline(req: OfflinePipelineRequest):
             )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
-                lambda: _resolve_vulnerabilities(cfg, req.release_id, req.report_path, None),
+                lambda: _resolve_vulnerabilities(
+                    cfg, req.release_id, req.report_path, None,
+                    persist_token=_should_persist_token(req.config),
+                ),
             )
             _store.update_job(pid, resume_meta={
                 "release_id": release_id,
@@ -1408,7 +1451,10 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
 
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
-                lambda: _resolve_vulnerabilities(cfg, 0, None, req.app_name),
+                lambda: _resolve_vulnerabilities(
+                    cfg, 0, None, req.app_name,
+                    persist_token=_should_persist_token(req.config),
+                ),
             )
             # Store the RESOLVED release_id (not app_name) so a resume hits
             # the exact same release even if a newer one has since appeared.
@@ -1477,7 +1523,10 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
             )
             client, raw_vulns, release_id, app_id = await loop.run_in_executor(
                 _EXECUTOR,
-                lambda: _resolve_vulnerabilities(cfg, 0, None, None, req.app_id),
+                lambda: _resolve_vulnerabilities(
+                    cfg, 0, None, None, req.app_id,
+                    persist_token=_should_persist_token(req.config),
+                ),
             )
             _store.update_job(pid, resume_meta={
                 "release_id": release_id,
@@ -1545,6 +1594,7 @@ async def pipeline_dry_run(req: DryRunRequest):
                 lambda: _resolve_vulnerabilities(
                     cfg, req.release_id, req.report_path, req.app_name,
                     getattr(req, "app_id", None),
+                    persist_token=_should_persist_token(req.config),
                 ),
             )
             _store.update_job(pid, resume_meta={
@@ -1583,6 +1633,32 @@ async def pipeline_dry_run(req: DryRunRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 # PIPELINE STATUS ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/pipeline/runs", tags=["Pipeline Status"])
+def list_pipeline_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    List Fortify pipeline jobs across **all users** — not just the caller's
+    own browser session.
+
+    Jobs are persisted server-side (GCS-backed `JobStore`, shared across
+    every pod), so this reflects the *global* state of every run currently
+    queued/running/completed/failed/cancelled, regardless of who started it
+    or which machine/browser they used. This is what powers the shared
+    Activity dashboard instead of each user only seeing pipelines they
+    personally kicked off from their own browser's local storage.
+
+    Returns newest-first, paginated via `limit` / `offset`. Each entry is
+    the same lightweight job doc shape as `GET /pipeline/status/{id}`
+    (overall status + per-stage breakdown) but excludes the heavy `result`
+    payload and `checkpoint` — fetch `GET /pipeline/status/{pipeline_id}`
+    for the full detail on any individual run.
+    """
+    jobs = _store.list_jobs(limit=limit, offset=offset)
+    return ok({"jobs": jobs, "count": len(jobs)})
+
 
 @app.get("/pipeline/status/{pipeline_id}", tags=["Pipeline Status"])
 def pipeline_status(pipeline_id: str):
@@ -1743,9 +1819,8 @@ async def resume_pipeline(pipeline_id: str):
         clone_dir: str | None = None
         _track_start(pid)
         try:
-            cfg = _apply_overrides(
-                load_config(), ConfigOverrides(**resume_meta.get("config_overrides") or {}),
-            )
+            resume_overrides = ConfigOverrides(**resume_meta.get("config_overrides") or {})
+            cfg = _apply_overrides(load_config(), resume_overrides)
             cfg, clone_dir = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _clone_repo_if_needed(cfg, resume_meta.get("repo")),
@@ -1760,6 +1835,7 @@ async def resume_pipeline(pipeline_id: str):
                     cfg, resume_meta.get("release_id", 0),
                     resume_meta.get("report_path"), resume_meta.get("app_name"),
                     resume_meta.get("app_id"),
+                    persist_token=_should_persist_token(resume_overrides),
                 ),
             )
             result = await loop.run_in_executor(
@@ -1851,7 +1927,7 @@ def stage_version_resolver(req: VersionResolverRequest):
         cfg = _apply_overrides(load_config(), req.config)
         from fortify_client import FortifyClient
         from agents.version_resolver import resolve_all_groups
-        client = FortifyClient.from_config(cfg)
+        client = FortifyClient.from_config(cfg, persist_token=_should_persist_token(req.config))
         resolved = resolve_all_groups(client, req.release_id, req.groups)
         return ok({"groups": resolved}, time.time() - t0)
     except Exception as exc:
@@ -2301,6 +2377,7 @@ def _make_partial_endpoint(stop_after: StageLabel):
                     lambda: _resolve_vulnerabilities(
                         cfg, req.release_id, req.report_path, req.app_name,
                         getattr(req, "app_id", None),
+                        persist_token=_should_persist_token(req.config),
                     ),
                 )
                 result = await loop.run_in_executor(
