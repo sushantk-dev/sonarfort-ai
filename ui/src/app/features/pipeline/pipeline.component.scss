@@ -800,12 +800,6 @@
 
     &--wide { flex: 2; }
     &--sm   { flex: 0 0 110px; min-width: unset; }
-
-    // Dry-run mode: 4 fields in one row — proportional widths, no wrapping
-    &--dryrun-id     { flex: 0 0 140px;  min-width: unset; }
-    &--dryrun-report { flex: 1 1 180px;  min-width: 0; }
-    &--dryrun-repo   { flex: 1 1 160px;  min-width: 0; }
-    &--dryrun-upg    { flex: 0 0 110px;  min-width: unset; }
   }
 
   &__input {
@@ -1575,31 +1569,6 @@
   width:       100%;
 }
 
-// ── Dry run note ──────────────────────────────────────────────────────────
-.dry-run-note {
-  display:       flex;
-  align-items:   flex-start;
-  gap:           8px;
-  font-size:     12px;
-  color:         var(--text-secondary);
-  background:    var(--surface-1);
-  border:        1px solid var(--border);
-  border-radius: 6px;
-  padding:       10px 12px;
-  line-height:   1.5;
-  width:         100%;
-  box-sizing:    border-box;
-  word-break:    break-word;
-  overflow-wrap: break-word;
-
-  svg {
-    flex-shrink: 0;
-    margin-top:  1px;
-    color:       var(--text-muted);
-  }
-
-  strong { color: var(--text-primary); }
-}
 // ── Sonar pipeline flow strip (replaces Both dual-flow) ───────────────────
 .sonar-flow {
   display:       flex;

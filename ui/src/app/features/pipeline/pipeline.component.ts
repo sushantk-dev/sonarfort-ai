@@ -11,13 +11,12 @@ import { OutcomeLabelPipe } from '../../shared/outcome-label.pipe';
 import { ActiveStepPipe }  from '../../shared/active-step.pipe';
 
 // ── Fortify pipeline mode → API endpoint mapping ──────────────────────────────
-export type FortifyMode = 'live' | 'offline' | 'app-name' | 'dry-run';
+export type FortifyMode = 'live' | 'offline' | 'app-name';
 
 const ENDPOINT_MAP: Record<FortifyMode, string> = {
   'live':     '/pipeline/live',
   'offline':  '/pipeline/offline',
   'app-name': '/pipeline/app-name',
-  'dry-run':  '/pipeline/dry-run',
 };
 
 @Component({
@@ -63,7 +62,6 @@ export class PipelineComponent {
     { label: 'Live',      value: 'live'     },
     { label: 'Offline',   value: 'offline'  },
     { label: 'App Name',  value: 'app-name' },
-    { label: 'Dry Run',   value: 'dry-run'  },
   ];
 
   // ── Active Fortify mode ───────────────────────────────────────────────────
@@ -224,14 +222,6 @@ export class PipelineComponent {
         body = {
           ...body,
           app_name: this.fortifyAppName(),
-        };
-        break;
-      case 'dry-run':
-        body = {
-          ...body,
-          release_id:  Number(this.fortifyReleaseId()) || 0,
-          report_path: this.fortifyReportPath() || null,
-          app_name:    null,
         };
         break;
     }

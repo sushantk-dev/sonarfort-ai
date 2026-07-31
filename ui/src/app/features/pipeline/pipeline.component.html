@@ -275,44 +275,6 @@
         </div>
       </ng-container>
 
-      <!-- DRY-RUN: release_id or report_path + repo, no side effects -->
-      <ng-container *ngIf="fortifyMode() === 'dry-run'">
-        <div class="run-form__field run-form__field--dryrun-id">
-          <label>Release ID <span class="label-opt">or use report</span></label>
-          <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
-                 (input)="fortifyReleaseId.set($any($event.target).value)"
-                 placeholder="e.g. 1723380">
-        </div>
-        <div class="run-form__field run-form__field--dryrun-report">
-          <label>Report Path <span class="label-opt">optional, overrides release ID</span></label>
-          <input class="run-form__input" [value]="fortifyReportPath()"
-                 (input)="fortifyReportPath.set($any($event.target).value)"
-                 placeholder="/tmp/report.json">
-        </div>
-        <div class="run-form__field run-form__field--dryrun-repo">
-          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
-          <input class="run-form__input" [value]="fortifyGithubRepo()"
-                 (input)="fortifyGithubRepo.set($any($event.target).value)"
-                 placeholder="acme/backend">
-        </div>
-        <div class="run-form__field run-form__field--dryrun-upg">
-          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
-          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
-                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
-                 min="0" placeholder="0">
-        </div>
-        <div class="run-form__field run-form__field--full">
-          <div class="dry-run-note">
-            <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-              <circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.3"/>
-              <path d="M7 5V7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-              <circle cx="7" cy="9.5" r=".5" fill="currentColor"/>
-            </svg>
-            Dependency fix, PR creation, and Fortify writeback are <strong>skipped</strong>. Safe to preview on any project.
-          </div>
-        </div>
-      </ng-container>
-
     </div>
 
     <div class="run-form__flags">
