@@ -101,7 +101,7 @@ const STAGE_LABELS: Record<string, string> = {
   'context':           'Context',
   'api-diff':          'API Diff',
   'ai-reasoning':      'AI Reasoning',
-  'adr-fix':           'ADR Fix',
+  'adr-fix':           'Dependency Fix',
   'pr-agent':          'PR Agent',
   'fortify-writeback': 'Fortify Writeback',
 };

@@ -30,7 +30,7 @@ export class DashboardComponent {
     { name: 'Context',           desc: 'Locate in repo'    },
     { name: 'API Diff',          desc: 'japicmp analysis'  },
     { name: 'AI Reasoning',      desc: 'Safety verdict'    },
-    { name: 'ADR Fix',           desc: 'pom.xml bump'      },
+    { name: 'Dependency Fix',           desc: 'pom.xml bump'      },
     { name: 'AI Code Fix',       desc: 'Call-site patch'   },
     { name: 'PR Agent',          desc: 'GitHub PR'         },
     { name: 'Writeback',         desc: 'Fortify comment'   },

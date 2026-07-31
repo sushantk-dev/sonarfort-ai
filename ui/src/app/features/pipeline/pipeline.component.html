@@ -308,7 +308,7 @@
               <path d="M7 5V7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
               <circle cx="7" cy="9.5" r=".5" fill="currentColor"/>
             </svg>
-            ADR fix, PR creation, and Fortify writeback are <strong>skipped</strong>. Safe to preview on any project.
+            Dependency fix, PR creation, and Fortify writeback are <strong>skipped</strong>. Safe to preview on any project.
           </div>
         </div>
       </ng-container>
@@ -494,7 +494,7 @@
                other Fortify runs, so resume shouldn't be blocked by either. -->
           <div class="detail__actions" *ngIf="run.source === 'fortify' && state.canResume(run)">
             <button class="action-btn action-btn--restart"
-                    title="Continue from the last completed stage — already-committed work (adr-fix, pr-agent) won't be redone"
+                    title="Continue from the last completed stage — already-committed work (dependency-fix, pr-agent) won't be redone"
                     (click)="state.resumeFortifyRun(run.id)">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <path d="M2 6A4 4 0 1 1 6 10" stroke="currentColor" stroke-width="1.4"
