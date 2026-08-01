@@ -83,7 +83,11 @@ def api_diff_agent(state: AgentState) -> AgentState:
     project_path = state.get("_project_path")  # type: ignore[attr-defined]
     japicmp_jar = state.get("_japicmp_jar")    # type: ignore[attr-defined]
     if project_path is None or japicmp_jar is None:
-        return _stub("ApiDiff", state)
+        logger.warning("[ApiDiff] Not configured (missing project_path/japicmp_jar) — skipping, pipeline will halt")
+        state["status"] = "skipped"
+        state["skip_reason"] = "ApiDiff not configured (missing project_path or japicmp_jar)"
+        state["audit_trail"].append({"node": "ApiDiff", "status": "skipped"})
+        return state
     return api_diff_node(state, project_path, japicmp_jar)
 
 
@@ -199,6 +203,21 @@ def route_triage(
     return "version_resolver"
 
 
+def route_api_diff(
+    state: AgentState,
+) -> Literal["ai_reasoning_agent", END]:  # type: ignore[valid-type]
+    """
+    Iteration 6: API Diff is a required step — if it failed (fatal error) or
+    was skipped (no context groups / not configured), stop the pipeline here
+    rather than letting AI Reasoning silently proceed without diff data.
+    Routes to END (not "escalate") so the "failed"/"skipped" status set by
+    api_diff_node/api_diff_agent is preserved as-is.
+    """
+    if state.get("status") in ("failed", "skipped"):
+        return END
+    return "ai_reasoning_agent"
+
+
 def route_ai_reasoning(
     state: AgentState,
 ) -> Literal["adr_fix", "ai_code_fix", "escalate", END]:  # type: ignore[valid-type]
@@ -299,7 +318,14 @@ def build_graph() -> StateGraph:
     # Happy path (no conditionals yet)
     graph.add_edge("version_resolver", "context")
     graph.add_edge("context", "api_diff_agent")
-    graph.add_edge("api_diff_agent", "ai_reasoning_agent")
+    graph.add_conditional_edges(
+        "api_diff_agent",
+        route_api_diff,
+        {
+            "ai_reasoning_agent": "ai_reasoning_agent",
+            END: END,
+        },
+    )
 
     # AI reasoning → branch on confidence
     graph.add_conditional_edges(

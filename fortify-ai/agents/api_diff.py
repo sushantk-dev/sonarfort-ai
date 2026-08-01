@@ -514,7 +514,18 @@ def api_diff_node(state: AgentState, project_path: str, japicmp_jar_path: str) -
         state["audit_trail"].append({"node": "api_diff", "status": "skipped"})
         return state
 
-    enriched = run_api_diff_all_groups(groups, Path(project_path), japicmp_jar_path)
+    try:
+        enriched = run_api_diff_all_groups(groups, Path(project_path), japicmp_jar_path)
+    except Exception as exc:  # any fatal error — halt the pipeline
+        logger.error(f"[API Diff] Fatal error — halting pipeline: {exc}")
+        state["status"] = "failed"
+        state["escalation_reason"] = f"API Diff failed: {exc}"
+        state["audit_trail"].append({
+            "node": "api_diff",
+            "status": "failed",
+            "error": str(exc),
+        })
+        return state
 
     state["_diff_groups"] = enriched  # type: ignore[typeddict-unknown-key]
     state["audit_trail"].append({
