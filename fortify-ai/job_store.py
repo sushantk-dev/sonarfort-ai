@@ -104,10 +104,17 @@ def _blank_job(pipeline_id: str, stages: list[str] | None = None) -> dict:
         "result":          None,
         "cancel_requested": False,
         "stages":          _blank_stages(stages),
-        # Non-secret request metadata needed to reconstruct cfg/client on a
-        # resume (release_id, repo, report_path, dry_run, ...). Set once at
-        # job creation by api_server.py. None means "resume unsupported"
-        # (e.g. a job created before this feature existed).
+        # Request metadata needed to reconstruct cfg/client on a resume
+        # (release_id, repo, report_path, dry_run, config_overrides, ...).
+        # Set once at job creation by api_server.py via
+        # credential_vault.encrypt_resume_meta — any secret fields inside
+        # config_overrides (Fortify password, GitHub PAT, Sonar token) are
+        # symmetrically encrypted before this dict ever reaches the store,
+        # so this doc is safe to persist even though the job store itself
+        # (a GCS bucket, in production) isn't a secrets manager. Decrypted
+        # on the way out via credential_vault.decrypt_resume_meta. None
+        # means "resume unsupported" (e.g. a job created before this
+        # feature existed, or via an individual-stage/partial endpoint).
         "resume_meta":     None,
         # Name of the next stage a resume would start at. Mirrored from the
         # checkpoint doc onto this small record so status polls can show
@@ -123,6 +130,17 @@ def _blank_job(pipeline_id: str, stages: list[str] | None = None) -> dict:
         # loss) without ever reaching finish_job — a "running" job with no
         # progress for longer than the sweep timeout is presumed orphaned.
         "last_progress_at": _now(),
+        # How many times api_server.py's `_try_auto_resume` has restarted
+        # this job from its checkpoint without a human calling
+        # POST /pipeline/resume/{pipeline_id}. Bounded by
+        # AUTO_RESUME_MAX_ATTEMPTS so a permanently-broken run doesn't loop
+        # forever; persists across resumes/restarts (never reset) so the
+        # count is meaningful even if the job bounces between pods.
+        "auto_resume_attempts": 0,
+        # "auto" | "manual" | None — who most recently (re)started this run.
+        # Informational only (surfaced on status polls), set by
+        # _start_resume in api_server.py.
+        "resumed_by": None,
     }
 
 

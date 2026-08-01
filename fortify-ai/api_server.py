@@ -20,9 +20,24 @@ Execution Modes:
                      ai-reasoning | adr-fix | pr-agent | fortify-writeback
     POST /pipeline/cancel/{pipeline_id}   — cooperative cancellation at the next stage boundary
     POST /pipeline/resume/{pipeline_id}   — resume an interrupted/failed/cancelled run from its
-                                             last checkpointed stage (full-pipeline runs only)
+                                             last checkpointed stage (full-pipeline runs only).
+                                             Most jobs never need this call made manually — see
+                                             AUTO_RESUME_ENABLED below.
     POST /pipeline/sweep                  — manually trigger the orphan-job sweep (also runs
                                              automatically in the background on every pod)
+
+  AUTO-RESUME (env-configurable, on by default)
+    Jobs left 'interrupted' (graceful pod SIGTERM) or 'failed' (orphan-swept
+    after a hard pod death) are automatically resumed from their last
+    checkpoint — by the orphan sweep as soon as it detects them, and by a
+    one-shot scan at every pod's startup — instead of waiting for a human
+    to call POST /pipeline/resume/{pipeline_id}. Bounded by
+    AUTO_RESUME_MAX_ATTEMPTS (default 3) per job so a permanently-broken
+    run doesn't retry forever. Disable with AUTO_RESUME_ENABLED=false.
+
+    Any per-request credentials captured for the resume (Fortify password,
+    GitHub PAT, Sonar token) are stored symmetrically encrypted — see
+    credential_vault.py — never in plaintext in the job store.
 
   INDIVIDUAL STAGES (can be called in isolation)
     POST /stages/triage            — Stage 1: filter/group raw vulnerabilities
@@ -77,6 +92,7 @@ from pydantic import BaseModel, Field
 from config import FortifyAIConfig, load_config
 from job_store import create_job_store, ALL_STAGE_NAMES
 from runtime_config import apply_overrides, persist_overrides, is_persisted
+from credential_vault import encrypt_resume_meta, decrypt_resume_meta
 from state import AgentState
 
 # Pull any GCS-persisted runtime config overrides (Settings-page saves,
@@ -121,21 +137,40 @@ _ORPHAN_SWEEP_INTERVAL_SECONDS = int(os.environ.get("ORPHAN_SWEEP_INTERVAL_SECON
 _ORPHAN_SWEEP_TIMEOUT_SECONDS  = int(os.environ.get("ORPHAN_SWEEP_TIMEOUT_SECONDS", 1800))
 _orphan_sweep_task: "asyncio.Task | None" = None
 
+# Auto-resume tuning — env-overridable. When enabled, jobs that would
+# otherwise sit stuck waiting for a human to call
+# POST /pipeline/resume/{pipeline_id} are resumed automatically from their
+# last checkpoint instead — see `_try_auto_resume`, used by both the
+# orphan sweep (below) and `startup_event` (jobs left 'interrupted' by a
+# previous pod's graceful-shutdown handler).
+_AUTO_RESUME_ENABLED = os.environ.get("AUTO_RESUME_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+_AUTO_RESUME_MAX_ATTEMPTS = int(os.environ.get("AUTO_RESUME_MAX_ATTEMPTS", 3))
+# Statuses eligible for auto-resume. Deliberately excludes 'cancelled' —
+# a user-requested cancellation should stay cancelled unless a human
+# explicitly resumes it.
+_AUTO_RESUME_STATUSES = ("interrupted", "failed")
+
 
 def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
     """
     Find jobs stuck at status='running' with no stage progress for longer
-    than *timeout_seconds* (default ORPHAN_SWEEP_TIMEOUT_SECONDS) and flip
-    them to 'failed'. This closes the "stuck forever" gap left when a pod
-    dies (OOM kill, node eviction, hard crash) mid-job without ever reaching
-    finish_job — no SIGTERM is delivered in that case, so the shutdown
-    handler below never runs.
+    than *timeout_seconds* (default ORPHAN_SWEEP_TIMEOUT_SECONDS). This
+    closes the "stuck forever" gap left when a pod dies (OOM kill, node
+    eviction, hard crash) mid-job without ever reaching finish_job — no
+    SIGTERM is delivered in that case, so the shutdown handler below never
+    runs.
 
-    The checkpoint (if any) is preserved — finish_job only clears it on
-    status='completed' — so a swept job still exposes a resumable
-    checkpoint via POST /pipeline/resume/{pipeline_id}.
+    Each stale job is first offered to `_try_auto_resume` — if it has a
+    resumable checkpoint, auto-resume attempts remaining, and
+    AUTO_RESUME_ENABLED is set, it's picked back up right away on this
+    (healthy) pod instead of being left for a human. Only jobs
+    auto-resume declines are flipped to 'failed' (checkpoint, if any, is
+    preserved either way — finish_job only clears it on
+    status='completed' — so a manual POST /pipeline/resume/{pipeline_id}
+    remains available even after auto-resume attempts are exhausted).
 
-    Returns the list of pipeline_ids that were swept.
+    Returns the list of pipeline_ids that were swept (auto-resumed or
+    marked failed).
     """
     timeout = timeout_seconds if timeout_seconds is not None else _ORPHAN_SWEEP_TIMEOUT_SECONDS
     swept: list[str] = []
@@ -149,6 +184,10 @@ def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
         if not pid:
             continue
         try:
+            # Mark it failed first so `_try_auto_resume`'s status check
+            # (interrupted/failed) sees a consistent, non-'running' record
+            # to work from — it flips it straight back to 'running' if it
+            # decides to resume.
             _store.finish_job(
                 pid, "failed",
                 error=(
@@ -159,7 +198,10 @@ def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
                 ),
             )
             swept.append(pid)
-            print(f"[OrphanSweep] Marked orphaned job as failed: {pid}")
+            if _try_auto_resume(pid):
+                print(f"[OrphanSweep] Orphaned job {pid} auto-resumed from checkpoint")
+            else:
+                print(f"[OrphanSweep] Marked orphaned job as failed: {pid}")
         except Exception as exc:
             print(f"[OrphanSweep] Failed to finish_job for {pid}: {exc}")
     return swept
@@ -943,6 +985,21 @@ async def startup_event():
         f"(timeout={_ORPHAN_SWEEP_TIMEOUT_SECONDS}s)"
     )
 
+    # One-shot scan for jobs stranded 'interrupted'/'failed' by a pod that
+    # went away before it could resume them itself — picks the work back
+    # up on this pod instead of waiting for a human or the next sweep
+    # interval. See _auto_resume_startup_scan / AUTO_RESUME_ENABLED.
+    if _AUTO_RESUME_ENABLED:
+        try:
+            resumed = await loop.run_in_executor(_EXECUTOR, _auto_resume_startup_scan)
+            if resumed:
+                print(f"[Startup] Auto-resumed {len(resumed)} job(s) left over from a "
+                      f"previous pod: {resumed}")
+        except Exception as exc:
+            print(f"[Startup] Auto-resume scan error (non-fatal): {exc}")
+    else:
+        print("[Startup] Auto-resume disabled (AUTO_RESUME_ENABLED=false)")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1338,7 +1395,10 @@ async def pipeline_live(req: LivePipelineRequest):
             # Capture everything a resume needs to reconstruct cfg + refetch
             # vulnerabilities, using the RESOLVED release_id (not the raw
             # request) so a later resume targets the exact same release.
-            _store.update_job(pid, resume_meta={
+            # Credentials inside config_overrides (Fortify password, GitHub
+            # PAT, Sonar token, ...) are symmetrically encrypted before
+            # this ever reaches the job store — see credential_vault.py.
+            _store.update_job(pid, resume_meta=encrypt_resume_meta({
                 "release_id": release_id,
                 "report_path": None,
                 "app_name": None,
@@ -1347,7 +1407,7 @@ async def pipeline_live(req: LivePipelineRequest):
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
                 "config_overrides": req.config.model_dump(),
-            })
+            }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1404,7 +1464,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
                     persist_token=_should_persist_token(req.config),
                 ),
             )
-            _store.update_job(pid, resume_meta={
+            _store.update_job(pid, resume_meta=encrypt_resume_meta({
                 "release_id": release_id,
                 "report_path": req.report_path,
                 "app_name": None,
@@ -1413,7 +1473,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
                 "config_overrides": req.config.model_dump(),
-            })
+            }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1487,7 +1547,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
             )
             # Store the RESOLVED release_id (not app_name) so a resume hits
             # the exact same release even if a newer one has since appeared.
-            _store.update_job(pid, resume_meta={
+            _store.update_job(pid, resume_meta=encrypt_resume_meta({
                 "release_id": release_id,
                 "report_path": None,
                 "app_name": None,
@@ -1496,7 +1556,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
                 "config_overrides": req.config.model_dump(),
-            })
+            }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1557,7 +1617,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
                     persist_token=_should_persist_token(req.config),
                 ),
             )
-            _store.update_job(pid, resume_meta={
+            _store.update_job(pid, resume_meta=encrypt_resume_meta({
                 "release_id": release_id,
                 "report_path": None,
                 "app_name": None,
@@ -1566,7 +1626,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
                 "config_overrides": req.config.model_dump(),
-            })
+            }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1626,7 +1686,7 @@ async def pipeline_dry_run(req: DryRunRequest):
                     persist_token=_should_persist_token(req.config),
                 ),
             )
-            _store.update_job(pid, resume_meta={
+            _store.update_job(pid, resume_meta=encrypt_resume_meta({
                 "release_id": release_id,
                 "report_path": req.report_path,
                 "app_name": None,
@@ -1635,7 +1695,7 @@ async def pipeline_dry_run(req: DryRunRequest):
                 "dry_run": True,
                 "max_upgrades": req.max_upgrades,
                 "config_overrides": req.config.model_dump(),
-            })
+            }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
@@ -1663,6 +1723,30 @@ async def pipeline_dry_run(req: DryRunRequest):
 # PIPELINE STATUS ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _sanitize_job_for_response(job: dict) -> dict:
+    """
+    Strip fields from a job doc that should never leave the server, before
+    it's returned from a GET endpoint.
+
+    Currently this is just ``resume_meta.config_overrides_secret`` — the
+    Fernet-encrypted blob holding any per-request credentials saved for a
+    resume (see credential_vault.py). It's not plaintext, so returning it
+    wouldn't leak a credential directly, but it's ciphertext with no
+    legitimate client-side use (only `_resume_precheck` ever decrypts it,
+    server-side, at resume time) and there's no reason to hand a bucket of
+    encrypted secrets to every status-poller. The non-secret parts of
+    `resume_meta`/`config_overrides` (paths, repo, gcp project, etc.) are
+    left as-is — that's useful for callers building a resume/retry UI.
+    """
+    resume_meta = job.get("resume_meta")
+    if not resume_meta or "config_overrides_secret" not in resume_meta:
+        return job
+    sanitized = dict(job)
+    sanitized["resume_meta"] = {k: v for k, v in resume_meta.items() if k != "config_overrides_secret"}
+    sanitized["resume_meta"]["has_saved_credentials"] = True
+    return sanitized
+
+
 @app.get("/pipeline/runs", tags=["Pipeline Status"])
 def list_pipeline_runs(
     limit: int = Query(default=50, ge=1, le=200),
@@ -1685,7 +1769,7 @@ def list_pipeline_runs(
     payload and `checkpoint` — fetch `GET /pipeline/status/{pipeline_id}`
     for the full detail on any individual run.
     """
-    jobs = _store.list_jobs(limit=limit, offset=offset)
+    jobs = [_sanitize_job_for_response(j) for j in _store.list_jobs(limit=limit, offset=offset)]
     return ok({"jobs": jobs, "count": len(jobs)})
 
 
@@ -1720,7 +1804,7 @@ def pipeline_status(pipeline_id: str):
     job = _store.get_job(pipeline_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-    return ok(job)
+    return ok(_sanitize_job_for_response(job))
 
 
 @app.get("/pipeline/status/{pipeline_id}/{stage_name}", tags=["Pipeline Status"])
@@ -1820,38 +1904,18 @@ def delete_pipeline_run(pipeline_id: str):
     })
 
 
-@app.post("/pipeline/resume/{pipeline_id}", tags=["Pipeline Status"])
-async def resume_pipeline(pipeline_id: str):
+def _resume_precheck(pipeline_id: str) -> tuple[dict, dict, dict] | tuple[None, None, None]:
     """
-    Resume an interrupted, failed, or cancelled pipeline run from its last
-    checkpointed stage instead of restarting from triage.
-
-    Requires:
-      - the job to exist and NOT currently be 'running' or 'completed'
-      - `resume_meta` captured at job creation (only full-pipeline runs —
-        /pipeline/live, /offline, /app-name, /app-id, /dry-run — capture
-        this; individual /stages/* calls and partial /pipeline/until/*
-        runs do not)
-      - a checkpoint (at least one stage must have completed)
-
-    Side-effecting stages already checkpointed (adr-fix, pr-agent) are
-    reused as-is and NOT re-run — see `_run_full_pipeline`'s
-    `resume_checkpoint` handling and `pr_agent._find_existing_pr` for the
-    duplicate-PR guard.
-
-    Returns a *pipeline_id* (the SAME one — resume continues the existing
-    job record rather than minting a new one) immediately; poll
-    **GET /pipeline/status/{pipeline_id}** as usual.
+    Shared validation for manual (HTTP) and automatic resume. Returns
+    ``(job, resume_meta, checkpoint)`` — with ``resume_meta`` already
+    decrypted (see credential_vault.decrypt_resume_meta) — or raises
+    HTTPException. Does NOT check job status; callers decide what
+    statuses are eligible (manual resume disallows 'running'/'completed';
+    auto-resume is choosier still — see `_auto_resumable`).
     """
     job = _store.get_job(pipeline_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
-
-    if job.get("status") in ("running", "completed"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot resume a job with status '{job['status']}'",
-        )
 
     resume_meta = job.get("resume_meta")
     if not resume_meta:
@@ -1864,6 +1928,7 @@ async def resume_pipeline(pipeline_id: str):
                 "Start a new pipeline run instead."
             ),
         )
+    resume_meta = decrypt_resume_meta(resume_meta)
 
     checkpoint = _store.get_checkpoint(pipeline_id)
     if not checkpoint:
@@ -1873,16 +1938,34 @@ async def resume_pipeline(pipeline_id: str):
                    "yet, so there is nothing to resume from. Start a new "
                    "pipeline run instead.",
         )
+    return job, resume_meta, checkpoint
 
+
+def _start_resume(pipeline_id: str, resume_meta: dict, checkpoint: dict, *, auto: bool = False) -> None:
+    """
+    Kick off the resume's background run and flip the job to 'running'.
+    Shared by the manual `POST /pipeline/resume/{pipeline_id}` endpoint
+    and automatic resume (orphan sweep / startup scan — see
+    `_try_auto_resume`). Fires the run as an asyncio task and returns
+    immediately; caller is responsible for any pre-conditions (status
+    checks, attempt limits).
+    """
     pid = pipeline_id
     t0 = time.time()
-    _store.update_job(pid, status="running", cancel_requested=False, error=None)
+    _store.update_job(
+        pid, status="running", cancel_requested=False, error=None,
+        resumed_by=("auto" if auto else "manual"),
+    )
 
     async def _run():
         loop = asyncio.get_event_loop()
         clone_dir: str | None = None
         _track_start(pid)
         try:
+            # config_overrides was decrypted by _resume_precheck — any
+            # per-request Fortify/GitHub/Sonar credentials saved at job
+            # creation (see credential_vault.encrypt_resume_meta) are back
+            # in plaintext here, in-memory only, for the duration of this run.
             resume_overrides = ConfigOverrides(**resume_meta.get("config_overrides") or {})
             cfg = _apply_overrides(load_config(), resume_overrides)
             cfg, clone_dir = await loop.run_in_executor(
@@ -1926,8 +2009,135 @@ async def resume_pipeline(pipeline_id: str):
                 shutil.rmtree(clone_dir, ignore_errors=True)
 
     asyncio.create_task(_run())
+
+
+def _auto_resume_eligible(job: dict) -> bool:
+    """Cheap, no-I/O check on a job doc — do the fields alone allow auto-resume?"""
+    if not _AUTO_RESUME_ENABLED:
+        return False
+    if job.get("status") not in _AUTO_RESUME_STATUSES:
+        return False
+    if not job.get("resume_meta"):
+        return False
+    if int(job.get("auto_resume_attempts") or 0) >= _AUTO_RESUME_MAX_ATTEMPTS:
+        return False
+    return True
+
+
+def _try_auto_resume(pipeline_id: str) -> bool:
+    """
+    Attempt to automatically resume *pipeline_id* from its last checkpoint
+    instead of leaving it stuck until a human notices and calls
+    POST /pipeline/resume/{pipeline_id}. Called from two places:
+
+      - `_run_orphan_sweep`, for jobs whose pod died without a clean
+        SIGTERM (OOM kill, node eviction, hard crash) — tried right after
+        the job is marked 'failed', so a healthy pod picks it straight
+        back up.
+      - `startup_event`, for jobs left 'interrupted' by a previous pod's
+        graceful-shutdown handler — tried once per pod boot.
+
+    Bounded by AUTO_RESUME_MAX_ATTEMPTS so a permanently-broken run (bad
+    saved credentials, a deleted repo, ...) doesn't retry forever; once
+    exhausted the job stays at its terminal status and only a manual
+    POST /pipeline/resume/{pipeline_id} will retry it.
+
+    Returns True if a resume was actually kicked off.
+    """
+    job = _store.get_job(pipeline_id)
+    if job is None or not _auto_resume_eligible(job):
+        return False
+    try:
+        _job, resume_meta, checkpoint = _resume_precheck(pipeline_id)
+    except HTTPException as exc:
+        print(f"[AutoResume] {pipeline_id} not resumable: {exc.detail}")
+        return False
+    except Exception as exc:
+        print(f"[AutoResume] precheck failed for {pipeline_id}: {exc}")
+        return False
+
+    attempts = int(job.get("auto_resume_attempts") or 0) + 1
+    _store.update_job(pipeline_id, auto_resume_attempts=attempts)
+    print(f"[AutoResume] Resuming {pipeline_id} from stage "
+          f"'{checkpoint.get('resume_stage')}' "
+          f"(attempt {attempts}/{_AUTO_RESUME_MAX_ATTEMPTS})")
+    _start_resume(pipeline_id, resume_meta, checkpoint, auto=True)
+    return True
+
+
+def _auto_resume_startup_scan(limit: int = 200) -> list[str]:
+    """
+    One-time scan run at pod boot (see `startup_event`) for jobs left
+    resumable by a *previous* pod: status 'interrupted' from a graceful
+    SIGTERM shutdown (see `shutdown_event`), or 'failed' from an orphan
+    sweep / exception that then never got a follow-up auto-resume because
+    that pod also went away. Bounded by AUTO_RESUME_MAX_ATTEMPTS the same
+    as the orphan-sweep path — see `_try_auto_resume`.
+
+    Only scans the most recent *limit* jobs (list_jobs is newest-first);
+    older stuck jobs remain reachable via a manual
+    POST /pipeline/resume/{pipeline_id}. Returns the pipeline_ids resumed.
+    """
+    resumed: list[str] = []
+    if not _AUTO_RESUME_ENABLED:
+        return resumed
+    try:
+        jobs = _store.list_jobs(limit=limit, offset=0)
+    except Exception as exc:
+        print(f"[AutoResume] Startup scan: list_jobs failed: {exc}")
+        return resumed
+    for job in jobs:
+        pid = job.get("pipeline_id")
+        if not pid or not _auto_resume_eligible(job):
+            continue
+        if _try_auto_resume(pid):
+            resumed.append(pid)
+    return resumed
+
+
+@app.post("/pipeline/resume/{pipeline_id}", tags=["Pipeline Status"])
+async def resume_pipeline(pipeline_id: str):
+    """
+    Resume an interrupted, failed, or cancelled pipeline run from its last
+    checkpointed stage instead of restarting from triage.
+
+    Requires:
+      - the job to exist and NOT currently be 'running' or 'completed'
+      - `resume_meta` captured at job creation (only full-pipeline runs —
+        /pipeline/live, /offline, /app-name, /app-id, /dry-run — capture
+        this; individual /stages/* calls and partial /pipeline/until/*
+        runs do not)
+      - a checkpoint (at least one stage must have completed)
+
+    Any per-request credentials saved with the original run (Fortify
+    password, GitHub PAT, Sonar token — stored encrypted, see
+    credential_vault.py) are transparently decrypted and reused here.
+
+    Side-effecting stages already checkpointed (adr-fix, pr-agent) are
+    reused as-is and NOT re-run — see `_run_full_pipeline`'s
+    `resume_checkpoint` handling and `pr_agent._find_existing_pr` for the
+    duplicate-PR guard.
+
+    Note: most interrupted/orphaned jobs never need this call manually —
+    see AUTO_RESUME_ENABLED — this endpoint remains for on-demand resume,
+    resuming a job whose auto-resume attempts were exhausted, or resuming
+    with AUTO_RESUME_ENABLED turned off.
+
+    Returns a *pipeline_id* (the SAME one — resume continues the existing
+    job record rather than minting a new one) immediately; poll
+    **GET /pipeline/status/{pipeline_id}** as usual.
+    """
+    job, resume_meta, checkpoint = _resume_precheck(pipeline_id)
+
+    if job.get("status") in ("running", "completed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot resume a job with status '{job['status']}'",
+        )
+
+    _start_resume(pipeline_id, resume_meta, checkpoint, auto=False)
     return ok({
-        "pipeline_id": pid,
+        "pipeline_id": pipeline_id,
         "status": "queued",
         "resuming_from_stage": checkpoint.get("resume_stage"),
     })
