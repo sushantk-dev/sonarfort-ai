@@ -124,6 +124,7 @@ export class PipelineComponent {
 
   get allRuns()  { return this.state.allRuns; }
   get canCancel(){ return this.state.canCancel; }
+  get loadingRuns() { return this.state.loadingRuns(); }
 
   /** Runs filtered to the active source tab — Sonar or Fortify */
   filteredRuns(): UiRun[] {

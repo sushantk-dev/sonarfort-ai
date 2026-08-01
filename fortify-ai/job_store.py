@@ -210,6 +210,20 @@ class JobStore(ABC):
         result — this does NOT mutate anything itself.
         """
 
+    @abstractmethod
+    def delete_job(self, pipeline_id: str) -> bool:
+        """
+        Permanently remove a job (doc + result + checkpoint). Returns True
+        if the job existed and was deleted, False if there was nothing to
+        delete.
+
+        MUST be idempotent: deleting an already-gone (or never-existed)
+        pipeline_id is not an error, it just returns False. Duplicate
+        DELETE calls for the same run — e.g. multiple browser tabs, or a
+        UI click handler firing more than once — are expected traffic, not
+        a bug, and should never surface as a 404/500 from this method.
+        """
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GCS implementation
@@ -504,6 +518,39 @@ class GcsJobStore(JobStore):
                     stale.append(doc)
         return stale
 
+    # ── Delete ─────────────────────────────────────────────────────────────────
+
+    def delete_job(self, pipeline_id: str) -> bool:
+        """
+        Delete the doc, result, and checkpoint blobs for a job.
+
+        Deletes each of the three blobs independently and swallows 404s
+        per-blob (a job may legitimately have no result/checkpoint blob at
+        all, e.g. it never finished a stage) rather than failing the whole
+        call. ``existed`` reflects only the main doc blob, since that's
+        the canonical "did this pipeline_id ever exist" signal — the
+        other two are opportunistic cleanup.
+        """
+        from google.api_core import exceptions as gexc
+
+        existed = False
+        try:
+            self._bucket.blob(self._doc_blob_name(pipeline_id)).delete()
+            existed = True
+        except gexc.NotFound:
+            pass
+
+        for blob_name in (
+            self._result_blob_name(pipeline_id),
+            self._checkpoint_blob_name(pipeline_id),
+        ):
+            try:
+                self._bucket.blob(blob_name).delete()
+            except gexc.NotFound:
+                pass
+
+        return existed
+
     # ── Lazy TTL purge (backstop — prefer a bucket lifecycle rule) ───────────
 
     def _maybe_purge(self) -> None:
@@ -652,6 +699,12 @@ class NullJobStore(JobStore):
                 if progress_epoch < cutoff:
                     stale.append(dict(j))
         return stale
+
+    # ── Delete ─────────────────────────────────────────────────────────────────
+
+    def delete_job(self, pipeline_id: str) -> bool:
+        with self._lock:
+            return self._jobs.pop(pipeline_id, None) is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

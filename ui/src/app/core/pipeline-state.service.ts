@@ -101,6 +101,16 @@ export class PipelineStateService {
   private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
 
   runs     = signal<UiRun[]>([]);
+  /**
+   * True while the initial `GET /pipeline/runs` fetch (or an explicit
+   * refresh) is in flight. `runs` is seeded synchronously from
+   * localStorage history first (see `_rehydrate`), so this does NOT mean
+   * "no data yet" — it means "what's on screen may not reflect the
+   * server's shared, all-users job store yet." Drives loading UI in the
+   * Activity and Pipeline run lists so they don't flash an empty state
+   * before the real list arrives.
+   */
+  loadingRuns = signal(true);
   selected = signal<UiRun | null>(null);
   running  = signal(false);
   error    = signal<string | null>(null);
@@ -136,6 +146,19 @@ export class PipelineStateService {
   // Polls GET /pipeline/runs on the Fortify server — the shared, GCS-backed
   // job list that includes runs started by *any* user, not just this browser.
   private _allRunsPoll?: Subscription;
+
+  // Two independent fetches feed the combined `runs` list on startup (Sonar's
+  // api.listRuns() and the Fortify all-users poll's first tick). loadingRuns
+  // only clears once BOTH have reported back at least once, so neither the
+  // Pipeline page (shows both sources) nor the Activity page (Fortify-only)
+  // can flash an empty state while the other fetch is still outstanding.
+  private _sonarListLoaded   = false;
+  private _fortifyListLoaded = false;
+  private _maybeFinishInitialLoad() {
+    if (this._sonarListLoaded && this._fortifyListLoaded) {
+      this.loadingRuns.set(false);
+    }
+  }
 
   get allRuns()  { return this.runs(); }
   get canCancel(){ return this.running() && !!this._activeRunId; }
@@ -175,6 +198,8 @@ export class PipelineStateService {
 
         this.runs.set(merged);
         this.selected.set(merged[0] ?? null);
+        this._sonarListLoaded = true;
+        this._maybeFinishInitialLoad();
 
         // Re-attach Sonar polling for any run still in progress
         const inProgress = fromBackend.find(
@@ -203,7 +228,57 @@ export class PipelineStateService {
           this.runs.set(seeded);
           this.selected.set(seeded[0] ?? null);
         }
+        this._sonarListLoaded = true;
+        this._maybeFinishInitialLoad();
         this._rehydrateFortify();
+      },
+    });
+  }
+
+  /**
+   * Re-fetch the shared run list on demand (e.g. the Activity page's
+   * Refresh button). Shows the same loader as the initial load — a manual
+   * refresh should visibly reflect that a request is in flight rather than
+   * silently swapping the list underneath the user. Re-fetches both
+   * sources (Sonar's listRuns + the Fortify all-users list) in parallel
+   * and clears the loader once both have reported back, same gating as
+   * the initial load.
+   */
+  refreshRuns() {
+    this.loadingRuns.set(true);
+    let sonarDone = false;
+    let fortifyDone = false;
+    const maybeDone = () => { if (sonarDone && fortifyDone) this.loadingRuns.set(false); };
+
+    this.api.listRuns().subscribe({
+      next: ({ runs }) => {
+        const fromBackend: UiRun[] = (runs ?? []).map((r: any) => this._backendRunToUiRun(r));
+        const backendIds = new Set(fromBackend.map(r => r.id));
+        // Keep any Fortify runs already in `runs()` that this Sonar-only
+        // endpoint doesn't know about, instead of dropping them.
+        const keep = this.runs().filter(r => !backendIds.has(r.id) && r.source === 'fortify');
+        const merged = [...fromBackend, ...keep]
+          .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+        this.runs.set(merged);
+        sonarDone = true;
+        maybeDone();
+      },
+      error: (err: Error) => {
+        this.error.set(err.message);
+        sonarDone = true;
+        maybeDone();
+      },
+    });
+
+    this.api.listFortifyRuns().subscribe({
+      next: resp => {
+        this._mergeBackendFortifyJobs(resp);
+        fortifyDone = true;
+        maybeDone();
+      },
+      error: () => {
+        fortifyDone = true;
+        maybeDone();
       },
     });
   }
@@ -777,10 +852,17 @@ export class PipelineStateService {
     this._allRunsPoll = timer(0, ALL_RUNS_POLL_MS)
       .pipe(switchMap(() => this.api.listFortifyRuns()))
       .subscribe({
-        next: resp => this._mergeBackendFortifyJobs(resp),
+        next: resp => {
+          this._mergeBackendFortifyJobs(resp);
+          this._fortifyListLoaded = true;
+          this._maybeFinishInitialLoad();
+        },
         // Best-effort — a Fortify server hiccup shouldn't surface an error
         // banner for a background list refresh.
-        error: () => {},
+        error: () => {
+          this._fortifyListLoaded = true;
+          this._maybeFinishInitialLoad();
+        },
       });
   }
 

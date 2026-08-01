@@ -356,9 +356,16 @@
         Showing runs from all users
       </div>
 
+      <!-- Loading state — avoid flashing "no runs" while the shared
+           GET /pipeline/runs fetch is still in flight -->
+      <div class="run-list__loading" *ngIf="loadingRuns && filteredRuns().length === 0">
+        <span class="run-list__loading-spinner"></span>
+        Loading runs…
+      </div>
+
       <!-- Fortify step reference card — shown when no runs exist on Fortify tab -->
       <div class="fortify-steps-card"
-           *ngIf="activeSource() === 'fortify' && filteredRuns().length === 0">
+           *ngIf="!loadingRuns && activeSource() === 'fortify' && filteredRuns().length === 0">
         <div class="fortify-steps-card__head">
           <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
             <path d="M7 1.5L12 4V8C12 11 7 13 7 13C7 13 2 11 2 8V4L7 1.5Z"

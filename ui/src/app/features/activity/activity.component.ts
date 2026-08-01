@@ -21,6 +21,9 @@ export class ActivityComponent {
   filter  = signal<StatusFilter>('all');
   search  = signal('');
 
+  /** True while GET /pipeline/runs is in flight (initial load or a manual refresh). */
+  loadingRuns = this.state.loadingRuns;
+
   // Track which pipeline_ids we've already asked the backend to hydrate
   // with full detail (PR urls / escalation files), so a re-render or the
   // next 20s list poll doesn't re-request the same job over and over.
@@ -90,8 +93,12 @@ export class ActivityComponent {
   setFilter(f: StatusFilter) { this.filter.set(f); }
 
   refresh() {
-    // Re-hydrate everything currently visible, ignoring the "already
-    // requested" cache — a manual refresh should always hit the network.
+    // Re-fetch the shared run list itself...
+    this.state.refreshRuns();
+
+    // ...and re-hydrate everything currently visible, ignoring the
+    // "already requested" cache — a manual refresh should always hit
+    // the network for row detail too.
     this._hydrated.clear();
     for (const r of this.filteredRuns()) {
       if (r.status === 'done' || r.status === 'error') this.state.hydrateRunDetail(r.id);

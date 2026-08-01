@@ -1756,6 +1756,41 @@ def cancel_pipeline(pipeline_id: str):
     })
 
 
+@app.delete("/pipeline/runs/{pipeline_id}", tags=["Pipeline Status"])
+def delete_pipeline_run(pipeline_id: str):
+    """
+    Permanently remove a pipeline run (doc + result + checkpoint) from the
+    job store.
+
+    Idempotent by design: deleting a run that's already gone returns `200`
+    with `deleted: false` rather than `404`. This matters in practice —
+    the UI can legitimately fire more than one DELETE for the same run
+    (multiple open tabs each clearing their own view of a shared Activity
+    list, a click handler re-firing, etc.), and the *second* call arriving
+    after the first one already succeeded is not an error condition; the
+    end state the caller wanted ("this run is gone") is already true.
+
+    If the run is still queued/running, cancellation is requested first
+    (best-effort, same as `POST /pipeline/cancel/{id}`) before the record
+    is removed — the in-flight background task will simply no-op the next
+    time it tries to write status for a doc that's no longer there.
+    """
+    job = _store.get_job(pipeline_id)
+    if job is not None and job.get("status") in ("queued", "running"):
+        _store.request_cancel(pipeline_id)
+
+    deleted = _store.delete_job(pipeline_id)
+    return ok({
+        "pipeline_id": pipeline_id,
+        "deleted": deleted,
+        "message": (
+            f"Run '{pipeline_id}' deleted"
+            if deleted else
+            f"Run '{pipeline_id}' was already gone — nothing to delete"
+        ),
+    })
+
+
 @app.post("/pipeline/resume/{pipeline_id}", tags=["Pipeline Status"])
 async def resume_pipeline(pipeline_id: str):
     """

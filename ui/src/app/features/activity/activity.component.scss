@@ -51,6 +51,20 @@
   color: inherit;
 }
 
+.refresh-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.refresh-btn__spinner {
+  width: 11px;
+  height: 11px;
+  border: 1.6px solid var(--border, #2a2d34);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: activity-spin 0.7s linear infinite;
+}
+
 .run-btn {
   background: var(--accent, #4f7cff);
   border-color: transparent;
@@ -267,4 +281,28 @@
   text-align: center;
   color: var(--text-muted, #8a8f98);
   font-size: 13px;
+}
+
+.runs-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 60px 0;
+  color: var(--text-muted, #8a8f98);
+  font-size: 13px;
+
+  &__spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--border, #2a2d34);
+    border-top-color: var(--brand, #5b5fc7);
+    border-radius: 50%;
+    animation: activity-spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+}
+
+@keyframes activity-spin {
+  to { transform: rotate(360deg); }
 }

@@ -1501,6 +1501,28 @@
   }
 }
 
+// ── Run list loading state (initial / manual refresh of GET /pipeline/runs) ──
+.run-list__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 40px 0;
+  color: var(--text-muted, #8a8f98);
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+
+.run-list__loading-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border-md, #2a2d34);
+  border-top-color: var(--brand, #5b5fc7);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
 // ── Fortify steps reference card (shown when no runs exist) ───────────────
 .fortify-steps-card {
   background:   var(--surface-0);
