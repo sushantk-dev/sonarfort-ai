@@ -857,7 +857,14 @@ def _run_full_pipeline(
     else:
         _check_cancelled(pipeline_id)
         t = _stage_start("api-diff")
-        diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
+        try:
+            diffed = run_api_diff_all_groups(context, project_path, japicmp_path)
+        except Exception as exc:
+            # JAR missing / japicmp missing / japicmp execution failure — must
+            # stop the pipeline. Mark the stage failed (not left stuck at
+            # "running") and re-raise so the caller marks the whole job failed.
+            _stage_fail("api-diff", t, str(exc))
+            raise
         _stage_done("api-diff", t, {"groups_count": len(diffed)})
         _checkpoint("ai-reasoning", diffed=diffed)
 
@@ -2602,10 +2609,14 @@ def _run_until(
     # Stage 3 — api diff
     _check_cancelled(pipeline_id)
     t = _s_start("api-diff")
-    diff_groups = run_api_diff_all_groups(
-        context_groups, project_path,
-        cfg.japicmp_jar_path or "/nonexistent/japicmp.jar",
-    )
+    try:
+        diff_groups = run_api_diff_all_groups(
+            context_groups, project_path,
+            cfg.japicmp_jar_path or "/nonexistent/japicmp.jar",
+        )
+    except Exception as exc:
+        _s_fail("api-diff", t, str(exc))
+        raise
     result["groups"] = diff_groups
     _s_done("api-diff", t, {"groups_count": len(diff_groups)})
     if idx == 3:
