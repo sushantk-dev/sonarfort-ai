@@ -1096,6 +1096,9 @@ export class PipelineStateService {
   // ── Delete ────────────────────────────────────────────────────────────────
   deleteRun(id: string) {
     if (id === this._activeRunId) return;
+    // Look up the run BEFORE removing it from state — need its source to
+    // know which backend actually owns this pipeline_id.
+    const run = this.runs().find(r => r.id === id);
     // Remove from UI
     this.runs.update(rs => rs.filter(r => r.id !== id));
     if (this.selected()?.id === id) this.selected.set(this.runs()[0] ?? null);
@@ -1103,8 +1106,18 @@ export class PipelineStateService {
     this._removeFromHistory(id);
     // Remove from active Fortify tracking (if it was a Fortify run)
     this._removePersisted(id);
-    // Best-effort delete from Sonar backend (no-op for Fortify runs)
-    this.api.deleteRun(id).subscribe({ error: () => {} });
+
+    if (run?.source === 'fortify') {
+      // Fortify runs live in the Fortify server's job store, not Sonar's —
+      // api.deleteRun() targets `${apiCfg.baseUrl()}/api/pipeline/runs/{id}`
+      // (Sonar only) and was previously a guaranteed no-op here. Hit the
+      // Fortify server directly instead, same pattern as the other
+      // Fortify-specific calls in this service (resume, escalations, etc).
+      fetch(`${this.fortifyBase}/pipeline/runs/${id}`, { method: 'DELETE' }).catch(() => {});
+    } else {
+      // Best-effort delete from Sonar backend.
+      this.api.deleteRun(id).subscribe({ error: () => {} });
+    }
   }
 
   // ── Resume ────────────────────────────────────────────────────────────────
