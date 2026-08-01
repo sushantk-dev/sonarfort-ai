@@ -192,21 +192,35 @@
   &--cancelled { background: #8a8f98; }
 }
 
-.run-name { font-weight: 500; }
-.run-sub {
-  font-size: 11px;
-  color: var(--text-muted, #8a8f98);
-  margin-top: 2px;
-  display: flex;
-  gap: 4px;
-}
-.run-id {
-  font-family: ui-monospace, SFMono-Regular, monospace;
-  max-width: 140px;
+.run-name {
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  display: inline-block;
+}
+.run-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-muted, #8a8f98);
+  min-width: 0; // let children truncate instead of forcing the row to overflow/wrap
+}
+.run-id {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  flex: 0 0 auto;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-component {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .col--stages {
