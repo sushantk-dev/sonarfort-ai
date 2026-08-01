@@ -97,9 +97,8 @@
       <!-- Run identity -->
       <div class="col col--run">
         <div class="run-name">{{ run.ruleKey }}</div>
-        <div class="run-sub">
-          <span class="run-id">{{ run.id }}</span>
-          <span *ngIf="run.component" class="run-component">· {{ run.component }}</span>
+        <div class="run-sub" *ngIf="run.component">
+          <span class="run-component">{{ run.component }}</span>
         </div>
       </div>
 

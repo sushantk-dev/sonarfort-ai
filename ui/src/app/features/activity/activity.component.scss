@@ -199,25 +199,13 @@
   white-space: nowrap;
 }
 .run-sub {
-  display: flex;
-  align-items: center;
-  gap: 4px;
   margin-top: 2px;
   font-size: 11px;
   color: var(--text-muted, #8a8f98);
-  min-width: 0; // let children truncate instead of forcing the row to overflow/wrap
-}
-.run-id {
-  font-family: ui-monospace, SFMono-Regular, monospace;
-  flex: 0 0 auto;
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
 }
 .run-component {
-  flex: 0 1 auto;
-  min-width: 0;
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
