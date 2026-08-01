@@ -229,7 +229,30 @@ def _validate_result(data: dict, recommended_candidate: str) -> AiReasoningResul
         at_risk = []
     at_risk = [str(l) for l in at_risk]
 
-    reason = str(data.get("reason", "No reason provided"))[:500]
+    # The prompt requires a "reason" field, so this is normally populated.
+    # But an LLM can still drop it on an otherwise-valid response — most
+    # importantly when safe=False, where a bare "No reason provided" would
+    # leave an escalation completely unexplained downstream (see
+    # summary-report_component.ts / api_server.py's _escalation_reason).
+    # Build a diagnostic fallback from whatever else the model DID return
+    # instead of a dead end.
+    raw_reason = data.get("reason")
+    if raw_reason and str(raw_reason).strip():
+        reason = str(raw_reason)[:500]
+    elif not safe and at_risk:
+        reason = (
+            f"Marked unsafe (confidence: {confidence}) — model did not provide "
+            f"an explanation, but flagged {len(at_risk)} at-risk call site(s): "
+            f"{', '.join(at_risk[:3])}"
+        )
+    elif not safe:
+        reason = (
+            f"Marked unsafe (confidence: {confidence}) — model did not provide "
+            "an explanation and flagged no specific at-risk lines"
+        )
+    else:
+        reason = f"No reason provided (confidence: {confidence})"
+
     pre_fix = bool(data.get("pre_fix_required", False))
     rec = str(data.get("recommended_candidate", recommended_candidate))
 

@@ -24,7 +24,10 @@ interface DepGroup {
   next_node?:       string;
   ai_reasoning?: {
     confidence_score?:    number;
-    reasoning?:           string;
+    // Backend field is `reason` (see AiReasoningResult in state.py) — was
+    // declared as `reasoning` here, which meant every usage below always
+    // read undefined and silently fell through to a generic placeholder.
+    reason?:               string;
     recommended_version?: string;
   };
   _outcome?: 'fixed' | 'escalated' | 'failed';
@@ -432,7 +435,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
             </div>
             <div class="esc-card__body"
                  *ngIf="expandedId() === dep.parsed?.artifact_id">
-              {{ dep.escalate_reason || dep.ai_reasoning?.reasoning || 'No safe version found.' }}
+              {{ dep.escalate_reason || dep.ai_reasoning?.reason || 'No safe version found.' }}
               <div class="esc-card__report-row" *ngIf="escalationFileFor(dep) as file">
                 <button type="button"
                         class="esc-card__report-btn"
@@ -1106,7 +1109,7 @@ export class SummaryReportComponent implements OnInit {
           const pr = prResults[prIdx++];
           return { ...g, _outcome: 'fixed', _prUrl: pr?.pr_url, _confidence: confidence };
         }
-        const hasReason = !!(g.escalate_reason || g.ai_reasoning?.reasoning || adr?.error_reason);
+        const hasReason = !!(g.escalate_reason || g.ai_reasoning?.reason || adr?.error_reason);
         return { ...g, _outcome: hasReason ? 'escalated' : 'failed', _confidence: confidence };
       });
     }

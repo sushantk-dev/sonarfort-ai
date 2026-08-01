@@ -427,7 +427,17 @@ def main(argv: list[str] | None = None) -> int:
                 "result": {
                     "success": False, "branch_name": None, "commit_hash": None,
                     "build_time_seconds": None, "pdf_path": None,
-                    "error_reason": group.get("escalation_reason", "Escalated by AI reasoning"),
+                    # NOTE: group["escalation_reason"] is never actually set by
+                    # either version_resolver.py or ai_reasoning.py — the real
+                    # reason lives at group["escalate_reason"] (version
+                    # resolver, earlier stage) or group["ai_reasoning"]["reason"]
+                    # (AI reasoning). Check those instead of the generic
+                    # placeholder, mirroring api_server.py's _escalation_reason().
+                    "error_reason": (
+                        group.get("escalate_reason")
+                        or (group.get("ai_reasoning") or {}).get("reason")
+                        or "Escalated — no reason recorded"
+                    ),
                 },
             })
             continue

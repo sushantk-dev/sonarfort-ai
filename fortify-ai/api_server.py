@@ -513,6 +513,35 @@ def _apply_overrides(cfg: FortifyAIConfig, overrides: ConfigOverrides) -> Fortif
     return FortifyAIConfig(**data)
 
 
+def _escalation_reason(group: dict) -> str:
+    """
+    Resolve the human-readable reason a dependency group was escalated.
+
+    Two different pipeline stages can send a group to escalation, and each
+    records its reason under a different key on the group dict:
+      - version_resolver.py sets ``group["escalate_reason"]`` when no safe
+        upgrade candidate could be resolved at all (escalated before AI
+        reasoning ever runs).
+      - ai_reasoning.py sets ``group["ai_reasoning"]["reason"]`` — NOT a
+        top-level ``group["escalation_reason"]`` key, despite that being
+        what earlier code here looked for. That mismatch meant this always
+        missed and silently fell back to a generic "Escalated by AI
+        reasoning" placeholder, even though the actual, specific reason
+        (e.g. "No safe version candidates available", or whatever the LLM
+        flagged as unsafe) was sitting right there in the group.
+
+    Checked in pipeline order: an earlier-stage escalation (version
+    resolver) takes precedence over a later one (AI reasoning), since a
+    group that never reached AI reasoning won't have an ai_reasoning
+    result to explain anyway.
+    """
+    return (
+        group.get("escalate_reason")
+        or (group.get("ai_reasoning") or {}).get("reason")
+        or "Escalated — no reason recorded"
+    )
+
+
 def _should_persist_token(overrides: ConfigOverrides) -> bool:
     """
     Decide whether a freshly-fetched Fortify OAuth token may be written to
@@ -816,7 +845,7 @@ def _run_full_pipeline(
                     "result": AdrResult(
                         success=False, branch_name=None, commit_hash=None,
                         build_time_seconds=None, pdf_path=None,
-                        error_reason=group.get("escalation_reason", "Escalated by AI reasoning"),
+                        error_reason=_escalation_reason(group),
                     ),
                 })
                 continue
@@ -2065,7 +2094,7 @@ def stage_adr_fix(req: AdrFixRequest):
                     "result": AdrResult(
                         success=False, branch_name=None, commit_hash=None,
                         build_time_seconds=None, pdf_path=None,
-                        error_reason=group.get("escalation_reason", "Escalated"),
+                        error_reason=_escalation_reason(group),
                     ),
                 })
                 continue
