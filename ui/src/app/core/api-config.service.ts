@@ -34,11 +34,20 @@ const _isDevDefault = isDevMode() && !_hasInjectedHost;
 const DEFAULT_HOST = _w.__FORTIFYAI_API_HOST__
   ?? (_isDevDefault ? DEV_SONAR_HOST : PROD_FALLBACK_HOST);
 
-// Fortify's path suffix — empty in the dev split (separate localhost:8001
-// host needs no path), '/fortify' otherwise (shared host, deployed envs).
-const FORTIFY_PATH = _isDevDefault
-  ? ''
-  : ((_w.__FORTIFYAI_FORTIFY_PATH__ ?? '/fortify') as string);
+// Fortify's path suffix, used as the fallback whenever the live dev split
+// is NOT active (see fortifyBaseUrl below) — i.e. whenever fortifyBaseUrl
+// can't route to a separate localhost:8001, it appends this path to
+// apiHost() instead. This must NOT be hardcoded to '' just because we
+// started in dev mode: _devSplitActive can flip to false at runtime (e.g.
+// after any Settings → Save Changes, which persists apiHost and disables
+// the split — see apply()/_resolveDevSplit() below) while isDevMode()
+// itself never changes. If this stayed '' in that case, Fortify calls
+// would silently collapse onto the exact same host *and port* as Sonar
+// instead of falling back to `${apiHost}/fortify` — which is exactly the
+// "Fortify calls hitting :8000 instead of :8001" bug this comment used to
+// cause. Always resolve to the real path; the dev split (when active)
+// bypasses this entirely by using _devFortifyHost() directly.
+const FORTIFY_PATH = (_w.__FORTIFYAI_FORTIFY_PATH__ ?? '/fortify') as string;
 
 @Injectable({ providedIn: 'root' })
 export class ApiConfigService {
@@ -64,7 +73,10 @@ export class ApiConfigService {
   private _resolveDevSplit(): boolean {
     if (!isDevMode() || _hasInjectedHost) return false;
     const saved = this._load('host');
-    if (saved === DEV_SONAR_HOST) {
+    // Trailing-slash tolerant: a saved value that's the dev default in
+    // everything but a stray '/' shouldn't permanently disable the split
+    // just because it fails a byte-exact match.
+    if (saved !== null && saved.replace(/\/+$/, '') === DEV_SONAR_HOST) {
       try { localStorage.removeItem(`${STORAGE_KEY}_host`); } catch {}
       return true;
     }
@@ -82,9 +94,12 @@ export class ApiConfigService {
   sonarBaseUrl = computed(() => this._normalize(this.apiHost()));
 
   /** Base URL for Fortify API calls — separate localhost:8001 host (no
-   *  path) in local dev; shared host + /fortify path in deployed envs.
-   *  FORTIFY_PATH is already '' whenever the dev split applies, so
-   *  /fortify is never appended in development mode either way. */
+   *  path) when the dev split is actually active; otherwise apiHost() with
+   *  FORTIFY_PATH appended ('/fortify' by default). The fallback branch
+   *  fires any time _devSplitActive is false — including in dev mode, if
+   *  a Settings save has disabled the split for this browser — so it must
+   *  resolve to a real, distinct path rather than colliding with Sonar's
+   *  host:port. */
   fortifyBaseUrl = computed(() => this._devSplitActive
     ? this._normalize(this._devFortifyHost())
     : `${this._normalize(this.apiHost())}${FORTIFY_PATH}`);

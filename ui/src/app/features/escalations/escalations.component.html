@@ -22,17 +22,6 @@
 
   <!-- ── Source tab switcher ── -->
   <div class="source-tabs">
-    <button class="source-tab source-tab--sonar"
-            [class.source-tab--active]="activeSource() === 'sonar'"
-            (click)="switchSource('sonar')">
-      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
-        <circle cx="5" cy="7" r="2.2" stroke="currentColor" stroke-width="1.3"/>
-        <path d="M7.2 7H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-        <circle cx="11" cy="7" r="1.5" stroke="currentColor" stroke-width="1.2"/>
-      </svg>
-      SonarQube
-      <span class="source-tab__count" *ngIf="sonarCount > 0">{{ sonarCount }}</span>
-    </button>
     <button class="source-tab source-tab--fortify"
             [class.source-tab--active]="activeSource() === 'fortify'"
             (click)="switchSource('fortify')">
@@ -46,6 +35,17 @@
       <span class="source-tab__loading" *ngIf="fortifyLoading()">
         <span class="spinner spinner--sm"></span>
       </span>
+    </button>
+    <button class="source-tab source-tab--sonar"
+            [class.source-tab--active]="activeSource() === 'sonar'"
+            (click)="switchSource('sonar')">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+        <circle cx="5" cy="7" r="2.2" stroke="currentColor" stroke-width="1.3"/>
+        <path d="M7.2 7H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+        <circle cx="11" cy="7" r="1.5" stroke="currentColor" stroke-width="1.2"/>
+      </svg>
+      SonarQube
+      <span class="source-tab__count" *ngIf="sonarCount > 0">{{ sonarCount }}</span>
     </button>
   </div>
 

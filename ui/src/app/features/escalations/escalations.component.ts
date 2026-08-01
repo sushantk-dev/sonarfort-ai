@@ -36,7 +36,7 @@ export class EscalationsComponent implements OnInit {
   private get fortifyBase() { return this.apiCfg.fortifyBaseUrl(); }
 
   // ── Source tab ────────────────────────────────────────────────────────────
-  activeSource = signal<'sonar' | 'fortify'>('sonar');
+  activeSource = signal<'sonar' | 'fortify'>('fortify');
 
   // ── Sonar escalations ─────────────────────────────────────────────────────
   sonarItems   = signal<EscalationItem[]>([]);
@@ -51,10 +51,15 @@ export class EscalationsComponent implements OnInit {
 
   selected       = signal<EscalationItem | null>(null);
   content        = signal<string>('');
-  loading        = signal(true);
+  loading        = signal(false);
   loadingContent = signal(false);
   deleteKey      = signal<string | null>(null);
   error          = signal('');
+
+  // Sonar-specific loaded flag — mirrors fortifyLoaded below. Sonar is now
+  // lazy-loaded on first switch to its tab (Fortify is the default/eager
+  // tab), same pattern as the old Fortify lazy-load, just swapped.
+  sonarLoaded = signal(false);
 
   // Fortify-specific loading state
   fortifyLoading = signal(false);
@@ -62,10 +67,10 @@ export class EscalationsComponent implements OnInit {
 
   ngOnInit() { this.load(); }
 
-  // ── Load — loads both sources ─────────────────────────────────────────────
+  // ── Load — refreshes whichever source(s) have already been loaded ────────
   load() {
-    this.loadSonar();
-    if (this.fortifyLoaded()) this.loadFortify();   // refresh if already loaded
+    this.loadFortify();
+    if (this.sonarLoaded()) this.loadSonar();   // refresh if already loaded
   }
 
   loadSonar() {
@@ -75,6 +80,7 @@ export class EscalationsComponent implements OnInit {
         const items = (res.escalations as EscalationItem[]).map(e => ({ ...e, source: 'sonar' as const }));
         this.sonarItems.set(items);
         this.loading.set(false);
+        this.sonarLoaded.set(true);
         this._resyncSelected(items);
       },
       error: () => {
@@ -123,9 +129,9 @@ export class EscalationsComponent implements OnInit {
     this.selected.set(null);
     this.content.set('');
     this.deleteKey.set(null);
-    // Lazy-load Fortify on first switch
-    if (src === 'fortify' && !this.fortifyLoaded()) {
-      this.loadFortify();
+    // Lazy-load Sonar on first switch (Fortify loads eagerly on init)
+    if (src === 'sonar' && !this.sonarLoaded()) {
+      this.loadSonar();
     }
   }
 
