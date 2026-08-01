@@ -135,11 +135,19 @@
 
 .runs-table__head,
 .runs-table__row {
-  display: grid;
-  grid-template-columns: 110px 1fr 130px 110px 1.4fr 120px;
+  display: flex;
   gap: 10px;
   padding: 10px 14px;
 }
+
+// Shared column widths for both the header and data rows, so a column
+// always lines up with its header regardless of how tall its content gets.
+.col--status  { flex: 0 0 110px; }
+.col--run     { flex: 1 1 0; min-width: 0; }
+.col--stages  { flex: 0 0 130px; }
+.col--started { flex: 0 0 110px; }
+.col--output  { flex: 1.4 1 0; min-width: 0; }
+.col--actions { flex: 0 0 120px; }
 
 .runs-table__head {
   align-items: center;
@@ -155,34 +163,17 @@
   // lines when a run has many PR / escalation chips, and centering the
   // whole row against that taller cell used to visually float the other
   // (single-line) columns away from the row's first line.
-  align-items: start;
+  align-items: flex-start;
   font-size: 12.5px;
   line-height: 1.3;
-  min-height: 44px;
   border-top: 1px solid var(--border, #2a2d34);
 
   &:hover { background: rgba(128, 128, 128, 0.05); }
+}
 
-  // Single-line columns: re-center their own (short) content vertically
-  // within the row's min-height so they don't just sit pinned to the top.
-  > .col {
-    display: flex;
-    align-items: center;
-    min-height: 20px;
-  }
-
-  // Multi-line-capable columns opt out of the vertical centering above so
-  // wrapped content grows downward from the top like Output does.
-  > .col--run,
-  > .col--output {
-    align-items: flex-start;
-  }
-
-  > .col--run {
-    flex-direction: column;
-    justify-content: center;
-    gap: 1px;
-  }
+.col--status {
+  display: flex;
+  align-items: center;
 }
 
 .status-dot {
@@ -192,6 +183,7 @@
   border-radius: 50%;
   margin-right: 6px;
   background: #8a8f98;
+  flex-shrink: 0;
 
   &--running   { background: #f5a623; box-shadow: 0 0 0 3px rgba(245,166,35,0.18); }
   &--queued    { background: #8a8f98; }
