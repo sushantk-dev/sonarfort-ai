@@ -124,6 +124,15 @@ export class PipelineStateService {
   submitting = signal<'start' | 'stop' | null>(null);
 
   /**
+   * Actual backend reachability, independent of `error` (which only reflects
+   * whether an *interactive* operation — start/cancel/resume/etc — failed).
+   * `null` = not checked yet (initial load in flight). Driven by the
+   * recurring "all users" Fortify poll below, which runs continuously
+   * regardless of whether any run is active, so it doubles as a heartbeat.
+   */
+  apiOnline = signal<boolean | null>(null);
+
+  /**
    * Set to the pipeline_id of the most recently completed (or errored) Fortify
    * run. PipelineComponent watches this with effect() and navigates to the
    * summary report. Reset by calling clearLastCompleted() after navigation.
@@ -199,6 +208,7 @@ export class PipelineStateService {
         this.runs.set(merged);
         this.selected.set(merged[0] ?? null);
         this._sonarListLoaded = true;
+        this.apiOnline.set(true);
         this._maybeFinishInitialLoad();
 
         // Re-attach Sonar polling for any run still in progress
@@ -222,7 +232,11 @@ export class PipelineStateService {
         this._rehydrateFortify();
       },
       error: () => {
-        // Backend unreachable — history is already loaded, just rehydrate Fortify
+        // Sonar backend unreachable — history is already loaded, just rehydrate
+        // Fortify. Deliberately NOT setting apiOnline(false) here: Sonar and
+        // Fortify can be separate servers (see fortifyBaseUrl), so a down
+        // Sonar server alone shouldn't flip the badge to offline. The
+        // recurring Fortify heartbeat poll is the source of truth for that.
         if (history.length === 0) {
           const seeded = this._seedRuns();
           this.runs.set(seeded);
@@ -855,12 +869,17 @@ export class PipelineStateService {
         next: resp => {
           this._mergeBackendFortifyJobs(resp);
           this._fortifyListLoaded = true;
+          this.apiOnline.set(true);   // heartbeat succeeded — backend is reachable
           this._maybeFinishInitialLoad();
         },
-        // Best-effort — a Fortify server hiccup shouldn't surface an error
-        // banner for a background list refresh.
+        // Best-effort for the run-list merge itself — a Fortify server hiccup
+        // shouldn't surface an *error banner* for a background list refresh.
+        // It should, however, still flip the connectivity badge, since this
+        // poll is the only thing that runs continuously (every 20s) whether
+        // or not a run is active, making it the actual heartbeat.
         error: () => {
           this._fortifyListLoaded = true;
+          this.apiOnline.set(false);  // heartbeat failed — backend unreachable
           this._maybeFinishInitialLoad();
         },
       });

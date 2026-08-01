@@ -15,9 +15,9 @@
       <p class="meta">SonarQube · Fortify — AI-powered scan → fix → PR</p>
     </div>
     <div class="header-actions">
-      <span class="api-badge" [class.api-badge--live]="!error()">
+      <span class="api-badge" [class.api-badge--live]="state.apiOnline() === true">
         <span class="api-badge__dot"></span>
-        {{ error() ? 'API offline' : 'API connected' }}
+        {{ state.apiOnline() === false ? 'API offline' : state.apiOnline() === null ? 'Checking…' : 'API connected' }}
       </span>
       <button class="stop-btn" *ngIf="canCancel" (click)="cancelRun()">
         <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
@@ -303,7 +303,7 @@
           <label>Fortify Username</label>
           <input class="run-form__input" [value]="fortifyUsername()"
                  (input)="fortifyUsername.set($any($event.target).value)"
-                 placeholder="jdoe">
+                 placeholder="john.doe">
           <span class="run-form__hint">"equifax\" prefix added automatically</span>
         </div>
         <div class="run-form__field">
