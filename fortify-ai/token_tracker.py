@@ -73,7 +73,15 @@ def _extract_usage(response: Any) -> dict[str, int]:
         vm = rm.get("usage_metadata") or {}
         if vm:
             inp = int(vm.get("prompt_token_count", 0) or 0)
-            out = int(vm.get("candidates_token_count", 0) or 0)
+            # Gemini 2.5 models spend internal "thinking" tokens before the
+            # visible completion. Vertex reports them separately in
+            # thoughts_token_count, but bills them at the output rate — so
+            # fold them into output_tokens (matching LangChain's own
+            # usage_metadata convention) rather than let them silently
+            # inflate total_tokens beyond input+output.
+            out = int(vm.get("candidates_token_count", 0) or 0) + int(
+                vm.get("thoughts_token_count", 0) or 0
+            )
             tot = int(vm.get("total_token_count", inp + out) or (inp + out))
             return {"input_tokens": inp, "output_tokens": out, "total_tokens": tot}
 
