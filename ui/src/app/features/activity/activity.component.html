@@ -118,30 +118,33 @@
 
       <!-- Output: PRs + escalation reports -->
       <div class="col col--output">
-        <ng-container *ngIf="run.prUrls?.length; else noPr">
-          <a *ngFor="let url of run.prUrls" [href]="url" target="_blank" rel="noopener"
-             class="output-chip output-chip--pr" (click)="$event.stopPropagation()">
-            PR ↗
-          </a>
-        </ng-container>
-        <ng-template #noPr>
-          <a *ngIf="run.prUrl" [href]="run.prUrl" target="_blank" rel="noopener"
-             class="output-chip output-chip--pr" (click)="$event.stopPropagation()">PR ↗</a>
-        </ng-template>
+        <div class="output-chips">
+          <ng-container *ngFor="let item of visibleOutputItems(run)">
+            <a *ngIf="item.type === 'pr'" [href]="item.url" target="_blank" rel="noopener"
+               class="output-chip output-chip--pr" (click)="$event.stopPropagation()">
+              PR ↗
+            </a>
+            <button *ngIf="item.type === 'escalation'"
+                    class="output-chip output-chip--escalation"
+                    (click)="downloadEscalation(item.file, $event)">
+              Escalation ⬇
+            </button>
+          </ng-container>
 
-        <button *ngFor="let file of run.escalationFiles"
-                class="output-chip output-chip--escalation"
-                (click)="downloadEscalation(file, $event)">
-          Escalation ⬇
-        </button>
+          <button *ngIf="hiddenOutputCount(run) as hidden"
+                  class="output-chip output-chip--more"
+                  (click)="toggleOutputExpand(run, $event)">
+            +{{ hidden }} more
+          </button>
 
-        <span *ngIf="run.outcome" class="badge {{ $any(run.outcome) | outcomeClass }}">
-          {{ $any(run.outcome) | outcomeLabel }}
-        </span>
+          <span *ngIf="run.outcome" class="badge {{ $any(run.outcome) | outcomeClass }}">
+            {{ $any(run.outcome) | outcomeLabel }}
+          </span>
 
-        <span *ngIf="!run.prUrls?.length && !run.prUrl && !run.escalationFiles?.length && !run.outcome
-                      && (run.status === 'running' || run.status === 'queued')"
-              class="output-pending">pending…</span>
+          <span *ngIf="!outputItems(run).length && !run.outcome
+                        && (run.status === 'running' || run.status === 'queued')"
+                class="output-pending">pending…</span>
+        </div>
       </div>
 
       <!-- Actions -->

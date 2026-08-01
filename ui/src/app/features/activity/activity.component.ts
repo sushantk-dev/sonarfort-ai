@@ -7,6 +7,10 @@ import { OutcomeClassPipe } from '../../shared/outcome-class.pipe';
 import { OutcomeLabelPipe } from '../../shared/outcome-label.pipe';
 
 type StatusFilter = 'all' | 'running' | 'done' | 'error' | 'cancelled';
+type OutputItem = { type: 'pr'; url: string } | { type: 'escalation'; file: string };
+
+/** Max output chips (PRs + escalation reports combined) shown per row before collapsing behind "+N more". */
+const MAX_VISIBLE_OUTPUTS = 3;
 
 @Component({
   selector: 'app-activity',
@@ -28,6 +32,10 @@ export class ActivityComponent {
   // with full detail (PR urls / escalation files), so a re-render or the
   // next 20s list poll doesn't re-request the same job over and over.
   private _hydrated = new Set<string>();
+
+  // Rows where the user has clicked "+N more" to reveal every PR / escalation
+  // chip instead of the capped preview — keyed by run id.
+  private _expandedOutputs = new Set<string>();
 
   // All Fortify runs, from every user — PipelineStateService.runs already
   // merges GET /pipeline/runs (shared, GCS-backed job store) on a 20s poll,
@@ -142,5 +150,33 @@ export class ActivityComponent {
   downloadEscalation(filename: string, ev: Event) {
     ev.stopPropagation();
     this.state.downloadEscalation(filename);
+  }
+
+  /** PRs + escalation reports for a run, normalized into one ordered list. */
+  outputItems(r: UiRun): OutputItem[] {
+    const items: OutputItem[] = [];
+    const urls = r.prUrls?.length ? r.prUrls : (r.prUrl ? [r.prUrl] : []);
+    for (const url of urls) items.push({ type: 'pr', url });
+    for (const file of (r.escalationFiles ?? [])) items.push({ type: 'escalation', file });
+    return items;
+  }
+
+  /** Capped list to render — full list once the row has been expanded. */
+  visibleOutputItems(r: UiRun): OutputItem[] {
+    const items = this.outputItems(r);
+    if (items.length <= MAX_VISIBLE_OUTPUTS || this._expandedOutputs.has(r.id)) return items;
+    return items.slice(0, MAX_VISIBLE_OUTPUTS);
+  }
+
+  /** How many chips are hidden behind "+N more" (0 once expanded or under the cap). */
+  hiddenOutputCount(r: UiRun): number {
+    if (this._expandedOutputs.has(r.id)) return 0;
+    return Math.max(0, this.outputItems(r).length - MAX_VISIBLE_OUTPUTS);
+  }
+
+  toggleOutputExpand(r: UiRun, ev: Event) {
+    ev.stopPropagation();
+    if (this._expandedOutputs.has(r.id)) this._expandedOutputs.delete(r.id);
+    else this._expandedOutputs.add(r.id);
   }
 }
