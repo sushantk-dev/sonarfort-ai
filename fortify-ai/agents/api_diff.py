@@ -341,28 +341,21 @@ def _find_affected_lines(
     return affected
 
 
-# ── No-japicmp fallback ───────────────────────────────────────────────────────
+# ── Fatal error type ──────────────────────────────────────────────────────────
 
-def _no_japicmp_result(
-    artifact_id: str,
-    current_version: str,
-    candidate: str,
-    reason: str,
-) -> ApiDiffResult:
+class ApiDiffError(Exception):
     """
-    Return a safe-by-assumption ApiDiffResult when japicmp cannot run.
-    The AI Reasoning agent will be told japicmp was unavailable.
+    Raised when the API diff cannot be produced reliably — JAR missing from
+    Maven Central, japicmp JAR missing on disk, or japicmp execution failing.
+    This is intentionally fatal: silently assuming "no breaking changes"
+    when japicmp couldn't actually run would let AI Reasoning judge upgrade
+    safety without real diff data, which is worse than stopping the pipeline.
     """
-    logger.warning(
-        f"[API Diff] {artifact_id}: japicmp unavailable ({reason}) — "
-        "assuming no breaking changes; AI Reasoning will proceed with caution"
-    )
-    return ApiDiffResult(
-        has_breaking_changes=False,
-        breaking_count=0,
-        affected_lines=[],
-        raw_output=f"japicmp unavailable: {reason}",
-    )
+
+    def __init__(self, artifact_id: str, reason: str):
+        self.artifact_id = artifact_id
+        self.reason = reason
+        super().__init__(f"{artifact_id}: {reason}")
 
 
 # ── Main diff function ────────────────────────────────────────────────────────
@@ -401,23 +394,21 @@ def run_api_diff(
 
         if old_jar is None or new_jar is None:
             missing = "current" if old_jar is None else "candidate"
-            return _no_japicmp_result(
-                artifact_id, current_version, candidate,
-                f"{missing} JAR not on Maven Central"
+            raise ApiDiffError(
+                artifact_id, f"{missing} JAR ({candidate if missing == 'candidate' else current_version}) not on Maven Central"
             )
 
         # ── Run japicmp ───────────────────────────────────────────────────────
         if not japicmp_jar.exists():
-            return _no_japicmp_result(
-                artifact_id, current_version, candidate,
-                f"japicmp JAR not found at {japicmp_jar_path}"
+            raise ApiDiffError(
+                artifact_id, f"japicmp JAR not found at {japicmp_jar_path}"
             )
 
         success, raw_output = _run_japicmp(japicmp_jar, old_jar, new_jar)
 
         if not success:
-            return _no_japicmp_result(
-                artifact_id, current_version, candidate, raw_output
+            raise ApiDiffError(
+                artifact_id, f"japicmp execution failed: {raw_output[:500]}"
             )
 
         # ── Parse output ──────────────────────────────────────────────────────
@@ -516,10 +507,23 @@ def api_diff_node(state: AgentState, project_path: str, japicmp_jar_path: str) -
 
     try:
         enriched = run_api_diff_all_groups(groups, Path(project_path), japicmp_jar_path)
-    except Exception as exc:  # any fatal error — halt the pipeline
-        logger.error(f"[API Diff] Fatal error — halting pipeline: {exc}")
+    except ApiDiffError as exc:
+        logger.error(
+            f"[API Diff] Fatal error — halting pipeline: {exc}"
+        )
         state["status"] = "failed"
-        state["escalation_reason"] = f"API Diff failed: {exc}"
+        state["escalation_reason"] = str(exc)
+        state["audit_trail"].append({
+            "node": "api_diff",
+            "status": "failed",
+            "artifact_id": exc.artifact_id,
+            "error": exc.reason,
+        })
+        return state
+    except Exception as exc:  # catch-all: any other unexpected error
+        logger.error(f"[API Diff] Unexpected fatal error — halting pipeline: {exc}")
+        state["status"] = "failed"
+        state["escalation_reason"] = f"Unexpected API diff error: {exc}"
         state["audit_trail"].append({
             "node": "api_diff",
             "status": "failed",
