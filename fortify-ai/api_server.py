@@ -21,19 +21,26 @@ Execution Modes:
     POST /pipeline/cancel/{pipeline_id}   — cooperative cancellation at the next stage boundary
     POST /pipeline/resume/{pipeline_id}   — resume an interrupted/failed/cancelled run from its
                                              last checkpointed stage (full-pipeline runs only).
-                                             Most jobs never need this call made manually — see
-                                             AUTO_RESUME_ENABLED below.
+                                             Jobs merely interrupted by a pod restart usually
+                                             resume on their own — see AUTO_RESUME_ENABLED below —
+                                             but failed/cancelled jobs always need this call made
+                                             manually.
     POST /pipeline/sweep                  — manually trigger the orphan-job sweep (also runs
                                              automatically in the background on every pod)
 
   AUTO-RESUME (env-configurable, on by default)
-    Jobs left 'interrupted' (graceful pod SIGTERM) or 'failed' (orphan-swept
-    after a hard pod death) are automatically resumed from their last
-    checkpoint — by the orphan sweep as soon as it detects them, and by a
-    one-shot scan at every pod's startup — instead of waiting for a human
-    to call POST /pipeline/resume/{pipeline_id}. Bounded by
-    AUTO_RESUME_MAX_ATTEMPTS (default 3) per job so a permanently-broken
-    run doesn't retry forever. Disable with AUTO_RESUME_ENABLED=false.
+    Jobs left 'interrupted' by a previous pod's graceful SIGTERM shutdown
+    (eviction, rolling deploy, scale-down — i.e. nothing actually went
+    wrong with the run) are automatically resumed from their last
+    checkpoint by a one-shot scan at every pod's startup, instead of
+    waiting for a human to call POST /pipeline/resume/{pipeline_id}.
+    Bounded by AUTO_RESUME_MAX_ATTEMPTS (default 3) per job. Disable with
+    AUTO_RESUME_ENABLED=false.
+
+    Deliberately does NOT cover 'failed' jobs (a raised exception, or the
+    orphan sweep timing out a job whose pod died without a clean SIGTERM)
+    or 'cancelled' jobs (a deliberate user action) — both always require
+    a human to call POST /pipeline/resume/{pipeline_id} explicitly.
 
     Any per-request credentials captured for the resume (Fortify password,
     GitHub PAT, Sonar token) are stored symmetrically encrypted — see
@@ -138,40 +145,44 @@ _ORPHAN_SWEEP_INTERVAL_SECONDS = int(os.environ.get("ORPHAN_SWEEP_INTERVAL_SECON
 _ORPHAN_SWEEP_TIMEOUT_SECONDS  = int(os.environ.get("ORPHAN_SWEEP_TIMEOUT_SECONDS", 1800))
 _orphan_sweep_task: "asyncio.Task | None" = None
 
-# Auto-resume tuning — env-overridable. When enabled, jobs that would
-# otherwise sit stuck waiting for a human to call
-# POST /pipeline/resume/{pipeline_id} are resumed automatically from their
-# last checkpoint instead — see `_try_auto_resume`, used by both the
-# orphan sweep (below) and `startup_event` (jobs left 'interrupted' by a
-# previous pod's graceful-shutdown handler).
+# Auto-resume tuning — env-overridable. When enabled, jobs left
+# 'interrupted' by a previous pod's graceful-shutdown handler (SIGTERM —
+# pod eviction, rolling deploy, scale-down) are resumed automatically from
+# their last checkpoint at the next pod's startup, instead of sitting
+# until a human notices and calls POST /pipeline/resume/{pipeline_id}.
+# See `_try_auto_resume`, called from `startup_event`.
+#
+# Deliberately does NOT cover 'failed' jobs. A failure means a stage
+# actually raised (bad/expired credentials, a deleted repo, a Fortify/
+# GitHub API error, a bug) — that's a real problem that silently retrying
+# won't fix and could make worse (e.g. hammering a rate-limited API, or
+# opening duplicate side effects if the failure happened after a
+# side-effecting stage but the checkpoint is stale). Failed jobs — whether
+# from an exception or from the orphan sweep timing a stuck 'running' job
+# out — always require a human to look and call
+# POST /pipeline/resume/{pipeline_id} explicitly. Nor does it cover
+# 'cancelled' — that was a deliberate user action.
 _AUTO_RESUME_ENABLED = os.environ.get("AUTO_RESUME_ENABLED", "true").strip().lower() not in ("0", "false", "no")
 _AUTO_RESUME_MAX_ATTEMPTS = int(os.environ.get("AUTO_RESUME_MAX_ATTEMPTS", 3))
-# Statuses eligible for auto-resume. Deliberately excludes 'cancelled' —
-# a user-requested cancellation should stay cancelled unless a human
-# explicitly resumes it.
-_AUTO_RESUME_STATUSES = ("interrupted", "failed")
+_AUTO_RESUME_STATUSES = ("interrupted",)
 
 
 def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
     """
     Find jobs stuck at status='running' with no stage progress for longer
-    than *timeout_seconds* (default ORPHAN_SWEEP_TIMEOUT_SECONDS). This
-    closes the "stuck forever" gap left when a pod dies (OOM kill, node
-    eviction, hard crash) mid-job without ever reaching finish_job — no
-    SIGTERM is delivered in that case, so the shutdown handler below never
-    runs.
+    than *timeout_seconds* (default ORPHAN_SWEEP_TIMEOUT_SECONDS) and flip
+    them to 'failed'. This closes the "stuck forever" gap left when a pod
+    dies (OOM kill, node eviction, hard crash) mid-job without ever reaching
+    finish_job — no SIGTERM is delivered in that case, so the shutdown
+    handler below never runs, and the job never becomes eligible for
+    auto-resume (see AUTO_RESUME_STATUSES) — a human must call
+    POST /pipeline/resume/{pipeline_id} for these.
 
-    Each stale job is first offered to `_try_auto_resume` — if it has a
-    resumable checkpoint, auto-resume attempts remaining, and
-    AUTO_RESUME_ENABLED is set, it's picked back up right away on this
-    (healthy) pod instead of being left for a human. Only jobs
-    auto-resume declines are flipped to 'failed' (checkpoint, if any, is
-    preserved either way — finish_job only clears it on
-    status='completed' — so a manual POST /pipeline/resume/{pipeline_id}
-    remains available even after auto-resume attempts are exhausted).
+    The checkpoint (if any) is preserved — finish_job only clears it on
+    status='completed' — so a swept job still exposes a resumable
+    checkpoint via that manual resume call.
 
-    Returns the list of pipeline_ids that were swept (auto-resumed or
-    marked failed).
+    Returns the list of pipeline_ids that were swept.
     """
     timeout = timeout_seconds if timeout_seconds is not None else _ORPHAN_SWEEP_TIMEOUT_SECONDS
     swept: list[str] = []
@@ -185,10 +196,6 @@ def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
         if not pid:
             continue
         try:
-            # Mark it failed first so `_try_auto_resume`'s status check
-            # (interrupted/failed) sees a consistent, non-'running' record
-            # to work from — it flips it straight back to 'running' if it
-            # decides to resume.
             _store.finish_job(
                 pid, "failed",
                 error=(
@@ -199,10 +206,7 @@ def _run_orphan_sweep(timeout_seconds: float | None = None) -> list[str]:
                 ),
             )
             swept.append(pid)
-            if _try_auto_resume(pid):
-                print(f"[OrphanSweep] Orphaned job {pid} auto-resumed from checkpoint")
-            else:
-                print(f"[OrphanSweep] Marked orphaned job as failed: {pid}")
+            print(f"[OrphanSweep] Marked orphaned job as failed: {pid}")
         except Exception as exc:
             print(f"[OrphanSweep] Failed to finish_job for {pid}: {exc}")
     return swept
@@ -2087,19 +2091,23 @@ def _try_auto_resume(pipeline_id: str) -> bool:
     """
     Attempt to automatically resume *pipeline_id* from its last checkpoint
     instead of leaving it stuck until a human notices and calls
-    POST /pipeline/resume/{pipeline_id}. Called from two places:
+    POST /pipeline/resume/{pipeline_id}.
 
-      - `_run_orphan_sweep`, for jobs whose pod died without a clean
-        SIGTERM (OOM kill, node eviction, hard crash) — tried right after
-        the job is marked 'failed', so a healthy pod picks it straight
-        back up.
-      - `startup_event`, for jobs left 'interrupted' by a previous pod's
-        graceful-shutdown handler — tried once per pod boot.
+    Only ever called for jobs still at status 'interrupted' — see
+    AUTO_RESUME_STATUSES — i.e. ones left mid-run by a *previous* pod's
+    graceful-shutdown handler (SIGTERM: eviction, rolling deploy,
+    scale-down), where nothing actually went wrong with the run itself.
+    Called from `startup_event`'s one-shot scan at every pod boot.
 
-    Bounded by AUTO_RESUME_MAX_ATTEMPTS so a permanently-broken run (bad
-    saved credentials, a deleted repo, ...) doesn't retry forever; once
-    exhausted the job stays at its terminal status and only a manual
-    POST /pipeline/resume/{pipeline_id} will retry it.
+    Deliberately NOT called for 'failed' jobs (whether from a raised
+    exception or the orphan sweep timing out a stuck 'running' job) —
+    those need a human to look before retrying. See the AUTO_RESUME_
+    STATUSES comment above for why.
+
+    Bounded by AUTO_RESUME_MAX_ATTEMPTS so a job that keeps getting
+    interrupted (e.g. every pod that picks it up gets evicted again before
+    finishing) doesn't retry forever; once exhausted it stays 'interrupted'
+    and only a manual POST /pipeline/resume/{pipeline_id} will retry it.
 
     Returns True if a resume was actually kicked off.
     """
@@ -2126,12 +2134,11 @@ def _try_auto_resume(pipeline_id: str) -> bool:
 
 def _auto_resume_startup_scan(limit: int = 200) -> list[str]:
     """
-    One-time scan run at pod boot (see `startup_event`) for jobs left
-    resumable by a *previous* pod: status 'interrupted' from a graceful
-    SIGTERM shutdown (see `shutdown_event`), or 'failed' from an orphan
-    sweep / exception that then never got a follow-up auto-resume because
-    that pod also went away. Bounded by AUTO_RESUME_MAX_ATTEMPTS the same
-    as the orphan-sweep path — see `_try_auto_resume`.
+    One-time scan run at pod boot for jobs left 'interrupted' by a
+    *previous* pod's graceful SIGTERM shutdown (see `shutdown_event`) —
+    work that was cut off mid-run through no fault of the run itself, not
+    a job that actually failed. Bounded by AUTO_RESUME_MAX_ATTEMPTS the
+    same as any other auto-resume — see `_try_auto_resume`.
 
     Only scans the most recent *limit* jobs (list_jobs is newest-first);
     older stuck jobs remain reachable via a manual
@@ -2177,10 +2184,12 @@ async def resume_pipeline(pipeline_id: str):
     `resume_checkpoint` handling and `pr_agent._find_existing_pr` for the
     duplicate-PR guard.
 
-    Note: most interrupted/orphaned jobs never need this call manually —
-    see AUTO_RESUME_ENABLED — this endpoint remains for on-demand resume,
-    resuming a job whose auto-resume attempts were exhausted, or resuming
-    with AUTO_RESUME_ENABLED turned off.
+    Note: jobs left 'interrupted' by a pod restart usually resume on their
+    own — see AUTO_RESUME_ENABLED — so this call is mainly needed for
+    'failed' jobs (auto-resume deliberately skips these; see the
+    AUTO_RESUME_STATUSES comment near the top of this file for why),
+    'cancelled' jobs, or an interrupted job whose auto-resume attempts
+    were exhausted or that arrived while AUTO_RESUME_ENABLED was off.
 
     Returns a *pipeline_id* (the SAME one — resume continues the existing
     job record rather than minting a new one) immediately; poll
