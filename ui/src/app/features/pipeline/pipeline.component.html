@@ -37,8 +37,7 @@
       </button>
       <button class="run-btn run-btn--fortify"
               *ngIf="activeSource() === 'fortify'"
-              (click)="showFortifyForm.set(!showFortifyForm()); showForm.set(false)"
-              [disabled]="running()">
+              (click)="showFortifyForm.set(!showFortifyForm()); showForm.set(false)">
         <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
           <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
         </svg>
@@ -318,9 +317,9 @@
 
     <div class="run-form__flags">
       <button class="run-form__submit run-form__submit--fortify"
-              (click)="startFortifyRun()" [disabled]="running()">
-        <span *ngIf="!running()">▶ Start</span>
-        <span *ngIf="running()" class="spinner"></span>
+              (click)="startFortifyRun()" [disabled]="state.submitting() === 'start'">
+        <span *ngIf="state.submitting() !== 'start'">▶ Start</span>
+        <span *ngIf="state.submitting() === 'start'" class="spinner"></span>
       </button>
 
     </div>
