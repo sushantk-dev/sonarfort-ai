@@ -11,6 +11,23 @@ from __future__ import annotations
 from typing import Any, Optional, TypedDict
 
 
+# ── Cancellation ─────────────────────────────────────────────────────────────
+
+class PipelineCancelledError(Exception):
+    """
+    Raised by an agent (e.g. adr_fix, ai_reasoning) when a caller-supplied
+    ``cancel_check()`` callback reports that the job was cancelled while the
+    agent was in the middle of a long-running operation (a subprocess build,
+    a per-group LLM loop, ...).
+
+    Lives in state.py — not api_server.py — so agent modules can raise it
+    without importing the API layer (which would be a circular import: the
+    API layer imports the agents, not the other way around). api_server.py
+    catches this alongside its own ``PipelineCancelled`` and treats both the
+    same way: the job is marked ``"cancelled"``.
+    """
+
+
 # ── Nested types ─────────────────────────────────────────────────────────────
 
 class DependencyInfo(TypedDict):

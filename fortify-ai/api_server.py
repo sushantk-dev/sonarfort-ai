@@ -88,7 +88,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,7 +101,7 @@ from job_store import create_job_store, ALL_STAGE_NAMES
 from token_tracker import token_tracker
 from runtime_config import apply_overrides, persist_overrides, is_persisted
 from credential_vault import encrypt_resume_meta, decrypt_resume_meta
-from state import AgentState
+from state import AgentState, PipelineCancelledError
 
 # Pull any GCS-persisted runtime config overrides (Settings-page saves,
 # refreshed Fortify tokens) into this pod's environment before anything
@@ -249,7 +249,18 @@ def _finish_job(pipeline_id: str, status: str, result: dict | None = None,
 
 
 class PipelineCancelled(Exception):
-    """Raised internally when a job's cancel flag is observed between stages."""
+    """
+    Raised internally when a job's cancel flag is observed between stages
+    (see ``_check_cancelled``).
+
+    Sibling exception: ``state.PipelineCancelledError`` — raised from inside
+    agent code (agents.adr_fix, agents.ai_reasoning) when cancellation is
+    observed *mid-stage* (mid-subprocess, mid per-group loop) rather than at
+    a stage boundary. It lives in state.py instead of here so agent modules
+    don't have to import api_server. Every ``except PipelineCancelled:``
+    below also catches it — both mean the same thing: mark the job
+    ``"cancelled"``.
+    """
 
 
 def _check_cancelled(pipeline_id: str | None) -> None:
@@ -261,6 +272,19 @@ def _check_cancelled(pipeline_id: str | None) -> None:
     """
     if pipeline_id and _store.is_cancel_requested(pipeline_id):
         raise PipelineCancelled()
+
+
+def _cancel_check_for(pipeline_id: str | None) -> "Callable[[], bool]":
+    """
+    Build a zero-arg cancel-check callback bound to *pipeline_id*, for
+    passing into agents.adr_fix.run_adr_fix / agents.ai_reasoning.reason_all_groups
+    so they can interrupt a long subprocess or per-group LLM loop instead of
+    only being checked at the surrounding stage boundary. Always returns
+    False when pipeline_id is None (e.g. ad-hoc/non-job invocations).
+    """
+    def _check() -> bool:
+        return bool(pipeline_id and _store.is_cancel_requested(pipeline_id))
+    return _check
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -872,6 +896,12 @@ def _run_full_pipeline(
         _stage_done("api-diff", t, {"groups_count": len(diffed)})
         _checkpoint("ai-reasoning", diffed=diffed)
 
+    # Cancel-check callback threaded into ai-reasoning / adr-fix below so a
+    # cancel request is honored mid-stage (mid per-group LLM loop, mid Maven
+    # build subprocess) instead of only at the stage boundaries _check_cancelled
+    # checks — see PipelineCancelledError in state.py for why.
+    cancel_check = _cancel_check_for(pipeline_id)
+
     # Stage 5 — ai reasoning
     if _already_done("ai-reasoning"):
         reasoned = acc["reasoned"]
@@ -879,7 +909,12 @@ def _run_full_pipeline(
         _check_cancelled(pipeline_id)
         t = _stage_start("ai-reasoning")
         try:
-            reasoned = reason_all_groups(diffed, cfg.gcp_project, cfg.gcp_location)
+            reasoned = reason_all_groups(
+                diffed, cfg.gcp_project, cfg.gcp_location, cancel_check=cancel_check,
+            )
+        except PipelineCancelledError:
+            _stage_fail("ai-reasoning", t, "Cancelled by user")
+            raise
         except Exception as exc:
             # A fatal AI reasoning error (permission denied, auth, quota, etc.)
             # must stop the pipeline — mark the stage failed (not left stuck at
@@ -899,36 +934,44 @@ def _run_full_pipeline(
         _check_cancelled(pipeline_id)
         t = _stage_start("adr-fix")
         adr_results: list[dict] = []
-        for group in reasoned:
-            _check_cancelled(pipeline_id)  # stop before pushing the next commit
-            artifact_id = group["parsed"]["artifact_id"]
-            if group.get("next_node") == "escalate":
-                adr_results.append({
-                    "artifact_id": artifact_id,
-                    "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
-                        error_reason=_escalation_reason(group),
-                    ),
-                })
-                continue
-            if dry_run or not cfg.adr_path:
-                adr_results.append({
-                    "artifact_id": artifact_id,
-                    "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
-                        error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
-                    ),
-                })
-            else:
-                result = run_adr_fix(
-                    group, adr_path=cfg.adr_path,
-                    project_path=str(project_path),
-                    jira_prefix=cfg.jira_id_prefix,
-                    release_id=release_id,
-                )
-                adr_results.append({"artifact_id": artifact_id, "result": result})
+        try:
+            for group in reasoned:
+                _check_cancelled(pipeline_id)  # stop before pushing the next commit
+                artifact_id = group["parsed"]["artifact_id"]
+                if group.get("next_node") == "escalate":
+                    adr_results.append({
+                        "artifact_id": artifact_id,
+                        "result": AdrResult(
+                            success=False, branch_name=None, commit_hash=None,
+                            build_time_seconds=None, pdf_path=None,
+                            error_reason=_escalation_reason(group),
+                        ),
+                    })
+                    continue
+                if dry_run or not cfg.adr_path:
+                    adr_results.append({
+                        "artifact_id": artifact_id,
+                        "result": AdrResult(
+                            success=False, branch_name=None, commit_hash=None,
+                            build_time_seconds=None, pdf_path=None,
+                            error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
+                        ),
+                    })
+                else:
+                    result = run_adr_fix(
+                        group, adr_path=cfg.adr_path,
+                        project_path=str(project_path),
+                        jira_prefix=cfg.jira_id_prefix,
+                        release_id=release_id,
+                        cancel_check=cancel_check,
+                    )
+                    adr_results.append({"artifact_id": artifact_id, "result": result})
+        except PipelineCancelledError:
+            # Raised either between groups (_check_cancelled) or from inside
+            # run_adr_fix if cancellation landed mid-build/mid-push — either
+            # way the subprocess has already been terminated by this point.
+            _stage_fail("adr-fix", t, "Cancelled by user")
+            raise
         _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
         _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
         _checkpoint("pr-agent", adr_results=adr_results)
@@ -1438,7 +1481,7 @@ async def pipeline_live(req: LivePipelineRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
-        except PipelineCancelled:
+        except (PipelineCancelled, PipelineCancelledError):
             _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
@@ -1504,7 +1547,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
-        except PipelineCancelled:
+        except (PipelineCancelled, PipelineCancelledError):
             _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
@@ -1587,7 +1630,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
             result["app_id"] = app_id
             result["repo"] = req.repo  # echo back so callers know which repo was used
             _finish_job(pid, "completed", result=result, t0=t0)
-        except PipelineCancelled:
+        except (PipelineCancelled, PipelineCancelledError):
             _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
@@ -1658,7 +1701,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
-        except PipelineCancelled:
+        except (PipelineCancelled, PipelineCancelledError):
             _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
@@ -1726,7 +1769,7 @@ async def pipeline_dry_run(req: DryRunRequest):
             if req.repo:
                 result["repo"] = req.repo
             _finish_job(pid, "completed", result=result, t0=t0)
-        except PipelineCancelled:
+        except (PipelineCancelled, PipelineCancelledError):
             _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
@@ -2061,7 +2104,7 @@ def _start_resume(pipeline_id: str, resume_meta: dict, checkpoint: dict, *, auto
             if resume_meta.get("repo"):
                 result["repo"] = resume_meta["repo"]
             _finish_job(pid, "completed", result=result, t0=t0)
-        except PipelineCancelled:
+        except (PipelineCancelled, PipelineCancelledError):
             _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
         except Exception as exc:
             _finish_job(pid, "failed", error=str(exc), t0=t0)
@@ -2634,10 +2677,17 @@ def _run_until(
         return result
 
     # Stage 4 — ai reasoning
+    cancel_check = _cancel_check_for(pipeline_id)
+
     _check_cancelled(pipeline_id)
     t = _s_start("ai-reasoning")
     try:
-        reasoned = reason_all_groups(diff_groups, cfg.gcp_project, cfg.gcp_location)
+        reasoned = reason_all_groups(
+            diff_groups, cfg.gcp_project, cfg.gcp_location, cancel_check=cancel_check,
+        )
+    except PipelineCancelledError:
+        _s_fail("ai-reasoning", t, "Cancelled by user")
+        raise
     except Exception as exc:
         _s_fail("ai-reasoning", t, str(exc))
         raise
@@ -2655,28 +2705,33 @@ def _run_until(
     _check_cancelled(pipeline_id)
     t = _s_start("adr-fix")
     adr_results: list[dict] = []
-    for group in reasoned:
-        _check_cancelled(pipeline_id)  # stop before pushing the next commit
-        artifact_id = group["parsed"]["artifact_id"]
-        if group.get("next_node") == "escalate" or not cfg.adr_path:
-            adr_results.append({
-                "artifact_id": artifact_id,
-                "result": AdrResult(
-                    success=False, branch_name=None, commit_hash=None,
-                    build_time_seconds=None, pdf_path=None,
-                    error_reason="Escalated or ADR_PATH not set",
-                ),
-            })
-        else:
-            adr_results.append({
-                "artifact_id": artifact_id,
-                "result": run_adr_fix(
-                    group, adr_path=cfg.adr_path,
-                    project_path=str(project_path),
-                    jira_prefix=cfg.jira_id_prefix,
-                    release_id=release_id,
-                ),
-            })
+    try:
+        for group in reasoned:
+            _check_cancelled(pipeline_id)  # stop before pushing the next commit
+            artifact_id = group["parsed"]["artifact_id"]
+            if group.get("next_node") == "escalate" or not cfg.adr_path:
+                adr_results.append({
+                    "artifact_id": artifact_id,
+                    "result": AdrResult(
+                        success=False, branch_name=None, commit_hash=None,
+                        build_time_seconds=None, pdf_path=None,
+                        error_reason="Escalated or ADR_PATH not set",
+                    ),
+                })
+            else:
+                adr_results.append({
+                    "artifact_id": artifact_id,
+                    "result": run_adr_fix(
+                        group, adr_path=cfg.adr_path,
+                        project_path=str(project_path),
+                        jira_prefix=cfg.jira_id_prefix,
+                        release_id=release_id,
+                        cancel_check=cancel_check,
+                    ),
+                })
+    except PipelineCancelledError:
+        _s_fail("adr-fix", t, "Cancelled by user")
+        raise
     _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
     result["adr_results"] = adr_results
     _s_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
@@ -2738,7 +2793,7 @@ def _make_partial_endpoint(stop_after: StageLabel):
                 if req.repo:
                     result["repo"] = req.repo
                 _finish_job(pid, "completed", result=result, t0=t0)
-            except PipelineCancelled:
+            except (PipelineCancelled, PipelineCancelledError):
                 _finish_job(pid, "cancelled", error="Cancelled by user", t0=t0)
             except Exception as exc:
                 _finish_job(pid, "failed", error=str(exc), t0=t0)

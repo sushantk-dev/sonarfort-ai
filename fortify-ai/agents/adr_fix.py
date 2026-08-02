@@ -28,18 +28,26 @@ Console output (done-when):
 from __future__ import annotations
 
 import json
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from loguru import logger
 
-from state import AgentState, AdrResult
+from state import AgentState, AdrResult, PipelineCancelledError
+
+# How often the subprocess-watching loop checks cancel_check() while waiting
+# for ADR's stdout, and how long we give the subprocess to exit cleanly after
+# SIGTERM before escalating to SIGKILL.
+_CANCEL_POLL_SECONDS = 0.5
+_CANCEL_GRACE_SECONDS = 10.0
 
 
 # ── Branch name builder ───────────────────────────────────────────────────────
@@ -267,6 +275,7 @@ def invoke_adr(
     project_path: str,
     commit_id: str,
     target_versions: dict | None = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[bool, str, str]:
     """
     Run adr_fortify.py --commit <commit_id> --push --target-versions <json>.
@@ -279,8 +288,28 @@ def invoke_adr(
         }, ...
     }
 
+    cancel_check: optional zero-arg callable returning True once the job has
+        been flagged for cancellation (e.g. ``lambda: store.is_cancel_requested(pid)``).
+        Without this, a cancel request made while ADR's Maven build is running
+        has no effect until the build finishes on its own — this is what makes
+        that responsive. Checked every ``_CANCEL_POLL_SECONDS`` while streaming
+        ADR's stdout (via a background reader thread, since blocking readline()
+        can't be interrupted directly). On a positive check, the subprocess is
+        sent SIGTERM, given ``_CANCEL_GRACE_SECONDS`` to exit, then SIGKILL'd —
+        and ``PipelineCancelledError`` is raised.
+
+        Note: terminating mid-build can leave the working tree / a partially
+        pushed branch in an inconsistent state (ADR's own rollback-on-failure
+        logic doesn't get a chance to run). The caller should treat a
+        cancelled ADR run as "state unknown — verify manually", not as a
+        clean rollback.
+
     Returns (success: bool, stdout: str, stderr: str).
     success=True means exit code 0 (build passed, branch pushed).
+
+    Raises:
+        PipelineCancelledError: if cancel_check() reports cancellation while
+            the subprocess was running.
     """
     import json as _json
     cmd = [
@@ -305,12 +334,74 @@ def invoke_adr(
         )
 
         stdout_lines: list[str] = []
-        for raw in iter(proc.stdout.readline, b""):
+
+        # readline() blocks until a line arrives (or EOF), which would starve
+        # our cancel_check() polling. Read on a background thread instead and
+        # drain a queue with a short timeout so we can check cancellation in
+        # between — without this, cancel is invisible for the entire build.
+        line_queue: "queue.Queue[bytes | None]" = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                for raw in iter(proc.stdout.readline, b""):
+                    line_queue.put(raw)
+            finally:
+                line_queue.put(None)  # EOF sentinel
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        cancelled = False
+        while True:
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
+            try:
+                raw = line_queue.get(timeout=_CANCEL_POLL_SECONDS)
+            except queue.Empty:
+                continue
+            if raw is None:   # EOF — subprocess closed stdout
+                break
             line = raw.decode("utf-8", errors="replace").rstrip()
             stdout_lines.append(line)
             logger.debug(f"[ADR] {line}")   # streams live to the terminal
 
-        proc.wait()   # no timeout — wait until ADR fully completes
+        if cancelled:
+            logger.warning(
+                f"[ADR Fix] Cancellation requested — terminating ADR subprocess "
+                f"(pid={proc.pid})"
+            )
+            proc.terminate()
+            try:
+                proc.wait(timeout=_CANCEL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    f"[ADR Fix] ADR subprocess (pid={proc.pid}) did not exit "
+                    f"within {_CANCEL_GRACE_SECONDS}s of SIGTERM — sending SIGKILL"
+                )
+                proc.kill()
+                proc.wait()
+            # Best-effort: grab whatever output the reader thread already buffered.
+            while True:
+                try:
+                    raw = line_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if raw is None:
+                    break
+                stdout_lines.append(raw.decode("utf-8", errors="replace").rstrip())
+            logger.warning(
+                "[ADR Fix] ⚠️  ADR subprocess terminated mid-run due to cancellation — "
+                "branch/build/push state is UNKNOWN (ADR's own rollback did not get "
+                "a chance to run). Verify the working tree and remote branch manually "
+                "before retrying this dependency."
+            )
+            raise PipelineCancelledError(
+                f"Cancelled by user while ADR build/push was in progress "
+                f"(pid={proc.pid}); partial output captured for the audit log."
+            )
+
+        proc.wait()   # reader hit EOF, so this returns immediately
         elapsed = int(time.time() - t0)
         stdout_text = "\n".join(stdout_lines)
 
@@ -319,6 +410,8 @@ def invoke_adr(
             logger.debug(f"[ADR Fix] stdout (last 1000):\n{stdout_text[-1000:]}")
         return proc.returncode == 0, stdout_text, ""
 
+    except PipelineCancelledError:
+        raise
     except FileNotFoundError:
         logger.error(f"[ADR Fix] adr.py not found at {adr_path}")
         return False, "", f"adr.py not found at {adr_path}"
@@ -335,6 +428,7 @@ def run_adr_fix(
     project_path: str,
     jira_prefix: str = "FORTIFY",
     release_id: int = 0,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
@@ -347,6 +441,11 @@ def run_adr_fix(
       5. Abort with success=False if ADR made 0 fixes (dep not found in poms)
       6. Log done-when result lines
       7. Return AdrResult
+
+    cancel_check: forwarded to invoke_adr() — see its docstring. If the job is
+        cancelled while this group's build is running, PipelineCancelledError
+        propagates out of this function (not caught here) so the pipeline
+        runner can mark the whole job "cancelled" instead of "failed".
     """
     parsed = group["parsed"]
     artifact_id = parsed["artifact_id"]
@@ -380,7 +479,8 @@ def run_adr_fix(
     logger.info(f"[ADR Fix] Target key: '{coord_key}' (bare fallback: '{coord_key_bare}')")
 
     success, stdout, stderr = invoke_adr(
-        adr_path, project_path, branch_name, target_versions=target_versions
+        adr_path, project_path, branch_name, target_versions=target_versions,
+        cancel_check=cancel_check,
     )
 
     if success:
@@ -454,9 +554,16 @@ def adr_fix_node(
     LangGraph node: adr_fix.
 
     Reads:  state["_reasoned_groups"]   (or _diff_groups as fallback)
+            state["_cancel_check"]      optional zero-arg callable — see
+                                         invoke_adr()'s docstring. Not required;
+                                         without it this node behaves as before
+                                         (cancel has no effect mid-build).
     Writes: state["_adr_results"]       list of AdrResult dicts, one per group
             state["adr_result"]         result of the first group (for routing)
             state["audit_trail"]
+
+    Raises: PipelineCancelledError if cancel_check() reports cancellation —
+            propagates uncaught so the caller can mark the job "cancelled".
     """
     groups: list[dict] = (
         state.get("_reasoned_groups")  # type: ignore[attr-defined]
@@ -473,9 +580,15 @@ def adr_fix_node(
 
     adr_results: list[dict] = []
     release_id: int = state.get("release_id", 0)  # type: ignore[attr-defined]
+    cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
 
     for group in groups:
-        result = run_adr_fix(group, adr_path, project_path, jira_prefix, release_id=release_id)
+        if cancel_check is not None and cancel_check():
+            raise PipelineCancelledError("Cancelled by user before starting next ADR group")
+        result = run_adr_fix(
+            group, adr_path, project_path, jira_prefix,
+            release_id=release_id, cancel_check=cancel_check,
+        )
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],
             "result": result,

@@ -36,11 +36,11 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from loguru import logger
 
-from state import AgentState, AiReasoningResult
+from state import AgentState, AiReasoningResult, PipelineCancelledError
 
 try:  # flat layout (token_tracker.py at repo root, next to state.py)
     from token_tracker import token_tracker
@@ -481,6 +481,7 @@ def reason_all_groups(
     gcp_location: str,
     vertex_model: str = "gemini-2.5-flash",
     max_tokens: int = 8192,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[dict]:
     """
     Run AI reasoning for every group against its current candidate.
@@ -489,12 +490,26 @@ def reason_all_groups(
 
     vertex_model: model name from VERTEX_MODEL config (e.g. gemini-2.5-flash)
     max_tokens:   max output tokens from MAX_TOKENS config
+
+    cancel_check: optional zero-arg callable returning True once the job has
+        been flagged for cancellation. Checked before each group's LLM call —
+        without this, a cancel request has no effect until every group in the
+        batch has been reasoned about, since this function is otherwise called
+        once per stage rather than once per group.
+
+    Raises:
+        PipelineCancelledError: if cancel_check() reports cancellation before
+            a group's LLM call starts.
     """
     llm = _build_llm(gcp_project, gcp_location, model_name=vertex_model, max_output_tokens=max_tokens)
 
     enriched: list[dict] = []
 
     for group in groups:
+        if cancel_check is not None and cancel_check():
+            raise PipelineCancelledError(
+                "Cancelled by user before reasoning about the next dependency group"
+            )
         candidates: list[str] = (
             group.get("version_candidates", {}).get("candidates", [])
         )
@@ -566,11 +581,19 @@ def ai_reasoning_node(
         state["audit_trail"].append({"node": "ai_reasoning", "status": "skipped"})
         return state
 
+    cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
+
     try:
         enriched = reason_all_groups(
             groups, gcp_project, gcp_location,
             vertex_model=vertex_model, max_tokens=max_tokens,
+            cancel_check=cancel_check,
         )
+    except PipelineCancelledError:
+        # Let cancellation propagate uncaught — the pipeline runner marks the
+        # job "cancelled", not "failed". Must be checked before the broad
+        # `except Exception` below, which would otherwise misclassify it.
+        raise
     except AIReasoningError as exc:
         logger.error(
             f"[AI Reasoning] Fatal error — halting pipeline: {exc}"
