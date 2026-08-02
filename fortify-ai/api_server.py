@@ -789,7 +789,15 @@ def _run_full_pipeline(
     def _stage_start(name: str) -> float:
         t = time.time()
         if pipeline_id:
-            _update_stage(pipeline_id, name, status="running", started_at=_now())
+            # update_stage() is a shallow merge (dict.update), so without
+            # explicitly clearing these, a stage that's restarting — on
+            # resume, or a future retry — keeps whatever error/output_summary
+            # its LAST attempt left behind. That stale text (e.g. "Cancelled
+            # by user") would otherwise still render as this step's detail
+            # even though the stage is genuinely running again right now.
+            _update_stage(pipeline_id, name, status="running", started_at=_now(),
+                          finished_at=None, elapsed_seconds=None,
+                          error=None, output_summary=None)
         return t
 
     def _stage_done(name: str, t: float, summary: dict | None = None) -> None:
@@ -2010,6 +2018,19 @@ def delete_pipeline_run(pipeline_id: str):
     })
 
 
+# Resume is only supported for interruptions at or before this stage.
+# adr-fix ("Dependency Fix") is the last side-effecting stage that makes
+# sense to pick back up from a checkpoint — once it (and therefore pr-agent,
+# possibly a real PR) is already done, "resuming" only has fortify-writeback
+# left to run, which isn't worth the resume machinery. resume_stage is the
+# NEXT stage a resume would start at (see job_store._blank_job), so
+# rejecting once it's past adr-fix in ALL_STAGE_NAMES order means: adr-fix
+# itself was interrupted or never started → still resumable; adr-fix already
+# completed and checkpointed (next stage is pr-agent or fortify-writeback)
+# → not resumable.
+_RESUME_MAX_STAGE = "adr-fix"
+
+
 def _resume_precheck(pipeline_id: str) -> tuple[dict, dict, dict] | tuple[None, None, None]:
     """
     Shared validation for manual (HTTP) and automatic resume. Returns
@@ -2044,6 +2065,20 @@ def _resume_precheck(pipeline_id: str) -> tuple[dict, dict, dict] | tuple[None, 
                    "yet, so there is nothing to resume from. Start a new "
                    "pipeline run instead.",
         )
+
+    resume_stage = checkpoint.get("resume_stage")
+    if resume_stage and resume_stage in ALL_STAGE_NAMES and (
+        ALL_STAGE_NAMES.index(resume_stage) > ALL_STAGE_NAMES.index(_RESUME_MAX_STAGE)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Resume is only supported up to the Dependency Fix stage — "
+                f"this job already completed it and progressed to "
+                f"'{resume_stage}'. Start a new pipeline run instead."
+            ),
+        )
+
     return job, resume_meta, checkpoint
 
 
@@ -2217,6 +2252,14 @@ async def resume_pipeline(pipeline_id: str):
         this; individual /stages/* calls and partial /pipeline/until/*
         runs do not)
       - a checkpoint (at least one stage must have completed)
+      - the checkpoint's next stage (`resume_stage`) to be at or before
+        adr-fix ("Dependency Fix") — see `_RESUME_MAX_STAGE`. If adr-fix
+        already completed (resume_stage is 'pr-agent' or
+        'fortify-writeback'), this returns 400: resume isn't offered past
+        that point. Whichever stage the job was actually interrupted at
+        (including adr-fix itself, if cancellation landed mid-build) is
+        re-run in full, not skipped — only stages that fully completed
+        before the interruption are served from the checkpoint.
 
     Any per-request credentials saved with the original run (Fortify
     password, GitHub PAT, Sonar token — stored encrypted, see
@@ -2592,7 +2635,9 @@ def _run_until(
     def _s_start(name: str) -> float:
         t = time.time()
         if pipeline_id:
-            _update_stage(pipeline_id, name, status="running", started_at=_now())
+            _update_stage(pipeline_id, name, status="running", started_at=_now(),
+                          finished_at=None, elapsed_seconds=None,
+                          error=None, output_summary=None)
         return t
 
     def _s_done(name: str, t: float, summary: dict | None = None) -> None:

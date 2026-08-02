@@ -87,6 +87,11 @@ export interface UiRun {
   fortifyRequest?:    FortifyRunRequest;
   source?:            'sonar' | 'fortify';
   startedAt?:         number;   // epoch ms — for elapsed timer and history ordering
+  /** Next stage a resume would start at (mirrors the backend job doc's
+   *  resume_stage — see job_store._blank_job). undefined = not loaded yet or
+   *  no checkpoint at all. Used by canResume() to enforce that resume is only
+   *  offered up to the Dependency Fix (adr-fix) stage. */
+  resumeStage?:       string | null;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -660,6 +665,7 @@ export class PipelineStateService {
         confidence:        confidence        ?? r.confidence,
         confidencePercent: confidencePercent ?? r.confidencePercent,
         startedAt:         r.startedAt ?? Date.now(),
+        resumeStage:       resp.resume_stage ?? r.resumeStage,
       };
       if (this.selected()?.id === pipelineId) this.selected.set(updated);
       // Persist to history on terminal state so it survives reload
@@ -996,6 +1002,7 @@ export class PipelineStateService {
       outcome,
       source:     'fortify',
       startedAt:  job.started_at ? new Date(job.started_at).getTime() : undefined,
+      resumeStage: job.resume_stage ?? null,
     };
   }
 
@@ -1157,10 +1164,27 @@ export class PipelineStateService {
   }
 
   // ── Resume ────────────────────────────────────────────────────────────────
+  /** Last stage index resume is still offered for — see the matching
+   *  _RESUME_MAX_STAGE constant in api_server.py::_resume_precheck. Keep
+   *  these two in sync; this only controls whether the button is *shown*,
+   *  the backend independently enforces the real rule. */
+  private readonly RESUME_MAX_STAGE_INDEX = FORTIFY_STAGE_ORDER.indexOf('adr-fix');
+
   /** Whether a run can be resumed from the UI — failed/cancelled Fortify runs only.
-   *  (Sonar runs have no resume endpoint; queued/running runs are already live.) */
+   *  (Sonar runs have no resume endpoint; queued/running runs are already live.)
+   *  Resume is only supported up to the Dependency Fix (adr-fix) stage — once
+   *  a job's checkpoint shows it already progressed past that (resumeStage is
+   *  'pr-agent' or 'fortify-writeback'), the backend rejects a resume request,
+   *  so don't offer the button for it. resumeStage being unset (not loaded
+   *  yet, or no checkpoint at all) doesn't hide the button — the backend's
+   *  error message is the real source of truth for that case. */
   canResume(run: UiRun): boolean {
-    return run.source === 'fortify' && (run.status === 'error' || run.status === 'cancelled');
+    if (run.source !== 'fortify' || (run.status !== 'error' && run.status !== 'cancelled')) {
+      return false;
+    }
+    if (!run.resumeStage) return true;
+    const idx = FORTIFY_STAGE_ORDER.indexOf(run.resumeStage);
+    return idx === -1 || idx <= this.RESUME_MAX_STAGE_INDEX;
   }
 
   /**
