@@ -1190,10 +1190,20 @@ export class PipelineStateService {
 
     this.api.resumeFortifyRun(pipelineId).subscribe({
       next: () => {
-        // Flip the card back to 'running' with the outcome banner cleared —
-        // the next poll tick fills in real stage statuses.
+        // Flip the card back to 'running' with the outcome banner cleared,
+        // and reset any step this browser had locally marked 'cancelled'
+        // (with a "Cancelled by user" detail) back to 'pending' — otherwise
+        // that stale label sits there until the next poll tick (up to
+        // QUEUED_POLL_MS) overwrites it with real backend stage state.
         this.runs.update(rs => rs.map(r => r.id === pipelineId
-          ? { ...r, status: 'running' as const, outcome: undefined }
+          ? {
+              ...r,
+              status:  'running' as const,
+              outcome: undefined,
+              steps: r.steps.map(s =>
+                s.status === 'cancelled' ? { ...s, status: 'pending' as const, detail: '' } : s
+              ),
+            }
           : r
         ));
         if (this.selected()?.id === pipelineId) {
