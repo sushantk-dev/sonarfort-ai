@@ -1171,16 +1171,17 @@ export class PipelineStateService {
    *  _RESUME_MAX_STAGE constant in api_server.py::_resume_precheck. Keep
    *  these two in sync; this only controls whether the button is *shown*,
    *  the backend independently enforces the real rule. */
-  private readonly RESUME_MAX_STAGE_INDEX = FORTIFY_STAGE_ORDER.indexOf('adr-fix');
+  private readonly RESUME_MAX_STAGE_INDEX = FORTIFY_STAGE_ORDER.indexOf('ai-reasoning');
 
   /** Whether a run can be resumed from the UI — failed/cancelled Fortify runs only.
    *  (Sonar runs have no resume endpoint; queued/running runs are already live.)
-   *  Resume is only supported up to the Dependency Fix (adr-fix) stage — once
-   *  a job's checkpoint shows it already progressed past that (resumeStage is
-   *  'pr-agent' or 'fortify-writeback'), the backend rejects a resume request,
-   *  so don't offer the button for it. resumeStage being unset (not loaded
-   *  yet, or no checkpoint at all) doesn't hide the button — the backend's
-   *  error message is the real source of truth for that case. */
+   *  Resume is only supported up to the AI Reasoning stage — once a job's
+   *  checkpoint shows it already progressed past that (resumeStage is
+   *  'adr-fix', 'pr-agent', or 'fortify-writeback'), the backend rejects a
+   *  resume request, so don't offer the button for it. resumeStage being
+   *  unset (not loaded yet, or no checkpoint at all) doesn't hide the
+   *  button — the backend's error message is the real source of truth for
+   *  that case. */
   canResume(run: UiRun): boolean {
     if (run.source !== 'fortify' || (run.status !== 'error' && run.status !== 'cancelled')) {
       return false;
@@ -1196,9 +1197,15 @@ export class PipelineStateService {
    * starting over. Reuses the same pipeline_id, so polling just picks back
    * up — stages the backend already completed come back as 'completed'
    * with output_summary.resumed_from_checkpoint on the next poll tick
-   * rather than being re-run (this matters most for adr-fix, which has
-   * side effects — the backend won't double-commit work that already
-   * succeeded).
+   * rather than being re-run.
+   *
+   * Only offered up to the AI Reasoning stage — see canResume/
+   * RESUME_MAX_STAGE_INDEX above and the matching backend check in
+   * api_server.py::_resume_precheck. Once a job's checkpoint shows it's
+   * already past that (adr-fix or later), the backend rejects the request:
+   * those stages have side effects (adr-fix commits+pushes, pr-agent opens
+   * a PR) that resume doesn't safely re-enter mid-way, so a job that got
+   * that far is expected to start over as a fresh run instead.
    *
    * Shows the full-screen loader ('resume') from the moment it's clicked
    * until a follow-up GET /pipeline/status/{id} confirms the backend's
@@ -1235,7 +1242,7 @@ export class PipelineStateService {
         this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`).subscribe({
           next: resp => {
             this._applyFortifyStatus(pipelineId, resp);
-            this._clearStaleCancelledSteps(pipelineId);
+            this._clearStaleCancelledState(pipelineId);
             this._finishResume(pipelineId, mode, body);
           },
           error: () => {
@@ -1243,7 +1250,7 @@ export class PipelineStateService {
               ? { ...r, status: 'running' as const, outcome: undefined }
               : r
             ));
-            this._clearStaleCancelledSteps(pipelineId);
+            this._clearStaleCancelledState(pipelineId);
             this._finishResume(pipelineId, mode, body);
           },
         });
@@ -1257,17 +1264,27 @@ export class PipelineStateService {
   }
 
   /**
-   * Reset any step still showing a stale 'cancelled' status (with its
-   * "Cancelled by user" detail) from the run's previous attempt. The
-   * backend clears this itself the moment the resumed stage actually
-   * restarts (see api_server.py's _stage_start), but that happens a beat
-   * after this call — after the repo re-clone and vulnerability re-fetch —
-   * so the very first status snapshot fetched here can still be showing it.
+   * Reset any leftover 'cancelled' state from the run's PREVIOUS attempt —
+   * both the "Run cancelled" outcome banner and any step still showing
+   * 'cancelled' status with its "Cancelled by user" detail.
+   *
+   * _applyFortifyStatus only overwrites `outcome` when the freshly-fetched
+   * status is itself terminal ('done'/'error'); since the just-resumed job
+   * is 'running' at this point, it falls back to `r.outcome ?? existing`
+   * and the stale 'cancelled' banner would otherwise sit there until the
+   * run reaches a new terminal state.
+   *
+   * The stale step status is a similar story: the backend clears a stage's
+   * leftover error the moment that stage actually restarts (see
+   * api_server.py's _stage_start), but that happens a beat after this call
+   * — after the repo re-clone and vulnerability re-fetch — so the very
+   * first status snapshot fetched here can still be showing it.
    */
-  private _clearStaleCancelledSteps(pipelineId: string) {
+  private _clearStaleCancelledState(pipelineId: string) {
     this.runs.update(rs => rs.map(r => r.id === pipelineId
       ? {
           ...r,
+          outcome: r.outcome === 'cancelled' ? undefined : r.outcome,
           steps: r.steps.map(s =>
             s.status === 'cancelled' ? { ...s, status: 'pending' as const, detail: '' } : s
           ),

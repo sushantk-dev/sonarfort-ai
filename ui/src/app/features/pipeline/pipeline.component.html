@@ -510,12 +510,17 @@
 
           <!-- Fortify: resume a failed/cancelled run from its last checkpointed
                stage instead of restarting from scratch (new pipeline_id, same
-               endpoint). No [disabled]="running()" guard — Fortify runs queue
-               behind an active Sonar run automatically, and can run alongside
-               other Fortify runs, so resume shouldn't be blocked by either. -->
+               endpoint). Only offered up to AI Reasoning — state.canResume()
+               hides this once the job's checkpoint shows it's already past
+               that (into adr-fix or later), since those stages have side
+               effects (adr-fix commits+pushes, pr-agent opens a PR) that
+               resume doesn't safely re-enter. No [disabled]="running()"
+               guard — Fortify runs queue behind an active Sonar run
+               automatically, and can run alongside other Fortify runs, so
+               resume shouldn't be blocked by either. -->
           <div class="detail__actions" *ngIf="run.source === 'fortify' && state.canResume(run)">
             <button class="action-btn action-btn--restart"
-                    title="Continue from the last completed stage — already-committed work (dependency-fix, pr-agent) won't be redone"
+                    title="Continue from the last completed stage — only available up through AI Reasoning"
                     [disabled]="state.submitting() === 'resume'"
                     (click)="state.resumeFortifyRun(run.id)">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">

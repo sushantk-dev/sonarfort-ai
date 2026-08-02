@@ -2019,16 +2019,22 @@ def delete_pipeline_run(pipeline_id: str):
 
 
 # Resume is only supported for interruptions at or before this stage.
-# adr-fix ("Dependency Fix") is the last side-effecting stage that makes
-# sense to pick back up from a checkpoint — once it (and therefore pr-agent,
-# possibly a real PR) is already done, "resuming" only has fortify-writeback
-# left to run, which isn't worth the resume machinery. resume_stage is the
-# NEXT stage a resume would start at (see job_store._blank_job), so
-# rejecting once it's past adr-fix in ALL_STAGE_NAMES order means: adr-fix
-# itself was interrupted or never started → still resumable; adr-fix already
-# completed and checkpointed (next stage is pr-agent or fortify-writeback)
-# → not resumable.
-_RESUME_MAX_STAGE = "adr-fix"
+# ai-reasoning is the last stage with no side effects — every stage after it
+# (adr-fix: git commit/push, pr-agent: opens a PR) writes to the outside
+# world. adr-fix in particular has no idempotence guard for a *partial*
+# rerun the way pr-agent does (_find_existing_pr, keyed by branch name):
+# adr-fix mints a brand-new random branch name on every call and resume
+# re-clones the default branch (not whatever feature branch a prior
+# attempt may have already pushed), so re-entering it after an interruption
+# can silently redo already-fixed dependency groups on a duplicate branch.
+# Disabling resume once adr-fix is next sidesteps that entirely — anything
+# that got that far starts over as a fresh run instead.
+# resume_stage is the NEXT stage a resume would start at (see
+# job_store._blank_job), so rejecting once it's past ai-reasoning in
+# ALL_STAGE_NAMES order means: ai-reasoning itself was interrupted or never
+# started → still resumable; ai-reasoning already completed and
+# checkpointed (next stage is adr-fix or later) → not resumable.
+_RESUME_MAX_STAGE = "ai-reasoning"
 
 
 def _resume_precheck(pipeline_id: str) -> tuple[dict, dict, dict] | tuple[None, None, None]:
@@ -2073,7 +2079,7 @@ def _resume_precheck(pipeline_id: str) -> tuple[dict, dict, dict] | tuple[None, 
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Resume is only supported up to the Dependency Fix stage — "
+                f"Resume is only supported up to the AI Reasoning stage — "
                 f"this job already completed it and progressed to "
                 f"'{resume_stage}'. Start a new pipeline run instead."
             ),
@@ -2253,13 +2259,15 @@ async def resume_pipeline(pipeline_id: str):
         runs do not)
       - a checkpoint (at least one stage must have completed)
       - the checkpoint's next stage (`resume_stage`) to be at or before
-        adr-fix ("Dependency Fix") — see `_RESUME_MAX_STAGE`. If adr-fix
-        already completed (resume_stage is 'pr-agent' or
-        'fortify-writeback'), this returns 400: resume isn't offered past
-        that point. Whichever stage the job was actually interrupted at
-        (including adr-fix itself, if cancellation landed mid-build) is
-        re-run in full, not skipped — only stages that fully completed
-        before the interruption are served from the checkpoint.
+        ai-reasoning ("AI Reasoning") — see `_RESUME_MAX_STAGE`. If
+        ai-reasoning already completed (resume_stage is 'adr-fix',
+        'pr-agent', or 'fortify-writeback'), this returns 400: resume isn't
+        offered once the pipeline has reached a side-effecting stage
+        (adr-fix commits+pushes; pr-agent opens a PR). Whichever stage the
+        job was actually interrupted at — including ai-reasoning itself, if
+        cancellation landed mid-stage — is re-run in full, not skipped;
+        only stages that fully completed before the interruption are
+        served from the checkpoint.
 
     Any per-request credentials saved with the original run (Fortify
     password, GitHub PAT, Sonar token — stored encrypted, see
