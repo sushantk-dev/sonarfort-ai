@@ -1,10 +1,10 @@
 <div class="page">
 
-  <!-- ── Full-screen loader — shown while a Start/Stop request is in flight ── -->
+  <!-- ── Full-screen loader — shown while a Start/Stop/Resume request is in flight ── -->
   <div class="loading-overlay" *ngIf="state.submitting() as action">
     <div class="loading-overlay__spinner"></div>
     <div class="loading-overlay__label">
-      {{ action === 'start' ? 'Starting run…' : 'Stopping run…' }}
+      {{ action === 'start' ? 'Starting run…' : action === 'resume' ? 'Resuming run…' : 'Stopping run…' }}
     </div>
   </div>
 
@@ -516,6 +516,7 @@
           <div class="detail__actions" *ngIf="run.source === 'fortify' && state.canResume(run)">
             <button class="action-btn action-btn--restart"
                     title="Continue from the last completed stage — already-committed work (dependency-fix, pr-agent) won't be redone"
+                    [disabled]="state.submitting() === 'resume'"
                     (click)="state.resumeFortifyRun(run.id)">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <path d="M2 6A4 4 0 1 1 6 10" stroke="currentColor" stroke-width="1.4"

@@ -124,9 +124,12 @@ export class PipelineStateService {
    * Which action (if any) currently has a request in flight to a backend.
    * Drives a full-screen loader in the UI — 'start' while waiting on the
    * initial POST for a Sonar or Fortify run, 'stop' while waiting on the
-   * cancel request(s) to be acknowledged. null the rest of the time.
+   * cancel request(s) to be acknowledged, 'resume' while waiting on a
+   * resumed run's POST *and* the follow-up status fetch that confirms the
+   * backend has actually picked it back up (see resumeFortifyRun). null the
+   * rest of the time.
    */
-  submitting = signal<'start' | 'stop' | null>(null);
+  submitting = signal<'start' | 'stop' | 'resume' | null>(null);
 
   /**
    * Actual backend reachability, independent of `error` (which only reflects
@@ -1193,9 +1196,19 @@ export class PipelineStateService {
    * starting over. Reuses the same pipeline_id, so polling just picks back
    * up — stages the backend already completed come back as 'completed'
    * with output_summary.resumed_from_checkpoint on the next poll tick
-   * rather than being re-run (this matters most for adr-fix/pr-agent,
-   * which have side effects — the backend won't double-commit or
-   * double-PR work that already succeeded).
+   * rather than being re-run (this matters most for adr-fix, which has
+   * side effects — the backend won't double-commit work that already
+   * succeeded).
+   *
+   * Shows the full-screen loader ('resume') from the moment it's clicked
+   * until a follow-up GET /pipeline/status/{id} confirms the backend's
+   * actual post-resume state, rather than optimistically flipping the card
+   * to 'running' the instant the POST is acknowledged and letting the
+   * regular poll (up to QUEUED_POLL_MS later) be the first real
+   * confirmation. The POST only means the backend *accepted* the resume
+   * request — the pipeline itself starts in the background afterward
+   * (repo re-clone, vulnerability re-fetch, ...), so fetching status right
+   * away and waiting on it is what actually confirms the job restarted.
    */
   resumeFortifyRun(pipelineId: string) {
     const run = this.runs().find(r => r.id === pipelineId);
@@ -1211,48 +1224,79 @@ export class PipelineStateService {
     const body: Record<string, unknown> = run.fortifyRequest?.body ?? {};
 
     this.error.set(null);
+    this.submitting.set('resume');
 
     this.api.resumeFortifyRun(pipelineId).subscribe({
       next: () => {
-        // Flip the card back to 'running' with the outcome banner cleared,
-        // and reset any step this browser had locally marked 'cancelled'
-        // (with a "Cancelled by user" detail) back to 'pending' — otherwise
-        // that stale label sits there until the next poll tick (up to
-        // QUEUED_POLL_MS) overwrites it with real backend stage state.
-        this.runs.update(rs => rs.map(r => r.id === pipelineId
-          ? {
-              ...r,
-              status:  'running' as const,
-              outcome: undefined,
-              steps: r.steps.map(s =>
-                s.status === 'cancelled' ? { ...s, status: 'pending' as const, detail: '' } : s
-              ),
-            }
-          : r
-        ));
-        if (this.selected()?.id === pipelineId) {
-          this.selected.set(this.runs().find(r => r.id === pipelineId) ?? null);
-        }
-
-        // Same queue-behind-an-active-Sonar-run rule as trackFortifyRun —
-        // Fortify runs can coexist with each other, just not with Sonar.
-        const sonarRunActive = !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
-        if (sonarRunActive) {
-          this.runs.update(rs => rs.map(r => r.id === pipelineId ? { ...r, status: 'queued' as const } : r));
-          this._fortifyQueue.push({ pipelineId, mode, body });
-          return;
-        }
-
-        this._persistFortifyRun(pipelineId, mode, body);
-        this._startFortifyPoll(pipelineId);
-        this.running.set(true);
-        this._activeRunId = pipelineId;
+        // Fetch the real post-resume state instead of assuming 'running'.
+        // Best-effort: if this particular fetch fails, still proceed with
+        // an optimistic flip so the run isn't stuck behind a dead loader —
+        // the regular poll cycle (started below) will correct it shortly.
+        this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`).subscribe({
+          next: resp => {
+            this._applyFortifyStatus(pipelineId, resp);
+            this._clearStaleCancelledSteps(pipelineId);
+            this._finishResume(pipelineId, mode, body);
+          },
+          error: () => {
+            this.runs.update(rs => rs.map(r => r.id === pipelineId
+              ? { ...r, status: 'running' as const, outcome: undefined }
+              : r
+            ));
+            this._clearStaleCancelledSteps(pipelineId);
+            this._finishResume(pipelineId, mode, body);
+          },
+        });
       },
       error: (err: any) => {
         const detail = err?.error?.detail ?? err?.message ?? 'Resume failed';
         this.error.set(`Resume: ${detail}`);
+        this.submitting.set(null);
       },
     });
+  }
+
+  /**
+   * Reset any step still showing a stale 'cancelled' status (with its
+   * "Cancelled by user" detail) from the run's previous attempt. The
+   * backend clears this itself the moment the resumed stage actually
+   * restarts (see api_server.py's _stage_start), but that happens a beat
+   * after this call — after the repo re-clone and vulnerability re-fetch —
+   * so the very first status snapshot fetched here can still be showing it.
+   */
+  private _clearStaleCancelledSteps(pipelineId: string) {
+    this.runs.update(rs => rs.map(r => r.id === pipelineId
+      ? {
+          ...r,
+          steps: r.steps.map(s =>
+            s.status === 'cancelled' ? { ...s, status: 'pending' as const, detail: '' } : s
+          ),
+        }
+      : r
+    ));
+  }
+
+  /** Shared tail of resumeFortifyRun — queue/poll bookkeeping + loader dismissal. */
+  private _finishResume(pipelineId: string, mode: FortifyMode, body: Record<string, unknown>) {
+    if (this.selected()?.id === pipelineId) {
+      this.selected.set(this.runs().find(r => r.id === pipelineId) ?? null);
+    }
+
+    // Same queue-behind-an-active-Sonar-run rule as trackFortifyRun —
+    // Fortify runs can coexist with each other, just not with Sonar.
+    const sonarRunActive = !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
+    if (sonarRunActive) {
+      this.runs.update(rs => rs.map(r => r.id === pipelineId ? { ...r, status: 'queued' as const } : r));
+      this._fortifyQueue.push({ pipelineId, mode, body });
+      this.submitting.set(null);
+      return;
+    }
+
+    this._persistFortifyRun(pipelineId, mode, body);
+    this._startFortifyPoll(pipelineId);
+    this.running.set(true);
+    this._activeRunId = pipelineId;
+    this.submitting.set(null);
   }
 
   // ── Cancel ────────────────────────────────────────────────────────────────
