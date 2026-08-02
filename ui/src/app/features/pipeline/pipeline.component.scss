@@ -1113,6 +1113,17 @@
       border-color: var(--brand);
     }
   }
+
+  &--stop {
+    border-color: rgba(220,38,38,.3);
+    color: var(--status-danger);
+    background: rgba(220,38,38,.1);
+
+    &:hover:not(:disabled) {
+      background: rgba(220,38,38,.18);
+      border-color: rgba(220,38,38,.5);
+    }
+  }
 }
 
 // ── Input viewer panel ────────────────────────────────────────────────────

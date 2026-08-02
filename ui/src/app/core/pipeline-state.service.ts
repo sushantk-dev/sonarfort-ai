@@ -170,7 +170,24 @@ export class PipelineStateService {
   }
 
   get allRuns()  { return this.runs(); }
-  get canCancel(){ return this.running() && !!this._activeRunId; }
+
+  /** Drives the header "Stop Run" button — Sonar only. Fortify runs each get
+   *  their own per-card Stop button (canCancelRun below) since several can be
+   *  in flight at once (this browser's own runs, plus teammates' runs visible
+   *  via the shared all-users list) — one global button can't scope to "just
+   *  this one" the way a per-card button can. */
+  get canCancel(){
+    return this.running() && !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
+  }
+
+  /** Drives the per-card Stop button on a Fortify run — true for any Fortify
+   *  run still in flight, whether this browser started it (locally polled or
+   *  queued) or it's a teammate's run merged in from the shared all-users
+   *  list (see _mergeBackendFortifyJobs). The backend's cancel endpoint isn't
+   *  scoped to whoever started the run, so the button isn't either. */
+  canCancelRun(run: UiRun): boolean {
+    return run.source === 'fortify' && (run.status === 'running' || run.status === 'queued');
+  }
 
   constructor() {
     this._rehydrate();
@@ -1205,45 +1222,77 @@ export class PipelineStateService {
   }
 
   // ── Cancel ────────────────────────────────────────────────────────────────
-  async cancelRun() {
-    const runId = this._activeRunId;
-    if (!runId) return;
+  /**
+   * Cancel one run.
+   *
+   * pipelineId omitted → defaults to the active Sonar run (this._activeRunId).
+   * That's the only backward-compatible default: the header "Stop Run" button
+   * (canCancel getter, above) now only ever shows for the Sonar run — every
+   * Fortify run gets its own per-card Stop button instead, since several can
+   * be in flight at once (this browser's own runs, plus teammates' runs
+   * surfaced by the shared all-users list) and a single global button can't
+   * scope to "just this one".
+   *
+   * Previously this always cancelled *every* tracked Fortify run — it read
+   * `Array.from(this._fortifyPolls.keys())` and cancelled all of them, so
+   * clicking Stop on one job cancelled every other Fortify job this browser
+   * was polling too. Now it only ever touches `pipelineId`.
+   *
+   * Four cases for the target:
+   *   1. The active Sonar run              → this.api.cancelRun + drop _poll.
+   *   2. An actively-polling Fortify run (this browser started it) →
+   *      POST /pipeline/cancel/{id}, then hand off to _cleanupFortifyPoll()
+   *      for exactly the same bookkeeping a normal terminal poll tick does —
+   *      unsubscribe *this* poll only, drop *this* entry from _fortifyPolls,
+   *      un-persist *this* id, drain the queue if it was waiting on this one.
+   *   3. A Fortify run still waiting in this browser's _fortifyQueue (never
+   *      started) → nothing to tell the backend; just drop it from the queue.
+   *   4. Any other visible Fortify run — a teammate's run merged in from the
+   *      shared all-users list, or one whose local poll already ended → just
+   *      fire the backend cancel POST; there's no local subscription or queue
+   *      entry to clean up. The next all-users poll tick (≤20s) confirms the
+   *      real status, but we flip it locally right away for feedback.
+   *
+   * Every case only ever touches `targetId` — every other run's poll, queue
+   * position, and persisted entry is left completely alone.
+   */
+  async cancelRun(pipelineId?: string) {
+    const targetId = pipelineId ?? this._activeRunId;
+    if (!targetId) return;
 
     this.submitting.set('stop');
 
-    this._poll?.unsubscribe();
-    this._poll = undefined;
+    const isFortifyActive = this._fortifyPolls.has(targetId);
+    const isFortifyQueued = !isFortifyActive && this._fortifyQueue.some(q => q.pipelineId === targetId);
+    const isSonarRun      = !isFortifyActive && !isFortifyQueued && targetId === this._activeRunId;
 
-    // Snapshot which Fortify pipelines are currently being polled *before*
-    // we clear them below — we still need their ids to tell the Fortify
-    // backend to actually stop each one.
-    const fortifyIds = Array.from(this._fortifyPolls.keys());
-
-    // Cancel all active Fortify polls too
-    this._fortifyPolls.forEach(sub => sub.unsubscribe());
-    this._fortifyPolls.clear();
-    this._fortifyQueue.length = 0;
-
-    // Notify the backend(s) and WAIT for the response — this is what the
-    // 'stop' loader is covering. A single "Stop" click cancels either the
-    // one active Sonar run OR one-or-more Fortify pipelines — never both,
-    // since trackFortifyRun() queues Fortify runs behind an active Sonar
-    // run rather than letting them run concurrently with it.
-    //
-    // IMPORTANT: Fortify pipelines live on the Fortify server (fortifyBase —
-    // localhost:8001 in dev) with a bare /pipeline/cancel/{id} route, no
-    // /api prefix. They must NOT go through api.cancelRun(), which always
-    // targets the Sonar server (this.base — localhost:8000 in dev).
-    if (fortifyIds.length > 0) {
-      await Promise.all(fortifyIds.map(id =>
-        fetch(`${this.fortifyBase}/pipeline/cancel/${id}`, { method: 'POST' }).catch(() => {})
-      ));
-    } else {
-      await firstValueFrom(this.api.cancelRun(runId)).catch(() => {});
+    try {
+      if (isFortifyQueued) {
+        // Never started on the backend — nothing to cancel server-side.
+        this._fortifyQueue = this._fortifyQueue.filter(q => q.pipelineId !== targetId);
+        this._removePersisted(targetId);
+      } else if (isSonarRun) {
+        this._poll?.unsubscribe();
+        this._poll = undefined;
+        await firstValueFrom(this.api.cancelRun(targetId)).catch(() => {});
+        this._activeRunId = null;
+        if (this._fortifyPolls.size === 0) this.running.set(false);
+      } else {
+        // A Fortify run — either actively polled by this browser, or only
+        // visible via the shared all-users list. Either way: bare
+        // /pipeline/cancel/{id} on the Fortify server (fortifyBase), NOT
+        // this.api.cancelRun(), which always targets the Sonar server.
+        await fetch(`${this.fortifyBase}/pipeline/cancel/${targetId}`, { method: 'POST' }).catch(() => {});
+        if (isFortifyActive) {
+          this._cleanupFortifyPoll(targetId);   // touches only this one id
+        }
+      }
+    } finally {
+      this.submitting.set(null);
     }
 
     this.runs.update(rs => rs.map(r => {
-      if (r.id !== runId && !fortifyIds.includes(r.id)) return r;
+      if (r.id !== targetId) return r;
       return {
         ...r,
         status:  'cancelled',
@@ -1256,14 +1305,7 @@ export class PipelineStateService {
       };
     }));
 
-    const updated = this.runs().find(r => r.id === runId);
-    if (updated && this.selected()?.id === runId) this.selected.set(updated);
-
-    this.submitting.set(null);
-    this.running.set(false);
-    this._activeRunId = null;
-
-    // Clear persisted Fortify runs so they don't rehydrate on next reload
-    localStorage.removeItem(FORTIFY_ACTIVE_KEY);
+    const updated = this.runs().find(r => r.id === targetId);
+    if (updated && this.selected()?.id === targetId) this.selected.set(updated);
   }
 }

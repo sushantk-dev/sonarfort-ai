@@ -526,6 +526,21 @@
               Resume Run
             </button>
           </div>
+
+          <!-- Fortify: stop just THIS run. Several Fortify runs can be in
+               flight at once (this browser's own, plus teammates' runs
+               surfaced by the shared all-users list), so this only cancels
+               run.id — not every run currently visible. -->
+          <div class="detail__actions" *ngIf="state.canCancelRun(run)">
+            <button class="action-btn action-btn--stop"
+                    title="Stop this run — takes effect at the next stage boundary"
+                    (click)="state.cancelRun(run.id)">
+              <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+                <rect x="2" y="2" width="7" height="7" rx="1" fill="currentColor"/>
+              </svg>
+              Stop Run
+            </button>
+          </div>
         </div>
 
         <!-- Input viewer panel -->
