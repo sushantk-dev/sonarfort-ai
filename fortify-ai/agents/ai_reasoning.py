@@ -88,6 +88,15 @@ You are given:
 
 Your job is to assess whether the upgrade is safe for THIS specific codebase.
 
+You will also be told the JDK major version this project is already built with
+(detected from its pom.xml). If the japicmp diff or bytecode class-file version
+implies a JDK requirement (e.g. class file version 61 = Java 17), resolve that
+against the project's actual JDK yourself rather than hedging — e.g. if the
+project already builds on JDK 17 and the candidate only needs JDK 17, that is
+NOT a reason to lower confidence or mark the upgrade unsafe. Only treat JDK
+requirements as a risk when the project's known JDK is lower than what the
+candidate needs, or when the project's JDK is not provided.
+
 You MUST respond with a single valid JSON object — no preamble, no markdown fences,
 no trailing text. The JSON must have exactly these fields:
 
@@ -111,6 +120,8 @@ note in the reason that the diff could not be run.
 
 _USER_PROMPT_TEMPLATE = """\
 Vulnerable dependency: {group_id}:{artifact_id} {current_version} → {candidate}
+
+Project's detected JDK requirement: {required_jdk}
 
 CVEs being fixed:
 {cve_list}
@@ -340,11 +351,21 @@ def reason_about_upgrade(
     group: dict,
     candidate: str,
     llm,
+    required_jdk: Optional[str] = None,
 ) -> AiReasoningResult:
     """
     Run AI reasoning for one dep + candidate pair.
 
     If llm is None, falls back to heuristic logic.
+
+    required_jdk: the JDK major version this project is already built with
+        (from state["required_jdk"], detected by context.py's
+        detect_required_jdk() off the project's pom.xml). Passed through to
+        the LLM prompt so it can resolve JDK-related hedges (e.g. a japicmp
+        class-file-version jump implying "needs Java 17") against what the
+        project actually already targets, instead of defensively marking
+        the upgrade low-confidence/unsafe on an unknown it was never told.
+
     Returns AiReasoningResult.
     """
     parsed = group["parsed"]
@@ -360,6 +381,7 @@ def reason_about_upgrade(
     cve_list = "\n".join(f"  - {c}" for c in group.get("cves", []))
     explanation = (group.get("version_candidates") or {}).get("explanation", "")[:1000]
     calling_code = group.get("_calling_code_snippet", "")[:2000] or "(no calling code found)"
+    required_jdk_str = f"JDK {required_jdk}" if required_jdk else "(not detected — assume unknown)"
 
     # ── Heuristic path (no LLM) ───────────────────────────────────────────────
     if llm is None:
@@ -376,6 +398,7 @@ def reason_about_upgrade(
         artifact_id=artifact_id,
         current_version=current_version,
         candidate=candidate,
+        required_jdk=required_jdk_str,
         cve_list=cve_list or "  (none listed)",
         explanation=explanation or "(not available)",
         breaking_count=breaking_count,
@@ -482,6 +505,7 @@ def reason_all_groups(
     vertex_model: str = "gemini-2.5-flash",
     max_tokens: int = 8192,
     cancel_check: Optional[Callable[[], bool]] = None,
+    required_jdk: Optional[str] = None,
 ) -> list[dict]:
     """
     Run AI reasoning for every group against its current candidate.
@@ -496,6 +520,13 @@ def reason_all_groups(
         without this, a cancel request has no effect until every group in the
         batch has been reasoned about, since this function is otherwise called
         once per stage rather than once per group.
+
+    required_jdk: the JDK major version this project already builds with
+        (state["required_jdk"], set by context.py's detect_required_jdk()).
+        Forwarded to every group's reason_about_upgrade() call so the LLM can
+        judge JDK-related breaking changes against the project's actual JDK
+        instead of hedging on an unknown — see reason_about_upgrade's
+        docstring for why this matters.
 
     Raises:
         PipelineCancelledError: if cancel_check() reports cancellation before
@@ -534,7 +565,7 @@ def reason_all_groups(
             continue
 
         candidate = candidates[0]   # always reason about next_safe first
-        result = reason_about_upgrade(group, candidate, llm)
+        result = reason_about_upgrade(group, candidate, llm, required_jdk=required_jdk)
 
         group = dict(group)
         group["ai_reasoning"] = result
@@ -566,6 +597,11 @@ def ai_reasoning_node(
     LangGraph node: ai_reasoning.
 
     Reads:  state["_diff_groups"]
+            state["required_jdk"]      (set by context_node — see context.py's
+                                         detect_required_jdk; forwarded so the
+                                         LLM can resolve JDK-related breaking
+                                         changes against the project's actual
+                                         JDK instead of hedging on an unknown)
     Writes: state["_reasoned_groups"]  (groups + ai_reasoning + next_node)
             state["audit_trail"]
 
@@ -582,12 +618,14 @@ def ai_reasoning_node(
         return state
 
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
+    required_jdk = state.get("required_jdk")  # type: ignore[attr-defined]
 
     try:
         enriched = reason_all_groups(
             groups, gcp_project, gcp_location,
             vertex_model=vertex_model, max_tokens=max_tokens,
             cancel_check=cancel_check,
+            required_jdk=required_jdk,
         )
     except PipelineCancelledError:
         # Let cancellation propagate uncaught — the pipeline runner marks the
