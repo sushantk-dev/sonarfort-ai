@@ -778,7 +778,7 @@ def _run_full_pipeline(
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
     from agents.version_resolver import resolve_all_groups
-    from agents.context import locate_all_groups
+    from agents.context import locate_all_groups, detect_required_jdk
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
     from agents.adr_fix import run_adr_fix
@@ -880,12 +880,35 @@ def _run_full_pipeline(
     # Stage 3 — context
     if _already_done("context"):
         context = acc["context"]
+        # required_jdk was computed in a prior attempt and checkpointed
+        # alongside "context" — pull it back out rather than losing it on
+        # resume (it's still needed by ai-reasoning/adr-fix below).
+        required_jdk = acc.get("required_jdk")
     else:
         _check_cancelled(pipeline_id)
         t = _stage_start("context")
         context = locate_all_groups(project_path, resolved)
-        _stage_done("context", t, {"groups_count": len(context)})
-        _checkpoint("api-diff", context=context)
+
+        # detect_required_jdk() itself logs every step of what it finds
+        # (INFO on a match, WARNING on mvn/effective-pom failures). This
+        # block only adds the final per-run outcome — and, critically, logs
+        # the None case explicitly rather than saying nothing, since silent
+        # failure here was indistinguishable from this call never having
+        # run at all.
+        required_jdk = detect_required_jdk(project_path)
+        if required_jdk:
+            print(f"[Context] Project requires JDK {required_jdk}")
+        else:
+            print(
+                "[Context] required_jdk is None for this run — downstream "
+                "agents (AI Reasoning, JDK registry selection) will treat "
+                "this project's JDK as unknown"
+            )
+
+        _stage_done("context", t, {
+            "groups_count": len(context), "required_jdk": required_jdk,
+        })
+        _checkpoint("api-diff", context=context, required_jdk=required_jdk)
 
     # Stage 4 — api diff
     if _already_done("api-diff"):
@@ -918,7 +941,8 @@ def _run_full_pipeline(
         t = _stage_start("ai-reasoning")
         try:
             reasoned = reason_all_groups(
-                diffed, cfg.gcp_project, cfg.gcp_location, cancel_check=cancel_check,
+                diffed, cfg.gcp_project, cfg.gcp_location,
+                cancel_check=cancel_check, required_jdk=required_jdk,
             )
         except PipelineCancelledError:
             _stage_fail("ai-reasoning", t, "Cancelled by user")
@@ -972,6 +996,7 @@ def _run_full_pipeline(
                         jira_prefix=cfg.jira_id_prefix,
                         release_id=release_id,
                         cancel_check=cancel_check,
+                        required_jdk=required_jdk,
                     )
                     adr_results.append({"artifact_id": artifact_id, "result": result})
         except PipelineCancelledError:
