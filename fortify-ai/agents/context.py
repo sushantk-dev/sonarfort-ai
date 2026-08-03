@@ -237,11 +237,23 @@ def _find_compiler_plugin_release(root: ET.Element) -> Optional[str]:
 def detect_required_jdk(project_path: Path) -> Optional[str]:
     """
     Determine which JDK major version this Maven project needs to build,
-    by inspecting pom.xml <properties> and the maven-compiler-plugin config.
+    by inspecting pom.xml <properties> and the maven-compiler-plugin config
+    across EVERY pom.xml in the tree, and returning the highest version
+    found.
 
-    Checks the root pom.xml first, then any other pom.xml in the tree
-    (covers multi-module repos where the property lives on a parent that
-    isn't literally at the project root, or in a single-module child pom).
+    Why "highest" and not "first found": a Maven reactor build (multi-module
+    repo) runs every module under a single JVM. A parent/aggregator pom
+    commonly declares a baseline compiler version (e.g.
+    maven.compiler.source=11) that individual child modules can — and often
+    do — override to a higher version via their own maven-compiler-plugin
+    <configuration><release> (e.g. a module using newer language features
+    needs release 17). A JDK N install can always compile --release <=N, but
+    never --release >N, so the JVM selected for the whole build must satisfy
+    the highest release any module requests — picking the first pom's value
+    (which is often the parent's lower baseline) causes builds to fail with
+    "release version X not supported" on any module that overrides upward,
+    even though the registry/JAVA_HOME selection appeared correct for the
+    (wrong) version that got detected.
 
     Returns a normalized major-version string (e.g. "17"), or None if no
     version signal could be found anywhere in the project.
@@ -250,14 +262,15 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
     if not all_poms:
         return None
 
-    # Root pom first (most common place), then the rest.
-    root_pom = next((p for p in all_poms if p.parent == project_path), all_poms[0])
-    ordered_poms = [root_pom] + [p for p in all_poms if p != root_pom]
+    highest: Optional[int] = None
+    highest_str: Optional[str] = None
 
-    for pom_path in ordered_poms:
+    for pom_path in all_poms:
         root = _parse_pom(pom_path)
         if root is None:
             continue
+
+        found_in_pom: Optional[str] = None
 
         for prop_name in _JDK_PROPERTY_NAMES:
             for ns_prefix in [f"{{{_MVN_NS}}}", ""]:
@@ -265,21 +278,41 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
                 if elem is not None and elem.text:
                     normalized = _normalize_jdk_version(elem.text)
                     if normalized:
+                        found_in_pom = normalized
                         logger.debug(
-                            f"[Context] Required JDK {normalized} detected via "
+                            f"[Context] JDK {normalized} detected via "
                             f"{prop_name} in {pom_path.name}"
                         )
-                        return normalized
+                        break
+            if found_in_pom:
+                break
 
-        plugin_version = _find_compiler_plugin_release(root)
-        if plugin_version:
-            normalized = _normalize_jdk_version(plugin_version)
-            if normalized:
-                logger.debug(
-                    f"[Context] Required JDK {normalized} detected via "
-                    f"maven-compiler-plugin in {pom_path.name}"
-                )
-                return normalized
+        if not found_in_pom:
+            plugin_version = _find_compiler_plugin_release(root)
+            if plugin_version:
+                normalized = _normalize_jdk_version(plugin_version)
+                if normalized:
+                    found_in_pom = normalized
+                    logger.debug(
+                        f"[Context] JDK {normalized} detected via "
+                        f"maven-compiler-plugin in {pom_path.name}"
+                    )
+
+        if found_in_pom:
+            try:
+                found_int = int(found_in_pom)
+            except ValueError:
+                continue
+            if highest is None or found_int > highest:
+                highest = found_int
+                highest_str = found_in_pom
+
+    if highest_str:
+        logger.debug(
+            f"[Context] Required JDK for reactor build: {highest_str} "
+            f"(highest across {len(all_poms)} pom.xml file(s))"
+        )
+        return highest_str
 
     logger.debug("[Context] No explicit JDK version found in any pom.xml")
     return None
