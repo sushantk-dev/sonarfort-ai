@@ -408,9 +408,22 @@ def main(argv: list[str] | None = None) -> int:
     # through context_node (the LangGraph node) — it calls the same
     # locate_all_groups() helper directly — so JDK detection has to be called
     # here explicitly too, or it silently never happens for CLI-driven runs.
+    #
+    # detect_required_jdk() itself already logs every step of what it finds
+    # (INFO/WARNING) — the block below only adds the final "here's the
+    # outcome for this run" line, and — critically — logs the failure case
+    # too. Silently saying nothing on required_jdk == None was the actual
+    # bug here: it made a real detection failure indistinguishable from
+    # "this code path never ran at all", which is exactly what happened.
     required_jdk = detect_required_jdk(project_path)
     if required_jdk:
         logger.info(f"[Context] Project requires JDK {required_jdk}")
+    else:
+        logger.warning(
+            "[Context] required_jdk is None for this run — downstream agents "
+            "(AI Reasoning, JDK registry selection) will treat this project's "
+            "JDK as unknown"
+        )
 
     # ── API diff ──────────────────────────────────────────────────────────────
     logger.info("─" * 60)
