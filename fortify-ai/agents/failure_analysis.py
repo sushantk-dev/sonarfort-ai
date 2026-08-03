@@ -61,6 +61,48 @@ _SYMBOL_PATTERNS = [
     re.compile(r"incompatible types.*?([\w\.]+)", re.IGNORECASE),
 ]
 
+# Patterns that identify a JDK/toolchain version mismatch — the local JDK
+# used to run the build is a different version than the project requires.
+# These are environment problems, not code problems: they don't reference a
+# specific .java file/line the way a compile error does, and no amount of
+# source patching (AI Code Fix) can resolve them. Group 1, when present,
+# captures the offending Java version named in the message.
+_JDK_ERROR_PATTERNS = [
+    re.compile(r"invalid target release:\s*(\d+)", re.IGNORECASE),
+    re.compile(r"invalid source release:\s*(\d+)", re.IGNORECASE),
+    re.compile(r"release version (\d+) not supported", re.IGNORECASE),
+    re.compile(r"source release (\d+) requires target release", re.IGNORECASE),
+    re.compile(r"source option (\d+) is no longer supported", re.IGNORECASE),
+    re.compile(r"target option (\d+) is no longer supported", re.IGNORECASE),
+    re.compile(r"class file has wrong version (\d+\.\d+)", re.IGNORECASE),
+    re.compile(
+        r"has been compiled by a more recent version of the java runtime",
+        re.IGNORECASE,
+    ),
+    re.compile(r"UnsupportedClassVersionError", re.IGNORECASE),
+    re.compile(r"bad class file", re.IGNORECASE),
+    re.compile(r"no compiler is provided in this environment", re.IGNORECASE),
+]
+
+
+def classify_jdk_mismatch(error_log: str) -> Optional[str]:
+    """
+    Determine whether a build failure is a JDK/toolchain version mismatch
+    rather than a code-level compile error.
+
+    Returns:
+      - the Java version string named in the error, if the message included
+        one (e.g. "17")
+      - "" (empty string, still truthy-checked via `is not None`) if the
+        error is clearly JDK-related but named no specific version
+      - None if this doesn't look like a JDK/toolchain error at all
+    """
+    for pattern in _JDK_ERROR_PATTERNS:
+        m = pattern.search(error_log)
+        if m:
+            return m.group(1) if m.groups() and m.group(1) else ""
+    return None
+
 
 # ── Error parser ──────────────────────────────────────────────────────────────
 
@@ -173,10 +215,17 @@ def decide_retry_route(
     Determine next routing step after a build failure.
 
     Logic:
+      is_jdk_mismatch            → "escalate"  (environment issue — AI Code
+                                    Fix can't patch it and retrying the same
+                                    candidate won't change the local JDK, so
+                                    don't burn the retry budget on it)
       retry_count < max_retries  → "retry"     (AI code fix then ADR again)
       retry_count >= max_retries and next candidate exists → "next"
       no more candidates → "escalate"
     """
+    if state.get("is_jdk_mismatch"):
+        return "escalate"
+
     retry_count = state.get("retry_count", 0)
     candidate_index = state.get("candidate_index", 0)
 
@@ -238,15 +287,35 @@ def failure_analysis_node(state: AgentState, project_path: str, max_retries: int
         f"(attempt {attempt_num}/{max_retries})"
     )
 
-    # Parse error log
-    sites = parse_maven_errors(error_log)
+    # Classify the failure before parsing individual sites — a JDK/toolchain
+    # error won't match the .java file/line patterns anyway, and code-level
+    # parsing has nothing useful to add for it.
+    jdk_version = classify_jdk_mismatch(error_log)
+    is_jdk_mismatch = jdk_version is not None
+    state["is_jdk_mismatch"] = is_jdk_mismatch          # type: ignore[typeddict-item]
+    state["jdk_mismatch_version"] = jdk_version or None  # type: ignore[typeddict-item]
+
+    if is_jdk_mismatch:
+        required = state.get("required_jdk")            # type: ignore[attr-defined]
+        detail = (
+            f"named version {jdk_version}" if jdk_version
+            else (f"project requires JDK {required}" if required else "version unknown")
+        )
+        logger.warning(
+            f"[Failure] {artifact_id} build failed on a JDK/toolchain mismatch "
+            f"({detail}) — this is an environment issue, not a code issue"
+        )
+
+    # Parse error log for code-level failure sites (skip for JDK mismatches —
+    # there's no .java file/line to find, and the code isn't at fault).
+    sites = [] if is_jdk_mismatch else parse_maven_errors(error_log)
 
     if sites:
         for site in sites[:3]:
             loc = f"{Path(site.file_path).name}:{site.line_number}" if site.line_number else Path(site.file_path).name
             logger.info(f"[Failure] Failing file: {loc}")
             logger.info(f"[Failure] Error: {site.error_message[:120]}")
-    else:
+    elif not is_jdk_mismatch:
         logger.warning("[Failure] Could not parse specific error locations from log")
 
     # Extract code context for AI Code Fix
@@ -281,12 +350,33 @@ def failure_analysis_node(state: AgentState, project_path: str, max_retries: int
     state["_failure_context"] = failure_context   # type: ignore[typeddict-unknown-key]
     state["_retry_route"] = route                  # type: ignore[typeddict-unknown-key]
 
+    if is_jdk_mismatch and route == "escalate":
+        required = state.get("required_jdk")        # type: ignore[attr-defined]
+        if jdk_version:
+            reason = (
+                f"Build failed due to a JDK/toolchain version mismatch (build "
+                f"environment reported version {jdk_version}"
+                + (f", project pom.xml requires JDK {required}" if required else "")
+                + "). This cannot be fixed by patching source code — install/"
+                "select a matching JDK for this project and re-run."
+            )
+        else:
+            reason = (
+                "Build failed due to a JDK/toolchain version mismatch"
+                + (f" — project pom.xml requires JDK {required}" if required else "")
+                + ". This cannot be fixed by patching source code — install/"
+                "select a matching JDK for this project and re-run."
+            )
+        state["escalation_reason"] = reason          # type: ignore[typeddict-item]
+
     state["audit_trail"].append({
         "node": "failure_analysis",
         "attempt": attempt_num,
         "sites": len(sites),
         "route": route,
         "candidate": current_candidate,
+        "is_jdk_mismatch": is_jdk_mismatch,
+        "jdk_mismatch_version": jdk_version or None,
     })
 
     return state

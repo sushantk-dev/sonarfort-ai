@@ -85,6 +85,7 @@ from datetime import datetime
 from xml.etree import ElementTree as ET
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ANSI COLOURS  (auto-disabled if terminal does not support VT sequences)
@@ -853,6 +854,86 @@ def _finalize_git_changes(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# JDK SELECTION
+# ──────────────────────────────────────────────────────────────────────────────
+# Different projects can require different JDK major versions to compile.
+# By default adr_fortify.py inherits whatever JDK is already on PATH (exactly
+# the old behaviour — nothing changes for existing callers). When a specific
+# JDK is needed, --java-home (explicit) or --required-jdk (looked up in a
+# registry) tells every mvn subprocess call in this file which JDK to use,
+# via a scoped environment override rather than mutating the parent process.
+
+def _load_jdk_registry() -> dict:
+    """
+    Load a {major_version: java_home_path} map from the FORTIFYAI_JDK_REGISTRY
+    env var (a JSON object), e.g.:
+        FORTIFYAI_JDK_REGISTRY='{"8":"/opt/jdks/jdk8","17":"/opt/jdks/jdk17"}'
+    Returns {} if the env var is unset or not valid JSON — callers treat that
+    as "no registry available" and fall back to whatever JDK is on PATH.
+    """
+    raw = os.environ.get("FORTIFYAI_JDK_REGISTRY", "").strip()
+    if not raw:
+        return {}
+    try:
+        registry = json.loads(raw)
+        if isinstance(registry, dict):
+            return {str(k): str(v) for k, v in registry.items()}
+    except (ValueError, TypeError):
+        pass
+    print(f"  {C.YELLOW}[JDK] FORTIFYAI_JDK_REGISTRY is set but not valid JSON — ignoring.{C.RESET}")
+    return {}
+
+
+def _resolve_java_home(explicit_java_home: str, required_jdk: str) -> str:
+    """
+    Decide which JAVA_HOME to use for this run.
+
+    Priority:
+      1. --java-home, if given explicitly — always wins.
+      2. --required-jdk looked up in FORTIFYAI_JDK_REGISTRY.
+      3. "" — inherit whatever JDK is already on PATH/JAVA_HOME. This is the
+         original behaviour and is what happens when neither flag is passed,
+         so existing callers of adr_fortify.py are unaffected.
+    """
+    if explicit_java_home:
+        return explicit_java_home
+
+    if required_jdk:
+        registry = _load_jdk_registry()
+        match = registry.get(str(required_jdk))
+        if match:
+            return match
+        print(
+            f"  {C.YELLOW}[JDK] Project requires JDK {required_jdk} but no matching "
+            f"entry found in FORTIFYAI_JDK_REGISTRY — using the JDK already on "
+            f"PATH.{C.RESET}"
+        )
+    return ""
+
+
+def _build_subprocess_env(java_home: str) -> Optional[dict]:
+    """
+    Build an environment dict for Maven/JDK subprocess calls that points
+    JAVA_HOME (and PATH) at a specific JDK install, without discarding the
+    rest of the inherited environment (M2_HOME, proxy settings, Maven/GitHub
+    credentials, etc.).
+
+    Returns None when java_home is empty — callers pass that straight to
+    subprocess's env= parameter, which means "inherit the parent process's
+    environment unchanged" (Python's default), so behaviour is identical to
+    before this JDK-selection feature existed.
+    """
+    if not java_home:
+        return None
+    java_home = os.path.abspath(java_home)
+    env = os.environ.copy()
+    env["JAVA_HOME"] = java_home
+    bin_dir = os.path.join(java_home, "bin")
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # MAVEN BUILD
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -896,17 +977,24 @@ def _kill_process_tree(pid: int) -> None:
         pass
 
 
-def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = False) -> tuple:
+def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = False,
+                      java_home: str = "") -> tuple:
     """Run 'mvn clean install' in project_root.
     Returns (success: bool | None, duration: float).
     None = maven not found (skipped).  False = build failed.  True = success.
     skip_tests: when True adds -DskipTests to the Maven command (tests are skipped).
+    java_home: when set, JAVA_HOME/PATH are overridden for this subprocess only
+               (see _build_subprocess_env) — empty string means inherit as before.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
     if not mvn_exe:
         print(f"  {C.YELLOW}[BUILD] Maven not found — skipping build verification.{C.RESET}")
         return None, 0.0
+
+    build_env = _build_subprocess_env(java_home)
+    if java_home:
+        print(f"  {C.GRAY}[BUILD] Using JDK: {os.path.abspath(java_home)}{C.RESET}")
 
     mvn_cmd = [mvn_exe, "clean", "install", "--no-transfer-progress"]
     if skip_tests:
@@ -924,6 +1012,7 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
             cwd=project_root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=build_env,
         )
         # Stream output line-by-line so progress is visible in real time
         for raw in iter(proc.stdout.readline, b""):
@@ -946,13 +1035,15 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         return False, time.time() - t0
 
 
-def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300) -> dict:
+def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
+                             java_home: str = "") -> dict:
     """
     Runs 'mvn dependency:tree -Dverbose' ONCE on the project root pom and returns
     a pool dict: (groupId, artifactId, version) -> dep_dict for every dep in the
     full resolved tree across all modules.  Call this once before the module loop.
     Tries offline mode first (uses .m2 cache, fast); falls back to online if needed.
     Returns {} if mvn is unavailable, the command fails, or times out.
+    java_home: when set, JAVA_HOME/PATH are overridden for this subprocess only.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
@@ -965,6 +1056,7 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300)
         return {}
 
     cwd = os.path.dirname(root_pom)
+    tree_env = _build_subprocess_env(java_home)
 
     def _run(extra_flags: list, t: int) -> str:
         # NOTE: Do NOT use CREATE_NEW_PROCESS_GROUP on Windows — it breaks
@@ -979,6 +1071,7 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300)
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=tree_env,
             )
         except (FileNotFoundError, OSError):
             return ""
@@ -1031,7 +1124,7 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300)
     return pool
 
 
-def get_effective_pom_content(pom_path: str, mvn_exe: str = "") -> str:
+def get_effective_pom_content(pom_path: str, mvn_exe: str = "", java_home: str = "") -> str:
     """Run 'mvn help:effective-pom' for pom_path and return the fully-resolved XML.
 
     This resolves:
@@ -1040,6 +1133,7 @@ def get_effective_pom_content(pom_path: str, mvn_exe: str = "") -> str:
 
     Returns empty string on any failure — callers must fall back to raw pom.xml.
     Cleans up the temporary output file in all cases.
+    java_home: when set, JAVA_HOME/PATH are overridden for this subprocess only.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
@@ -1048,6 +1142,7 @@ def get_effective_pom_content(pom_path: str, mvn_exe: str = "") -> str:
 
     cwd      = os.path.dirname(os.path.abspath(pom_path))
     out_file = os.path.join(cwd, ".adr_effective_pom_tmp.xml")
+    eff_env  = _build_subprocess_env(java_home)
 
     try:
         proc = subprocess.Popen(
@@ -1061,6 +1156,7 @@ def get_effective_pom_content(pom_path: str, mvn_exe: str = "") -> str:
             cwd=cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=eff_env,
         )
         try:
             proc.communicate(timeout=60)
@@ -1307,6 +1403,11 @@ def main():
             "  --base-branch BRANCH      Base branch to checkout from before creating the feature branch\n"
             "                            (auto-detected from remote HEAD if not provided)\n"
             "  --mvn PATH                Path to mvn executable (auto-detected if not provided)\n"
+            "  --java-home PATH          JAVA_HOME to use for all mvn subprocess calls in this run\n"
+            "                            (overrides whatever JDK is on PATH; scoped to this process only)\n"
+            "  --required-jdk VERSION    Java major version this project needs, e.g. --required-jdk 17\n"
+            "                            Looked up in the FORTIFYAI_JDK_REGISTRY env var (JSON map of\n"
+            "                            version -> JAVA_HOME) when --java-home is not given directly.\n"
             "  --skip ARTIFACTS          Comma-separated artifact IDs to exclude from auto-fix\n"
             "                            e.g. --skip spring-core,spring-boot\n"
             "  --include-scopes SCOPES   Comma-separated scopes to include in scanning\n"
@@ -1345,6 +1446,12 @@ def main():
                              "(auto-detected from remote HEAD if not provided), e.g. --base-branch develop")
     parser.add_argument("--mvn",     default="", metavar="PATH",
                         help="Path to mvn executable (auto-detected if not provided)")
+    parser.add_argument("--java-home", default="", metavar="PATH",
+                        help="JAVA_HOME to use for all mvn subprocess calls in this run "
+                             "(scoped to this process — does not touch the parent environment)")
+    parser.add_argument("--required-jdk", default="", metavar="VERSION",
+                        help="Java major version this project needs, e.g. --required-jdk 17. "
+                             "Looked up in FORTIFYAI_JDK_REGISTRY when --java-home is not given.")
     parser.add_argument("--skip",    default="", metavar="ARTIFACTS",
                         help="Comma-separated artifact IDs to exclude from auto-fix, "
                              "e.g. --skip spring-core,spring-boot,spring-context")
@@ -1473,6 +1580,10 @@ def main():
 
     # ── Transitive dep pool: ONE mvn dependency:tree run on root pom ─────────
     mvn_exe       = args.mvn or _find_mvn()   # resolved once; used for transitive + effective-pom + build
+    java_home     = _resolve_java_home(args.java_home, args.required_jdk)
+    if java_home:
+        print()
+        print(f"  {C.CYAN}[JDK] Using JAVA_HOME: {os.path.abspath(java_home)}{C.RESET}")
     transitive_pool = {}   # (gid, aid, ver) -> dep_dict
     if mvn_exe:
         print()
@@ -1481,7 +1592,7 @@ def main():
               flush=True)
         t_pool = time.time()
         transitive_pool = collect_transitive_pool(
-            os.path.abspath(args.project_path), args.mvn, timeout=300
+            os.path.abspath(args.project_path), args.mvn, timeout=300, java_home=java_home
         )
         elapsed_pool = time.time() - t_pool
         if transitive_pool:
@@ -1514,7 +1625,7 @@ def main():
         t_eff    = time.time()
         done_eff = [0]
         with ThreadPoolExecutor(max_workers=min(len(pom_files), 6)) as exe:
-            futures = {exe.submit(get_effective_pom_content, p, mvn_exe): p
+            futures = {exe.submit(get_effective_pom_content, p, mvn_exe, java_home): p
                        for p in pom_files}
             for fut in as_completed(futures):
                 pom_path_key = futures[fut]
@@ -1583,7 +1694,7 @@ def main():
                   f"  {C.GRAY}[{time.time()-t0:.1f}s]{C.RESET}")
         elif mvn_exe:
             # Fallback: try on-demand (should not normally reach here)
-            eff_content = get_effective_pom_content(pom_path, mvn_exe)
+            eff_content = get_effective_pom_content(pom_path, mvn_exe, java_home)
             if eff_content:
                 deps, props = parse_dependencies_effective(eff_content, content)
                 print(f"  {C.GRAY}Parsed{C.RESET}  {C.BOLD}{len(deps)}{C.RESET} deps"
@@ -1857,7 +1968,8 @@ def main():
             else os.path.dirname(os.path.abspath(args.project_path))
         )
         maven_ok, maven_duration = _run_maven_build(project_root, mvn_exe=mvn_exe,
-                                                      skip_tests=args.skipTests)
+                                                      skip_tests=args.skipTests,
+                                                      java_home=java_home)
         if not maven_ok:
             print()
             print(f"  {C.RED}[ABORT] Build failed — reverting all pom.xml changes from backups.{C.RESET}")

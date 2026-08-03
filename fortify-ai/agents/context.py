@@ -185,6 +185,106 @@ def _find_property_pom(
     return None
 
 
+# ── Required-JDK detection ─────────────────────────────────────────────────────
+
+# Properties checked, in priority order — <release> implies both source and
+# target and is what modern (Java 9+) projects should use, so it wins if present.
+_JDK_PROPERTY_NAMES = [
+    "maven.compiler.release",
+    "maven.compiler.target",
+    "maven.compiler.source",
+    "java.version",
+]
+
+
+def _normalize_jdk_version(raw: str) -> Optional[str]:
+    """
+    Normalize a Java version string to a bare major-version number.
+    '1.8' -> '8', '17' -> '17', '11.0.2' -> '11'. Returns None if unparsable.
+    """
+    raw = raw.strip()
+    m = re.match(r"1\.(\d+)", raw)          # legacy '1.8' style
+    if m:
+        return m.group(1)
+    m = re.match(r"(\d+)", raw)             # '17', '11.0.2', etc.
+    if m:
+        return m.group(1)
+    return None
+
+
+def _find_compiler_plugin_release(root: ET.Element) -> Optional[str]:
+    """
+    Check <build><plugins><plugin> for maven-compiler-plugin's
+    <configuration><release>/<source>/<target>, in case the version isn't
+    declared via a <properties> entry.
+    """
+    for ns in [_MVN_NS, ""]:
+        p = f"{{{ns}}}" if ns else ""
+        for plugin in root.iter(f"{p}plugin"):
+            aid = plugin.find(f"{p}artifactId")
+            if aid is None or aid.text != "maven-compiler-plugin":
+                continue
+            config = plugin.find(f"{p}configuration")
+            if config is None:
+                continue
+            for tag in ("release", "target", "source"):
+                elem = config.find(f"{p}{tag}")
+                if elem is not None and elem.text:
+                    return elem.text.strip()
+    return None
+
+
+def detect_required_jdk(project_path: Path) -> Optional[str]:
+    """
+    Determine which JDK major version this Maven project needs to build,
+    by inspecting pom.xml <properties> and the maven-compiler-plugin config.
+
+    Checks the root pom.xml first, then any other pom.xml in the tree
+    (covers multi-module repos where the property lives on a parent that
+    isn't literally at the project root, or in a single-module child pom).
+
+    Returns a normalized major-version string (e.g. "17"), or None if no
+    version signal could be found anywhere in the project.
+    """
+    all_poms = sorted(project_path.rglob("pom.xml"))
+    if not all_poms:
+        return None
+
+    # Root pom first (most common place), then the rest.
+    root_pom = next((p for p in all_poms if p.parent == project_path), all_poms[0])
+    ordered_poms = [root_pom] + [p for p in all_poms if p != root_pom]
+
+    for pom_path in ordered_poms:
+        root = _parse_pom(pom_path)
+        if root is None:
+            continue
+
+        for prop_name in _JDK_PROPERTY_NAMES:
+            for ns_prefix in [f"{{{_MVN_NS}}}", ""]:
+                elem = root.find(f".//{ns_prefix}properties/{ns_prefix}{prop_name}")
+                if elem is not None and elem.text:
+                    normalized = _normalize_jdk_version(elem.text)
+                    if normalized:
+                        logger.debug(
+                            f"[Context] Required JDK {normalized} detected via "
+                            f"{prop_name} in {pom_path.name}"
+                        )
+                        return normalized
+
+        plugin_version = _find_compiler_plugin_release(root)
+        if plugin_version:
+            normalized = _normalize_jdk_version(plugin_version)
+            if normalized:
+                logger.debug(
+                    f"[Context] Required JDK {normalized} detected via "
+                    f"maven-compiler-plugin in {pom_path.name}"
+                )
+                return normalized
+
+    logger.debug("[Context] No explicit JDK version found in any pom.xml")
+    return None
+
+
 # ── Transitive detection via mvn dependency:tree ──────────────────────────────
 
 def _find_transitive_introducer(
@@ -545,12 +645,18 @@ def context_node(state: AgentState, project_path: str) -> AgentState:
     path = Path(project_path)
     enriched = locate_all_groups(path, groups)
 
+    required_jdk = detect_required_jdk(path)
+    state["required_jdk"] = required_jdk  # type: ignore[typeddict-item]
+    if required_jdk:
+        logger.info(f"[Context] Project requires JDK {required_jdk}")
+
     state["_context_groups"] = enriched  # type: ignore[typeddict-unknown-key]
     state["audit_trail"].append({
         "node": "context",
         "status": "ok",
         "groups": len(enriched),
         "calling_files_total": sum(len(g.get("calling_files", [])) for g in enriched),
+        "required_jdk": required_jdk,
     })
 
     return state

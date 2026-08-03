@@ -318,6 +318,19 @@ def ai_code_fix_node(
         state["ai_code_fix_applied"] = False
         return state
 
+    if state.get("is_jdk_mismatch"):
+        logger.info(
+            "[AI Code Fix] Skipping — last failure was a JDK/toolchain mismatch, "
+            "not a code error. No source patch can fix this."
+        )
+        state["ai_code_fix_applied"] = False
+        state["audit_trail"].append({
+            "node": "ai_code_fix",
+            "status": "skipped",
+            "reason": "jdk_mismatch",
+        })
+        return state
+
     # Build LLM using the configured model and token limit.
     # max_tokens should be \u22654096 for this agent — multi-patch JSON responses
     # silently truncate at lower limits, causing json.loads() to fail and all

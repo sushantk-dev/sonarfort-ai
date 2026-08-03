@@ -128,6 +128,17 @@ class AgentState(TypedDict):
     last_build_error: Optional[str]        # Maven error log from last failed run
     ai_code_fix_applied: bool              # True once pre/post-patch fix has been tried
 
+    # ── JDK / toolchain mismatch detection ────────────────────────────────────
+    required_jdk: Optional[str]            # detected from pom.xml (maven.compiler.release
+                                            # / source / target / java.version), e.g. "17"
+    is_jdk_mismatch: Optional[bool]        # True once failure_analysis classifies the last
+                                            # build failure as a JDK/toolchain error rather
+                                            # than a code-level compile error — AI Code Fix
+                                            # cannot repair this, so routing should skip
+                                            # straight to escalation instead of retrying
+    jdk_mismatch_version: Optional[str]    # Java version named in the build error itself,
+                                            # if the compiler/JVM message included one
+
     # ── PR agent output ───────────────────────────────────────────────────────
     pr_result: Optional[PrResult]
 

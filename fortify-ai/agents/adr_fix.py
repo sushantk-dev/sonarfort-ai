@@ -276,6 +276,7 @@ def invoke_adr(
     commit_id: str,
     target_versions: dict | None = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    required_jdk: Optional[str] = None,
 ) -> tuple[bool, str, str]:
     """
     Run adr_fortify.py --commit <commit_id> --push --target-versions <json>.
@@ -287,6 +288,13 @@ def invoke_adr(
             "cve_id":       "CVE-2024-38820"
         }, ...
     }
+
+    required_jdk: Java major version this project needs (from context.py's
+        detect_required_jdk, via state["required_jdk"]). Forwarded to
+        adr_fortify.py as --required-jdk, which looks it up in the
+        FORTIFYAI_JDK_REGISTRY env var to select the right JAVA_HOME for
+        this build. None/empty means adr_fortify.py inherits whatever JDK
+        is already on PATH — identical to the pre-existing behaviour.
 
     cancel_check: optional zero-arg callable returning True once the job has
         been flagged for cancellation (e.g. ``lambda: store.is_cancel_requested(pid)``).
@@ -320,6 +328,8 @@ def invoke_adr(
     ]
     if target_versions:
         cmd += ["--target-versions", _json.dumps(target_versions)]
+    if required_jdk:
+        cmd += ["--required-jdk", str(required_jdk)]
 
     logger.debug(f"[ADR Fix] Running: {' '.join(cmd)}")
 
@@ -429,6 +439,7 @@ def run_adr_fix(
     jira_prefix: str = "FORTIFY",
     release_id: int = 0,
     cancel_check: Optional[Callable[[], bool]] = None,
+    required_jdk: Optional[str] = None,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
@@ -441,6 +452,8 @@ def run_adr_fix(
       5. Abort with success=False if ADR made 0 fixes (dep not found in poms)
       6. Log done-when result lines
       7. Return AdrResult
+
+    required_jdk: forwarded to invoke_adr() — see its docstring.
 
     cancel_check: forwarded to invoke_adr() — see its docstring. If the job is
         cancelled while this group's build is running, PipelineCancelledError
@@ -480,7 +493,7 @@ def run_adr_fix(
 
     success, stdout, stderr = invoke_adr(
         adr_path, project_path, branch_name, target_versions=target_versions,
-        cancel_check=cancel_check,
+        cancel_check=cancel_check, required_jdk=required_jdk,
     )
 
     if success:
@@ -581,6 +594,7 @@ def adr_fix_node(
     adr_results: list[dict] = []
     release_id: int = state.get("release_id", 0)  # type: ignore[attr-defined]
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
+    required_jdk = state.get("required_jdk")  # type: ignore[attr-defined] — set by context_node
 
     for group in groups:
         if cancel_check is not None and cancel_check():
@@ -588,6 +602,7 @@ def adr_fix_node(
         result = run_adr_fix(
             group, adr_path, project_path, jira_prefix,
             release_id=release_id, cancel_check=cancel_check,
+            required_jdk=required_jdk,
         )
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],

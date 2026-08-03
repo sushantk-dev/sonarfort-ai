@@ -1,0 +1,1 @@
+export FORTIFYAI_JDK_REGISTRY='{"8":"/usr/lib/jvm/java-8-openjdk-amd64","11":"/usr/lib/jvm/java-11-openjdk-amd64","17":"/usr/lib/jvm/java-17-openjdk-amd64","21":"/usr/lib/jvm/java-21-openjdk-amd64"}'
