@@ -38,6 +38,36 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from config import FortifyAIConfig
 
 
+# ── Exceptions ───────────────────────────────────────────────────────────────
+
+class FortifyAPITimeoutError(Exception):
+    """
+    Raised when a Fortify API call fails to complete within its timeout
+    budget, or the connection to Fortify itself can't be established.
+
+    A distinct type (rather than letting requests.exceptions.Timeout /
+    ConnectionError bubble up raw) so this specific failure mode — "Fortify
+    is slow or unreachable" — is unambiguous in logs and, if a caller ever
+    wants to, can be handled differently from other API errors (e.g. a
+    malformed request or an auth failure). It's still a plain Exception
+    subclass, so every existing `except Exception` handler up the call
+    chain (fortifyai.py, version_resolver.py, api_server.py's job runner)
+    catches it exactly as before with zero changes required there — this
+    only adds clarity, it doesn't change failure behavior.
+    """
+
+    def __init__(self, method: str, url: str, timeout: tuple, original_exc: Exception):
+        self.method = method
+        self.url = url
+        self.timeout = timeout
+        self.original_exc = original_exc
+        connect_t, read_t = timeout
+        super().__init__(
+            f"Fortify API did not respond in time — {method} {url} "
+            f"(connect timeout={connect_t}s, read timeout={read_t}s): {original_exc}"
+        )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_primary_location(primary_location: str) -> dict:
@@ -79,7 +109,18 @@ class FortifyClient:
     """
 
     _PAGE_SIZE = 50          # items per page for paginated endpoints
-    _REQUEST_TIMEOUT = 60    # seconds per HTTP call
+
+    # (connect_timeout, read_timeout) in seconds, passed straight to requests.
+    # connect: how long to wait to establish the TCP/TLS connection at all —
+    #   kept short, since a host that's genuinely unreachable (network issue,
+    #   VPN down, wrong URL) should fail fast rather than hang.
+    # read: how long to wait for Fortify to send a response once connected —
+    #   kept longer, since some SSC endpoints (large vulnerability pages) can
+    #   legitimately take a while to compute server-side.
+    _CONNECT_TIMEOUT = 10
+    _READ_TIMEOUT = 45
+    _REQUEST_TIMEOUT = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
+    _MAX_PAGES = 500  # safety cap — at _PAGE_SIZE=50 this is 25,000 items
 
     def __init__(self, base_url: str, api_token: str, persist_token: bool = True) -> None:
         self._base_url = base_url.rstrip("/")
@@ -119,9 +160,17 @@ class FortifyClient:
             "Content-Type": "application/json",
         })
 
-        # Retry on 429 (rate limit) and 5xx server errors
+        # Retry on 429 (rate limit) and 5xx server errors — these are cases
+        # where Fortify DID respond, just not successfully, so retrying is
+        # likely to help. `connect`/`read` are capped separately and lower:
+        # a connection that's timing out or refusing entirely is unlikely to
+        # start working within a few seconds, so we fail fast there instead
+        # of silently retrying up to `total` times and turning one slow call
+        # into several minutes of apparent hang before finally raising.
         retry = Retry(
             total=4,
+            connect=1,
+            read=1,
             backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"],
@@ -152,10 +201,24 @@ class FortifyClient:
         logger.info("[FortifyClient] Session re-authorized with fresh token.")
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        """GET a single JSON response; raise on HTTP error."""
+        """GET a single JSON response; raise on HTTP error.
+
+        Raises FortifyAPITimeoutError if Fortify doesn't respond within the
+        connect/read timeout budget (see _CONNECT_TIMEOUT/_READ_TIMEOUT) —
+        this fails fast and predictably rather than hanging.
+        """
         url = self._url(path)
         logger.debug(f"[FortifyClient] GET {url} params={params}")
-        resp = self._session.get(url, params=params, timeout=self._REQUEST_TIMEOUT, verify=False)
+        try:
+            resp = self._session.get(
+                url, params=params, timeout=self._REQUEST_TIMEOUT, verify=False,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            logger.error(
+                f"[FortifyClient] Timed out waiting for Fortify — GET {url} "
+                f"(budget: connect={self._CONNECT_TIMEOUT}s, read={self._READ_TIMEOUT}s)"
+            )
+            raise FortifyAPITimeoutError("GET", url, self._REQUEST_TIMEOUT, exc) from exc
         resp.raise_for_status()
         return resp.json()
 
@@ -163,14 +226,32 @@ class FortifyClient:
         """
         Paginate through all pages of a collection endpoint.
         Fortify v3 uses offset/limit pagination; items live under response["items"].
+
+        _MAX_PAGES bounds the loop even if the server returns an
+        inconsistent totalCount/offset pairing that would otherwise never
+        satisfy the `fetched >= total` exit condition — each individual
+        page fetch already has its own connect/read timeout via _get(), but
+        without this cap a misbehaving API could still keep the loop itself
+        running indefinitely.
         """
         params = dict(params or {})
         params["limit"] = self._PAGE_SIZE
         params["offset"] = 0
 
         all_items: list[dict] = []
+        page_count = 0
 
         while True:
+            page_count += 1
+            if page_count > self._MAX_PAGES:
+                logger.error(
+                    f"[FortifyClient] Aborting pagination for {path} after "
+                    f"{self._MAX_PAGES} pages ({len(all_items)} items fetched) — "
+                    "totalCount/offset never converged. Returning what was "
+                    "fetched so far rather than looping indefinitely."
+                )
+                break
+
             data = self._get(path, params)
             items = data.get("items", [])
             all_items.extend(items)
@@ -191,10 +272,23 @@ class FortifyClient:
         return all_items
 
     def _post(self, path: str, body: dict) -> dict:
-        """POST JSON body; raise on HTTP error."""
+        """POST JSON body; raise on HTTP error.
+
+        Raises FortifyAPITimeoutError if Fortify doesn't respond within the
+        connect/read timeout budget — see _get()'s docstring.
+        """
         url = self._url(path)
         logger.debug(f"[FortifyClient] POST {url}")
-        resp = self._session.post(url, json=body, timeout=self._REQUEST_TIMEOUT, verify=False)
+        try:
+            resp = self._session.post(
+                url, json=body, timeout=self._REQUEST_TIMEOUT, verify=False,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            logger.error(
+                f"[FortifyClient] Timed out waiting for Fortify — POST {url} "
+                f"(budget: connect={self._CONNECT_TIMEOUT}s, read={self._READ_TIMEOUT}s)"
+            )
+            raise FortifyAPITimeoutError("POST", url, self._REQUEST_TIMEOUT, exc) from exc
         resp.raise_for_status()
         # Some POST endpoints return 204 No Content
         if resp.status_code == 204 or not resp.content:
