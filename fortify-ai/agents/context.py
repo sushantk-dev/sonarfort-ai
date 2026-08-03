@@ -24,6 +24,7 @@ Console output (done-when):
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -234,6 +235,139 @@ def _find_compiler_plugin_release(root: ET.Element) -> Optional[str]:
     return None
 
 
+def _check_root_for_jdk(root: ET.Element, source_label: str) -> Optional[str]:
+    """
+    Check one already-parsed pom <project> root element for a JDK version
+    signal — properties first (in _JDK_PROPERTY_NAMES priority order), then
+    maven-compiler-plugin configuration. Shared by both the literal-file scan
+    in detect_required_jdk() and the effective-pom fallback below, so both
+    paths recognise the exact same set of signals.
+
+    source_label: used only for the debug log line (e.g. a filename, or
+        "effective POM").
+    """
+    for prop_name in _JDK_PROPERTY_NAMES:
+        for ns_prefix in [f"{{{_MVN_NS}}}", ""]:
+            elem = root.find(f".//{ns_prefix}properties/{ns_prefix}{prop_name}")
+            if elem is not None and elem.text:
+                normalized = _normalize_jdk_version(elem.text)
+                if normalized:
+                    logger.debug(
+                        f"[Context] JDK {normalized} detected via "
+                        f"{prop_name} in {source_label}"
+                    )
+                    return normalized
+
+    plugin_version = _find_compiler_plugin_release(root)
+    if plugin_version:
+        normalized = _normalize_jdk_version(plugin_version)
+        if normalized:
+            logger.debug(
+                f"[Context] JDK {normalized} detected via "
+                f"maven-compiler-plugin in {source_label}"
+            )
+            return normalized
+
+    return None
+
+
+def _detect_required_jdk_via_effective_pom(
+    project_path: Path,
+    mvn_exe: str = "",
+    timeout: int = 90,
+) -> Optional[str]:
+    """
+    Fallback used when NO local pom.xml in the project tree contains a
+    literal JDK signal (detect_required_jdk()'s static scan returns None).
+
+    This happens routinely for Spring Boot projects (and other org-internal
+    parent-BOM setups) that inherit their Java version from a remote parent
+    POM — e.g. <parent>spring-boot-starter-parent</parent> — resolved out of
+    the local .m2 cache / Maven Central rather than declared anywhere inside
+    this checked-out repo. A static project_path.rglob("pom.xml") scan can
+    only ever see files physically on disk in this repo, so it's blind to
+    values that only exist once Maven actually resolves the parent chain.
+
+    Resolves this by running `mvn help:effective-pom` on the project's root
+    pom.xml, which fully expands the parent inheritance chain (and BOM
+    imports) into a single self-contained XML document, then checks that
+    resolved document with the same _check_root_for_jdk() logic used for
+    literal files.
+
+    Scope/limitation: only the ROOT pom's effective view is resolved (one
+    subprocess call, kept fast) — this covers the common case where the
+    Java version is inherited project-wide from a parent. It does NOT catch
+    a child module overriding the version upward on its own (that case is
+    already handled by detect_required_jdk()'s literal multi-pom max-scan,
+    since an override like that is, by definition, written explicitly in
+    that child's own pom.xml and so is visible to the static scan).
+
+    Returns None if mvn is unavailable, the project can't be resolved, or
+    the effective POM has no JDK signal either.
+    """
+    root_pom = project_path if project_path.is_file() else project_path / "pom.xml"
+    if not root_pom.is_file():
+        return None
+
+    if not mvn_exe:
+        mvn_exe = shutil.which("mvn") or shutil.which("mvn.cmd") or ""
+    if not mvn_exe:
+        logger.debug(
+            "[Context] mvn not on PATH — cannot resolve effective POM for "
+            "JDK detection; project's required JDK will be reported as unknown"
+        )
+        return None
+
+    cwd = str(root_pom.parent)
+    out_file = root_pom.parent / ".fortifyai_effective_pom_tmp.xml"
+
+    try:
+        proc = subprocess.run(
+            [
+                mvn_exe, "help:effective-pom",
+                f"-Doutput={out_file}",
+                "-f", str(root_pom),
+                "--no-transfer-progress",
+                "-q",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug(f"[Context] mvn help:effective-pom failed: {exc}")
+        return None
+
+    try:
+        if proc.returncode != 0 or not out_file.is_file():
+            logger.debug(
+                f"[Context] mvn help:effective-pom exited {proc.returncode} "
+                "or produced no output — cannot resolve inherited JDK version"
+            )
+            return None
+
+        try:
+            tree = ET.parse(out_file)
+            root_elem = tree.getroot()
+        except ET.ParseError as exc:
+            logger.debug(f"[Context] Could not parse effective POM XML: {exc}")
+            return None
+    finally:
+        try:
+            if out_file.is_file():
+                out_file.unlink()
+        except OSError:
+            pass
+
+    result = _check_root_for_jdk(root_elem, "effective POM (resolved parent chain)")
+    if result:
+        logger.info(
+            f"[Context] Required JDK {result} resolved via effective POM — "
+            "inherited from a parent POM not present locally in this repo"
+        )
+    return result
+
+
 def detect_required_jdk(project_path: Path) -> Optional[str]:
     """
     Determine which JDK major version this Maven project needs to build,
@@ -256,7 +390,8 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
     (wrong) version that got detected.
 
     Returns a normalized major-version string (e.g. "17"), or None if no
-    version signal could be found anywhere in the project.
+    version signal could be found anywhere in the project (including via
+    the effective-pom fallback described below).
     """
     all_poms = sorted(project_path.rglob("pom.xml"))
     if not all_poms:
@@ -270,33 +405,7 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
         if root is None:
             continue
 
-        found_in_pom: Optional[str] = None
-
-        for prop_name in _JDK_PROPERTY_NAMES:
-            for ns_prefix in [f"{{{_MVN_NS}}}", ""]:
-                elem = root.find(f".//{ns_prefix}properties/{ns_prefix}{prop_name}")
-                if elem is not None and elem.text:
-                    normalized = _normalize_jdk_version(elem.text)
-                    if normalized:
-                        found_in_pom = normalized
-                        logger.debug(
-                            f"[Context] JDK {normalized} detected via "
-                            f"{prop_name} in {pom_path.name}"
-                        )
-                        break
-            if found_in_pom:
-                break
-
-        if not found_in_pom:
-            plugin_version = _find_compiler_plugin_release(root)
-            if plugin_version:
-                normalized = _normalize_jdk_version(plugin_version)
-                if normalized:
-                    found_in_pom = normalized
-                    logger.debug(
-                        f"[Context] JDK {normalized} detected via "
-                        f"maven-compiler-plugin in {pom_path.name}"
-                    )
+        found_in_pom = _check_root_for_jdk(root, pom_path.name)
 
         if found_in_pom:
             try:
@@ -314,7 +423,19 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
         )
         return highest_str
 
-    logger.debug("[Context] No explicit JDK version found in any pom.xml")
+    # Nothing declared literally in any pom.xml on disk — this is the common
+    # case for Spring Boot (and similar) projects that inherit their Java
+    # version from a remote/.m2-cached parent POM instead of declaring it
+    # locally. Resolve the effective (fully-inherited) POM via Maven itself
+    # rather than reporting the project's JDK as unknown.
+    effective = _detect_required_jdk_via_effective_pom(project_path)
+    if effective:
+        return effective
+
+    logger.debug(
+        "[Context] No explicit JDK version found in any pom.xml, and "
+        "effective-pom resolution found none either"
+    )
     return None
 
 
