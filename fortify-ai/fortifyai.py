@@ -67,6 +67,9 @@ def initial_state(release_id: int, max_upgrades: int = 0) -> AgentState:
         retry_count=0,
         last_build_error=None,
         ai_code_fix_applied=False,
+        required_jdk=None,
+        is_jdk_mismatch=None,
+        jdk_mismatch_version=None,
         pr_result=None,
         status="running",
         skip_reason=None,
@@ -395,10 +398,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Context ───────────────────────────────────────────────────────────────
     logger.info("─" * 60)
-    from agents.context import locate_all_groups
+    from agents.context import locate_all_groups, detect_required_jdk
     from pathlib import Path
     project_path = Path(config.project_path) if config.project_path else Path(".")
     context_groups = locate_all_groups(project_path, resolved_groups)
+
+    # Detect the JDK this project needs so run_adr_fix (below) can tell
+    # adr_fortify.py which JAVA_HOME to build with. This CLI path doesn't go
+    # through context_node (the LangGraph node) — it calls the same
+    # locate_all_groups() helper directly — so JDK detection has to be called
+    # here explicitly too, or it silently never happens for CLI-driven runs.
+    required_jdk = detect_required_jdk(project_path)
+    if required_jdk:
+        logger.info(f"[Context] Project requires JDK {required_jdk}")
 
     # ── API diff ──────────────────────────────────────────────────────────────
     logger.info("─" * 60)
@@ -448,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
                 adr_path=config.adr_path,
                 project_path=str(project_path),
                 jira_prefix=config.jira_id_prefix,
+                required_jdk=required_jdk,
             )
         else:
             from state import AdrResult
