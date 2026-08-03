@@ -252,9 +252,9 @@ def _check_root_for_jdk(root: ET.Element, source_label: str) -> Optional[str]:
             if elem is not None and elem.text:
                 normalized = _normalize_jdk_version(elem.text)
                 if normalized:
-                    logger.debug(
+                    logger.info(
                         f"[Context] JDK {normalized} detected via "
-                        f"{prop_name} in {source_label}"
+                        f"{prop_name}='{elem.text.strip()}' in {source_label}"
                     )
                     return normalized
 
@@ -262,9 +262,9 @@ def _check_root_for_jdk(root: ET.Element, source_label: str) -> Optional[str]:
     if plugin_version:
         normalized = _normalize_jdk_version(plugin_version)
         if normalized:
-            logger.debug(
+            logger.info(
                 f"[Context] JDK {normalized} detected via "
-                f"maven-compiler-plugin in {source_label}"
+                f"maven-compiler-plugin release='{plugin_version}' in {source_label}"
             )
             return normalized
 
@@ -312,14 +312,16 @@ def _detect_required_jdk_via_effective_pom(
     if not mvn_exe:
         mvn_exe = shutil.which("mvn") or shutil.which("mvn.cmd") or ""
     if not mvn_exe:
-        logger.debug(
-            "[Context] mvn not on PATH — cannot resolve effective POM for "
-            "JDK detection; project's required JDK will be reported as unknown"
+        logger.warning(
+            "[Context] mvn not on PATH for this process — cannot resolve "
+            "effective POM for JDK detection; project's required JDK will "
+            "be reported as unknown"
         )
         return None
 
     cwd = str(root_pom.parent)
     out_file = root_pom.parent / ".fortifyai_effective_pom_tmp.xml"
+    logger.info(f"[Context] Running: {mvn_exe} help:effective-pom -f {root_pom}")
 
     try:
         proc = subprocess.run(
@@ -335,14 +337,16 @@ def _detect_required_jdk_via_effective_pom(
             timeout=timeout,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug(f"[Context] mvn help:effective-pom failed: {exc}")
+        logger.warning(f"[Context] mvn help:effective-pom failed to run: {exc}")
         return None
 
     try:
         if proc.returncode != 0 or not out_file.is_file():
-            logger.debug(
+            stderr_tail = (proc.stderr or b"").decode(errors="replace")[-500:]
+            logger.warning(
                 f"[Context] mvn help:effective-pom exited {proc.returncode} "
-                "or produced no output — cannot resolve inherited JDK version"
+                f"or produced no output — cannot resolve inherited JDK version. "
+                f"stderr tail: {stderr_tail}"
             )
             return None
 
@@ -350,7 +354,7 @@ def _detect_required_jdk_via_effective_pom(
             tree = ET.parse(out_file)
             root_elem = tree.getroot()
         except ET.ParseError as exc:
-            logger.debug(f"[Context] Could not parse effective POM XML: {exc}")
+            logger.warning(f"[Context] Could not parse effective POM XML: {exc}")
             return None
     finally:
         try:
@@ -364,6 +368,11 @@ def _detect_required_jdk_via_effective_pom(
         logger.info(
             f"[Context] Required JDK {result} resolved via effective POM — "
             "inherited from a parent POM not present locally in this repo"
+        )
+    else:
+        logger.warning(
+            "[Context] Effective POM resolved successfully but contained no "
+            "recognized JDK property or maven-compiler-plugin release either"
         )
     return result
 
@@ -395,7 +404,16 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
     """
     all_poms = sorted(project_path.rglob("pom.xml"))
     if not all_poms:
+        logger.warning(
+            f"[Context] No pom.xml files found under {project_path} — "
+            "cannot detect required JDK"
+        )
         return None
+
+    logger.info(
+        f"[Context] Scanning {len(all_poms)} pom.xml file(s) under "
+        f"{project_path} for required JDK version..."
+    )
 
     highest: Optional[int] = None
     highest_str: Optional[str] = None
@@ -417,7 +435,7 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
                 highest_str = found_in_pom
 
     if highest_str:
-        logger.debug(
+        logger.info(
             f"[Context] Required JDK for reactor build: {highest_str} "
             f"(highest across {len(all_poms)} pom.xml file(s))"
         )
@@ -428,13 +446,19 @@ def detect_required_jdk(project_path: Path) -> Optional[str]:
     # version from a remote/.m2-cached parent POM instead of declaring it
     # locally. Resolve the effective (fully-inherited) POM via Maven itself
     # rather than reporting the project's JDK as unknown.
+    logger.info(
+        f"[Context] No literal JDK signal found in any of the {len(all_poms)} "
+        "local pom.xml file(s) — trying effective-pom resolution "
+        "(handles versions inherited from a remote/.m2-cached parent POM)..."
+    )
     effective = _detect_required_jdk_via_effective_pom(project_path)
     if effective:
         return effective
 
-    logger.debug(
-        "[Context] No explicit JDK version found in any pom.xml, and "
-        "effective-pom resolution found none either"
+    logger.warning(
+        "[Context] Could not determine required JDK — no signal found in "
+        "any local pom.xml, and effective-pom resolution found none either. "
+        "required_jdk will be None for this run."
     )
     return None
 
@@ -803,6 +827,12 @@ def context_node(state: AgentState, project_path: str) -> AgentState:
     state["required_jdk"] = required_jdk  # type: ignore[typeddict-item]
     if required_jdk:
         logger.info(f"[Context] Project requires JDK {required_jdk}")
+    else:
+        logger.warning(
+            "[Context] required_jdk is None for this run — downstream agents "
+            "(AI Reasoning, JDK registry selection) will treat this project's "
+            "JDK as unknown"
+        )
 
     state["_context_groups"] = enriched  # type: ignore[typeddict-unknown-key]
     state["audit_trail"].append({
