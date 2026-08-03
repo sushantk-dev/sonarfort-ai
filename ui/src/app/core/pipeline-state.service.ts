@@ -1242,7 +1242,7 @@ export class PipelineStateService {
         this.http.get<any>(`${this.fortifyBase}/pipeline/status/${pipelineId}`).subscribe({
           next: resp => {
             this._applyFortifyStatus(pipelineId, resp);
-            this._clearStaleCancelledState(pipelineId);
+            this._clearStaleTerminalState(pipelineId);
             this._finishResume(pipelineId, mode, body);
           },
           error: () => {
@@ -1250,7 +1250,7 @@ export class PipelineStateService {
               ? { ...r, status: 'running' as const, outcome: undefined }
               : r
             ));
-            this._clearStaleCancelledState(pipelineId);
+            this._clearStaleTerminalState(pipelineId);
             this._finishResume(pipelineId, mode, body);
           },
         });
@@ -1264,15 +1264,20 @@ export class PipelineStateService {
   }
 
   /**
-   * Reset any leftover 'cancelled' state from the run's PREVIOUS attempt —
-   * both the "Run cancelled" outcome banner and any step still showing
+   * Reset any leftover TERMINAL state from the run's PREVIOUS attempt — the
+   * outcome banner/badges (whatever they were showing — "Pipeline error",
+   * "Run cancelled", etc. — see outcomeTitle) and any step still showing
    * 'cancelled' status with its "Cancelled by user" detail.
    *
    * _applyFortifyStatus only overwrites `outcome` when the freshly-fetched
    * status is itself terminal ('done'/'error'); since the just-resumed job
    * is 'running' at this point, it falls back to `r.outcome ?? existing`
-   * and the stale 'cancelled' banner would otherwise sit there until the
-   * run reaches a new terminal state.
+   * and whatever the PREVIOUS attempt's outcome was — 'error', 'cancelled',
+   * anything — would otherwise sit there rendering as if it still applied,
+   * until the run reaches a new terminal state. There's no case where a
+   * leftover outcome is still valid once a run is confirmed running again,
+   * so this clears it unconditionally rather than special-casing individual
+   * values.
    *
    * The stale step status is a similar story: the backend clears a stage's
    * leftover error the moment that stage actually restarts (see
@@ -1280,11 +1285,11 @@ export class PipelineStateService {
    * — after the repo re-clone and vulnerability re-fetch — so the very
    * first status snapshot fetched here can still be showing it.
    */
-  private _clearStaleCancelledState(pipelineId: string) {
+  private _clearStaleTerminalState(pipelineId: string) {
     this.runs.update(rs => rs.map(r => r.id === pipelineId
       ? {
           ...r,
-          outcome: r.outcome === 'cancelled' ? undefined : r.outcome,
+          outcome: undefined,
           steps: r.steps.map(s =>
             s.status === 'cancelled' ? { ...s, status: 'pending' as const, detail: '' } : s
           ),
