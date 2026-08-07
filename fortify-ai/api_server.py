@@ -98,6 +98,7 @@ from pydantic import BaseModel, Field
 # ── Internal imports ──────────────────────────────────────────────────────────
 from config import FortifyAIConfig, load_config
 from job_store import create_job_store, ALL_STAGE_NAMES
+from maven_warmup import start_maven_warmup, log_warmup_status
 from token_tracker import token_tracker
 from runtime_config import apply_overrides, persist_overrides, is_persisted
 from credential_vault import encrypt_resume_meta, decrypt_resume_meta
@@ -843,6 +844,22 @@ def _run_full_pipeline(
     project_path = Path(cfg.project_path) if cfg.project_path else Path(".")
     japicmp_path = cfg.japicmp_jar_path or "/nonexistent/japicmp.jar"
 
+    # ── Background Maven cache warm-up ─────────────────────────────────────────
+    # project_path is final at this point (the caller already ran
+    # _clone_repo_if_needed, if applicable, before invoking this function).
+    # Kick off 'mvn dependency:go-offline' here, in the background, so the
+    # .m2 cache has the whole triage / version-resolution / context / api-diff
+    # / ai-reasoning window to warm up before adr-fix's Phase 1b (mvn
+    # dependency:tree) needs it. See maven_warmup.py for details. Shared with
+    # fortifyai.py's CLI entry point so the two don't drift with separate
+    # copies of this logic.
+    #
+    # Skipped on a resume where adr-fix is already checkpointed — that stage
+    # won't run again for this call, so warming the cache would be wasted work.
+    maven_warmup_thread = None
+    if not _already_done("adr-fix"):
+        maven_warmup_thread = start_maven_warmup(str(project_path))
+
     # Stage 1 — triage
     if _already_done("triage"):
         groups = acc["groups"]
@@ -960,6 +977,7 @@ def _run_full_pipeline(
         _checkpoint("adr-fix", reasoned=reasoned)
 
     # Stage 6 — adr fix (side-effecting: commits + pushes — never re-run once checkpointed)
+    log_warmup_status(maven_warmup_thread)
     if _already_done("adr-fix"):
         adr_results = acc["adr_results"]
     else:

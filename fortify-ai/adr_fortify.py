@@ -29,8 +29,12 @@ HOW IT WORKS
                           <dependencyManagement> in the root pom. A
                           timestamped backup is created before any write.
   Phase 5b  BUILD CHECK   Validate changes by running 'mvn clean install
-                          -DskipTests'. Automatically reverts all pom.xml
-                          files from backups if the build fails.
+                          -DskipTests' with a multithreaded reactor build
+                          (-T, default 1C — one thread per CPU core; tune
+                          or disable via --build-threads). Automatically
+                          reverts all pom.xml files from backups if the
+                          build fails (after a single-threaded retry to
+                          rule out a parallel-build plugin flake).
   Phase 5c  GIT COMMIT    Create a feature branch (feature/<FORTIFY-ID>_fortify_fix
                           _<date>), stage all modified pom files, and commit
                           with a structured message. Optionally push with --push.
@@ -63,6 +67,10 @@ USAGE
                                          injected automatically by adr_fix.py
     --skipTests true|false               Skip Maven tests during build verification
                                          (default: false — tests run by default)
+    --build-threads N                    Maven -T value for the build (default: 1C — one
+                                         thread per CPU core). Use a number for a fixed
+                                         thread count, or 1 to disable parallelism.
+
 
 REQUIREMENTS
   Python 3.6+  --  no third-party packages needed
@@ -978,13 +986,19 @@ def _kill_process_tree(pid: int) -> None:
 
 
 def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = False,
-                      java_home: str = "") -> tuple:
+                      java_home: str = "", build_threads: str = "1C") -> tuple:
     """Run 'mvn clean install' in project_root.
     Returns (success: bool | None, duration: float).
     None = maven not found (skipped).  False = build failed.  True = success.
     skip_tests: when True adds -DskipTests to the Maven command (tests are skipped).
     java_home: when set, JAVA_HOME/PATH are overridden for this subprocess only
                (see _build_subprocess_env) — empty string means inherit as before.
+    build_threads: value passed to Maven's -T flag for a multithreaded reactor
+               build across modules, e.g. "1C" (one thread per CPU core —
+               the default), "4" (4 threads), or "1" (single-threaded —
+               effectively disables parallelism, matching the old behaviour).
+               Only takes effect for multi-module builds; a single pom.xml
+               reactor of one module builds the same either way.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
@@ -997,11 +1011,21 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         print(f"  {C.GRAY}[BUILD] Using JDK: {os.path.abspath(java_home)}{C.RESET}")
 
     mvn_cmd = [mvn_exe, "clean", "install", "--no-transfer-progress"]
+    build_threads = (build_threads or "").strip()
+    threaded = bool(build_threads) and build_threads != "1"
+    if build_threads:
+        mvn_cmd += ["-T", build_threads]
+
+    thread_label = f" -T {build_threads}" if threaded else ""
     if skip_tests:
         mvn_cmd.append("-DskipTests")
-        print(f"  {C.GRAY}[BUILD] Running mvn clean install -DskipTests ...{C.RESET}", flush=True)
+        print(f"  {C.GRAY}[BUILD] Running mvn clean install -DskipTests{thread_label} ...{C.RESET}", flush=True)
     else:
-        print(f"  {C.GRAY}[BUILD] Running mvn clean install (with tests) ...{C.RESET}", flush=True)
+        print(f"  {C.GRAY}[BUILD] Running mvn clean install{thread_label} (with tests) ...{C.RESET}", flush=True)
+    if threaded:
+        print(f"  {C.GRAY}[BUILD] Multithreaded reactor build — modules with no interdependency "
+              f"build in parallel. If any module fails with plugin thread-safety errors, "
+              f"re-run with --build-threads 1 to fall back to single-threaded.{C.RESET}")
 
     t0 = time.time()
     proc = None
@@ -1023,6 +1047,17 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         duration = time.time() - t0
         if proc.returncode != 0:
             print(f"  {C.RED}[BUILD] Build FAILED (exit {proc.returncode}){C.RESET}")
+            if threaded:
+                # Parallel reactor builds can fail spuriously against plugins that
+                # aren't thread-safe (shared mutable state, non-reentrant file I/O,
+                # etc.) — a failure here doesn't necessarily mean the fix is bad.
+                # Retry once single-threaded before reporting failure, since the
+                # caller reverts all pom.xml changes on a real failure and that's
+                # an expensive false positive to eat for a parallelism artifact.
+                print(f"  {C.YELLOW}[BUILD] Retrying single-threaded to rule out a "
+                      f"plugin thread-safety issue under -T {build_threads} ...{C.RESET}", flush=True)
+                return _run_maven_build(project_root, mvn_exe=mvn_exe, skip_tests=skip_tests,
+                                         java_home=java_home, build_threads="1")
             return False, duration
         return True, duration
     except subprocess.TimeoutExpired:
@@ -1417,6 +1452,11 @@ def main():
             "  --target-versions JSON    JSON map {groupId:artifactId: {safe_version,...}} from Fortify pipeline\n"
             "  --skipTests true|false    Skip Maven tests during build verification\n"
             "                            true = skip tests (-DskipTests)  |  false = run tests (default: false)\n"
+            "  --build-threads N         Maven -T value for a multithreaded reactor build\n"
+            "                            (default: 1C — one thread per CPU core). Use a plain\n"
+            "                            number (e.g. 4) for a fixed thread count, or 1 to disable\n"
+            "                            parallelism and build single-threaded as before.\n"
+            "                            Only affects multi-module projects with independent modules.\n"
             "\n"
             "Examples:\n"
             "  python adr_fortify.py /path/to/project --scan\n"
@@ -1427,6 +1467,8 @@ def main():
             "  python adr_fortify.py /path/to/project --commit FORTIFY-a4105c54 --base-branch develop\n"
             "  python adr_fortify.py /path/to/project --commit FORTIFY-a4105c54 --push --skipTests true\n"
             "  python adr_fortify.py /path/to/project --fix --skipTests false\n"
+            "  python adr_fortify.py /path/to/project --fix --build-threads 4\n"
+            "  python adr_fortify.py /path/to/project --fix --build-threads 1   # disable parallel build\n"
         ),
     )
     parser.add_argument("project_path", help="Path to the project directory (or a single pom.xml)")
@@ -1467,6 +1509,10 @@ def main():
                         default=False, metavar="true|false",
                         help="Skip Maven tests during build verification. "
                              "true = skip tests (-DskipTests), false = run tests (default: false)")
+    parser.add_argument("--build-threads", default="1C", metavar="N",
+                        help="Maven -T value for a multithreaded reactor build across modules. "
+                             "Default '1C' (one thread per CPU core). Pass a fixed number (e.g. 4) "
+                             "or '1' to disable parallelism and build single-threaded.")
     args = parser.parse_args()
 
     # ── Parse --target-versions JSON ──────────────────────────────────────────
@@ -1969,7 +2015,8 @@ def main():
         )
         maven_ok, maven_duration = _run_maven_build(project_root, mvn_exe=mvn_exe,
                                                       skip_tests=args.skipTests,
-                                                      java_home=java_home)
+                                                      java_home=java_home,
+                                                      build_threads=args.build_threads)
         if not maven_ok:
             print()
             print(f"  {C.RED}[ABORT] Build failed — reverting all pom.xml changes from backups.{C.RESET}")

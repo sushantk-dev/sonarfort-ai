@@ -12,8 +12,6 @@ import argparse
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 
 from loguru import logger
@@ -21,6 +19,7 @@ from loguru import logger
 from config import FortifyAIConfig, load_config
 from fortify_client import FortifyClient
 from graph import get_compiled_graph
+from maven_warmup import start_maven_warmup, log_warmup_status
 from state import AgentState
 
 
@@ -41,79 +40,6 @@ def configure_logging(verbose: bool = False) -> None:
         ),
         colorize=True,
     )
-
-
-# ── Background Maven cache warm-up ──────────────────────────────────────────────
-#
-# adr_fortify.py's Phase 1b (mvn dependency:tree) tries an offline resolution
-# first and only falls back to a live remote fetch if the local .m2 cache is
-# incomplete — that remote fallback is what makes ADR runs slow (silently, for
-# up to 5 minutes, since it's not streamed). By the time the pipeline reaches
-# adr_fix, triage / version-resolution / context-location / api-diff have
-# already spent real wall-clock time doing non-Maven work — this warms the
-# .m2 cache in a background thread during that window so the offline attempt
-# inside adr_fortify.py is more likely to succeed outright.
-#
-# This is strictly best-effort: failure or a slow/incomplete warm-up here is
-# never fatal — adr_fortify.py's own offline→online fallback logic still runs
-# exactly as before and handles a cold or partially-warmed cache correctly.
-
-def _warm_maven_cache(project_path: str) -> None:
-    """Run 'mvn dependency:go-offline' in the background to pre-populate the
-    local .m2 repository while earlier pipeline stages (triage, version
-    resolution, context location, api-diff) are doing non-Maven work.
-
-    Runs on a daemon thread — never joined/blocked on by the main pipeline,
-    so it can only ever help (a warmer cache by the time adr_fix runs) and
-    never slow anything down or hang the process on exit.
-    """
-    try:
-        pom = Path(project_path) / "pom.xml"
-        if not pom.is_file():
-            logger.debug(f"[MavenWarm] No pom.xml at {project_path} — skipping warm-up")
-            return
-
-        mvn_exe = shutil.which("mvn")
-        if not mvn_exe:
-            logger.debug("[MavenWarm] mvn not found on PATH — skipping warm-up")
-            return
-
-        logger.info(f"[MavenWarm] Starting background 'mvn dependency:go-offline' "
-                    f"on {pom} ...")
-        t0 = time.time()
-        result = subprocess.run(
-            [mvn_exe, "dependency:go-offline", "-f", str(pom), "--no-transfer-progress"],
-            capture_output=True, text=True,
-            timeout=280,   # stay under adr_fortify.py's own 300s fallback timeout
-        )
-        elapsed = time.time() - t0
-        if result.returncode == 0:
-            logger.info(f"[MavenWarm] ✅ .m2 cache warmed in {elapsed:.0f}s — "
-                        f"adr_fortify.py's offline dependency:tree should now succeed")
-        else:
-            logger.warning(f"[MavenWarm] go-offline exited {result.returncode} after "
-                            f"{elapsed:.0f}s — adr_fortify.py will fall back to its own "
-                            f"online resolution as usual")
-    except subprocess.TimeoutExpired:
-        logger.warning("[MavenWarm] go-offline timed out after 280s — proceeding; "
-                        "adr_fortify.py will still fall back to its own resolution")
-    except Exception as exc:
-        logger.warning(f"[MavenWarm] skipped due to error: {exc}")
-
-
-def _start_maven_warmup(project_path: "Path | str") -> "threading.Thread | None":
-    """Kick off _warm_maven_cache() on a daemon thread. Returns the thread
-    (for optional status logging later) or None if it couldn't be started."""
-    try:
-        thread = threading.Thread(
-            target=_warm_maven_cache, args=(str(project_path),),
-            name="maven-cache-warmup", daemon=True,
-        )
-        thread.start()
-        return thread
-    except Exception as exc:
-        logger.warning(f"[MavenWarm] could not start background warm-up: {exc}")
-        return None
 
 
 # ── State factory ─────────────────────────────────────────────────────────────
@@ -383,10 +309,14 @@ def main(argv: list[str] | None = None) -> int:
     # regardless of which branch above ran. Kick off 'mvn dependency:go-offline'
     # here, in the background, so the .m2 cache has the whole triage /
     # version-resolution / context / api-diff window to warm up before
-    # adr_fix's Phase 1b (mvn dependency:tree) needs it. See _warm_maven_cache
-    # docstring for why this makes ADR noticeably faster without changing its
-    # own offline/online fallback behaviour.
-    maven_warmup_thread = _start_maven_warmup(config.project_path)
+    # adr_fix's Phase 1b (mvn dependency:tree) needs it. See maven_warmup.py
+    # for why this makes ADR noticeably faster without changing its own
+    # offline/online fallback behaviour. Shared with api_server.py so the
+    # two entry points don't drift with separate copies of this logic.
+    maven_warmup_thread = start_maven_warmup(
+        config.project_path,
+        log_info=logger.info, log_warning=logger.warning, log_debug=logger.debug,
+    )
 
     # ── Resolve vulnerabilities ───────────────────────────────────────────────
     release_id = args.release
@@ -524,15 +454,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── ADR fix ───────────────────────────────────────────────────────────────
     logger.info("─" * 60)
-    if maven_warmup_thread is not None:
-        if maven_warmup_thread.is_alive():
-            logger.info(
-                "[MavenWarm] Still warming .m2 cache in the background — "
-                "adr_fortify.py will use whatever is cached so far and fall "
-                "back to its own online resolution for the rest"
-            )
-        else:
-            logger.info("[MavenWarm] ✅ Background .m2 warm-up already finished")
+    log_warmup_status(maven_warmup_thread, log_info=logger.info)
     from agents.adr_fix import run_adr_fix
     adr_results: list[dict] = []
     for group in reasoned_groups:
