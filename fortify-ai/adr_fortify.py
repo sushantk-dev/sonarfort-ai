@@ -17,6 +17,10 @@ HOW IT WORKS
                           collect the full resolved dependency tree across all
                           modules (test/provided/system scopes excluded by
                           default; use --include-scopes to override).
+                          Uses the same -T reactor threading as the build
+                          step (--build-threads, default 1C) since
+                          dependency:tree resolves per-module across the
+                          reactor like any other goal.
   Phase 3   REPORT        Colour-coded vulnerability report with per-CVE cards
                           and PDF output.
                           NOTE: CVE detection and safe-version resolution are
@@ -1071,14 +1075,21 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
 
 
 def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
-                             java_home: str = "") -> dict:
+                             java_home: str = "", build_threads: str = "1C") -> dict:
     """
-    Runs 'mvn dependency:tree -Dverbose' ONCE on the project root pom and returns
+    Runs 'mvn dependency:tree' ONCE on the project root pom and returns
     a pool dict: (groupId, artifactId, version) -> dep_dict for every dep in the
     full resolved tree across all modules.  Call this once before the module loop.
     Tries offline mode first (uses .m2 cache, fast); falls back to online if needed.
     Returns {} if mvn is unavailable, the command fails, or times out.
     java_home: when set, JAVA_HOME/PATH are overridden for this subprocess only.
+    build_threads: Maven -T value (default "1C" — one thread per CPU core).
+        dependency:tree runs per-module during the reactor traversal like any
+        other goal (it isn't a single-shot aggregator), so this parallelizes
+        resolution across independent modules the same way -T does for the
+        build in _run_maven_build. Pass "1" to disable (single-threaded,
+        matching the old behaviour). Reuses the same --build-threads value
+        as the build step so there's one consistent knob for the whole run.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
@@ -1093,13 +1104,16 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
     cwd = os.path.dirname(root_pom)
     tree_env = _build_subprocess_env(java_home)
 
+    build_threads = (build_threads or "").strip()
+    thread_flags = ["-T", build_threads] if build_threads and build_threads != "1" else []
+
     def _run(extra_flags: list, t: int) -> str:
         # NOTE: Do NOT use CREATE_NEW_PROCESS_GROUP on Windows — it breaks
         # Maven's stdout pipe, causing communicate() to hang indefinitely.
         # Instead, kill the process tree by PID on timeout.
         try:
             proc = subprocess.Popen(
-                [mvn_exe, "dependency:tree"] + extra_flags + ["-f", root_pom],
+                [mvn_exe, "dependency:tree"] + extra_flags + thread_flags + ["-f", root_pom],
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -1122,7 +1136,7 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
             return ""
 
     # Try offline first (uses .m2 cache — fast, ~seconds)
-    print(f"  {C.GRAY}[TRANSITIVE] Trying offline (.m2 cache) ...{C.RESET}", flush=True)
+    print(f"  {C.GRAY}[TRANSITIVE] Trying offline (.m2 cache){' -T ' + build_threads if thread_flags else ''} ...{C.RESET}", flush=True)
     output = _run(["-o", "--no-transfer-progress"], 60)
 
     if not output:
@@ -1634,11 +1648,14 @@ def main():
     if mvn_exe:
         print()
         section("PHASE 1b -- TRANSITIVE DEPS (mvn dependency:tree)")
-        print(f"  {C.GRAY}Running mvn dependency:tree on root pom (this may take a minute) ...{C.RESET}",
+        _tree_thread_note = f" -T {args.build_threads}" if args.build_threads not in ("", "1") else ""
+        print(f"  {C.GRAY}Running mvn dependency:tree on root pom{_tree_thread_note} "
+              f"(this may take a minute) ...{C.RESET}",
               flush=True)
         t_pool = time.time()
         transitive_pool = collect_transitive_pool(
-            os.path.abspath(args.project_path), args.mvn, timeout=300, java_home=java_home
+            os.path.abspath(args.project_path), args.mvn, timeout=300, java_home=java_home,
+            build_threads=args.build_threads,
         )
         elapsed_pool = time.time() - t_pool
         if transitive_pool:
