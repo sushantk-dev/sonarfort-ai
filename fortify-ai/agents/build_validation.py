@@ -43,6 +43,8 @@ Console output (done-when):
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import time
@@ -52,14 +54,81 @@ from loguru import logger
 
 from state import AgentState, BuildValidationResult, PipelineCancelledError
 
-try:  # flat layout (adr_fix.py / adr_fortify.py at repo root, next to state.py)
+try:  # flat layout (adr_fix.py at repo root, next to state.py)
     from adr_fix import _extract_maven_error
-    from adr_fortify import _resolve_java_home, _build_subprocess_env
 except ImportError:  # package layout
     from agents.adr_fix import _extract_maven_error  # type: ignore
-    from agents.adr_fortify import _resolve_java_home, _build_subprocess_env  # type: ignore
+
+# NOTE: deliberately does NOT import from adr_fortify.py. adr_path (and
+# therefore wherever adr_fortify.py actually lives) is a runtime-configured,
+# arbitrary filesystem path — see FortifyAIConfig.adr_path in config.py — the
+# same category as japicmp_jar_path. adr_fix.py only ever invokes it via
+# `subprocess.Popen([sys.executable, adr_path, ...])`, never as an importable
+# module, precisely because it isn't guaranteed to be co-located with this
+# package or even be the same script (different checkout, different version,
+# a compiled/bundled tool, etc.). The JDK-registry resolution below is
+# therefore duplicated in full (not imported) so this module stays correct
+# regardless of what adr_path points at — see adr_fortify.py's
+# _load_jdk_registry / _resolve_java_home / _build_subprocess_env for the
+# canonical version this must stay behaviourally identical to.
 
 _BUILD_TIMEOUT_SECONDS = 600
+
+
+# ── JDK resolution (duplicated from adr_fortify.py — see note above) ───────────
+
+def _load_jdk_registry() -> dict:
+    """
+    Load a {major_version: java_home_path} map from the FORTIFYAI_JDK_REGISTRY
+    env var (a JSON object), e.g.:
+        FORTIFYAI_JDK_REGISTRY='{"8":"/opt/jdks/jdk8","17":"/opt/jdks/jdk17"}'
+    Returns {} if the env var is unset or not valid JSON.
+    """
+    raw = os.environ.get("FORTIFYAI_JDK_REGISTRY", "").strip()
+    if not raw:
+        return {}
+    try:
+        registry = json.loads(raw)
+        if isinstance(registry, dict):
+            return {str(k): str(v) for k, v in registry.items()}
+    except (ValueError, TypeError):
+        pass
+    logger.warning("[Build Validation] FORTIFYAI_JDK_REGISTRY is set but not valid JSON — ignoring.")
+    return {}
+
+
+def _resolve_java_home(explicit_java_home: str, required_jdk: str) -> str:
+    """
+    Priority: explicit java_home wins; else required_jdk looked up in
+    FORTIFYAI_JDK_REGISTRY; else "" (inherit whatever JDK is on PATH).
+    """
+    if explicit_java_home:
+        return explicit_java_home
+    if required_jdk:
+        registry = _load_jdk_registry()
+        match = registry.get(str(required_jdk))
+        if match:
+            return match
+        logger.warning(
+            f"[Build Validation] Project requires JDK {required_jdk} but no matching "
+            f"entry found in FORTIFYAI_JDK_REGISTRY — using the JDK already on PATH."
+        )
+    return ""
+
+
+def _build_subprocess_env(java_home: str) -> Optional[dict]:
+    """
+    Env dict pointing JAVA_HOME/PATH at a specific JDK, without discarding
+    the rest of the inherited environment. None (inherit unchanged) when
+    java_home is empty.
+    """
+    if not java_home:
+        return None
+    java_home = os.path.abspath(java_home)
+    env = os.environ.copy()
+    env["JAVA_HOME"] = java_home
+    env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
+    return env
 
 
 # ── git helpers ────────────────────────────────────────────────────────────────
