@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import subprocess
+import threading
 import time
 from typing import Callable, Optional
 
@@ -73,6 +75,12 @@ except ImportError:  # package layout
 # canonical version this must stay behaviourally identical to.
 
 _BUILD_TIMEOUT_SECONDS = 600
+
+# How often the streaming loop checks cancel_check() / the overall timeout
+# while waiting for mvn's stdout, and how long a SIGTERM'd mvn subprocess
+# gets before we escalate to SIGKILL — mirrors adr_fix.py's invoke_adr().
+_CANCEL_POLL_SECONDS = 0.5
+_CANCEL_GRACE_SECONDS = 10.0
 
 
 # ── JDK resolution (duplicated from adr_fortify.py — see note above) ───────────
@@ -176,12 +184,28 @@ def _run_maven_build(
     skip_tests: bool = True,
     java_home: str = "",
     build_threads: str = "1C",
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[bool, int, str, str]:
     """
     Returns (success, duration_seconds, stdout, stderr).
     java_home resolution (required_jdk → FORTIFYAI_JDK_REGISTRY → PATH) is
     the caller's job — see build_validation_node, which mirrors exactly how
     adr_fortify.py resolves it internally via _resolve_java_home.
+
+    Streams Maven's output line-by-line via logger.info as it runs — a
+    subprocess.run(capture_output=True) call here would silently buffer the
+    entire build until it exits (no progress visible, and even then nothing
+    gets printed unless the caller explicitly logs the returned text), which
+    is exactly the "no console output" regression this replaced: the build
+    used to be visible because adr_fortify.py's own _run_maven_build printed
+    every line live. This restores that behaviour instead of just capturing
+    text for post-hoc error extraction.
+
+    cancel_check (optional): checked every _CANCEL_POLL_SECONDS while
+    streaming. On a positive check the subprocess is SIGTERM'd, given
+    _CANCEL_GRACE_SECONDS to exit, then SIGKILL'd, and
+    PipelineCancelledError is raised — same pattern as adr_fix.py's
+    invoke_adr().
     """
     exe = _find_mvn(mvn_exe)
     cmd = [exe, "clean", "install", "--no-transfer-progress"]
@@ -194,22 +218,91 @@ def _run_maven_build(
 
     logger.info(f"[Build Validation] Running {' '.join(cmd)} ...")
     t0 = time.time()
+    proc = None
+    output_lines: list[str] = []
     try:
-        result = subprocess.run(
-            cmd, cwd=project_path, capture_output=True, text=True,
-            env=env, timeout=_BUILD_TIMEOUT_SECONDS,
+        proc = subprocess.Popen(
+            cmd, cwd=project_path, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
+
+        line_queue: "queue.Queue[bytes | None]" = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                for raw in iter(proc.stdout.readline, b""):
+                    line_queue.put(raw)
+            finally:
+                line_queue.put(None)  # EOF sentinel
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        cancelled = False
+        timed_out = False
+        while True:
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
+            if time.time() - t0 > _BUILD_TIMEOUT_SECONDS:
+                timed_out = True
+                break
+            try:
+                raw = line_queue.get(timeout=_CANCEL_POLL_SECONDS)
+            except queue.Empty:
+                continue
+            if raw is None:   # EOF — subprocess closed stdout
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            output_lines.append(line)
+            logger.info(f"[Build Validation]   {line}")   # streams live, matches adr_fortify.py's visibility
+
+        if timed_out:
+            logger.error(f"[Build Validation] Build timed out after {_BUILD_TIMEOUT_SECONDS}s — killing mvn")
+            proc.terminate()
+            try:
+                proc.wait(timeout=_CANCEL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            duration = int(time.time() - t0)
+            return False, duration, "\n".join(output_lines), f"Timed out after {_BUILD_TIMEOUT_SECONDS}s"
+
+        if cancelled:
+            logger.warning(
+                f"[Build Validation] Cancellation requested — terminating mvn "
+                f"subprocess (pid={proc.pid})"
+            )
+            proc.terminate()
+            try:
+                proc.wait(timeout=_CANCEL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    f"[Build Validation] mvn subprocess (pid={proc.pid}) did not "
+                    f"exit within {_CANCEL_GRACE_SECONDS}s of SIGTERM — sending SIGKILL"
+                )
+                proc.kill()
+                proc.wait()
+            raise PipelineCancelledError(
+                f"Cancelled by user while the Maven build was in progress "
+                f"(pid={proc.pid}); partial output captured for the audit log."
+            )
+
+        proc.wait()   # reader hit EOF, so this returns immediately
         duration = int(time.time() - t0)
-        return result.returncode == 0, duration, result.stdout, result.stderr
-    except subprocess.TimeoutExpired as exc:
-        duration = int(time.time() - t0)
-        logger.error(f"[Build Validation] Build timed out after {_BUILD_TIMEOUT_SECONDS}s")
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        return False, duration, stdout, f"Timed out after {_BUILD_TIMEOUT_SECONDS}s"
+        combined = "\n".join(output_lines)
+        return proc.returncode == 0, duration, combined, ""
+
+    except PipelineCancelledError:
+        raise
     except FileNotFoundError:
         duration = int(time.time() - t0)
         logger.error(f"[Build Validation] Maven executable not found ({exe})")
         return False, duration, "", f"Maven executable not found: {exe}"
+    except Exception as exc:
+        duration = int(time.time() - t0)
+        logger.error(f"[Build Validation] Error running maven: {exc}")
+        return False, duration, "\n".join(output_lines), str(exc)
 
 
 # ── Per-group validation ──────────────────────────────────────────────────────
@@ -265,6 +358,7 @@ def validate_one(
     success, duration, stdout, stderr = _run_maven_build(
         project_path, mvn_exe=mvn_exe, skip_tests=skip_tests,
         java_home=resolved_java_home, build_threads=build_threads,
+        cancel_check=cancel_check,
     )
 
     if success:
