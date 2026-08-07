@@ -27,8 +27,9 @@ Key design
   the same reason). If a run later fails or is cancelled, ``POST
   /pipeline/resume/{pipeline_id}`` reads this checkpoint and re-enters
   ``_run_full_pipeline`` partway through instead of from stage 1 — stages
-  with side effects (adr-fix, pr-agent) are not redone once their output is
-  checkpointed. Cleared automatically once the job completes successfully.
+  with side effects (adr-fix, build-validation, pr-agent) are not redone
+  once their output is checkpointed. Cleared automatically once the job
+  completes successfully.
 - ``started_at`` is mirrored into custom blob metadata so ``list_jobs`` can
   sort newest-first from the listing alone, without downloading every doc.
 - Read-modify-write updates use GCS generation preconditions
@@ -71,7 +72,7 @@ _PURGE_EVERY  = 600        # lazy purge at most once per 10 min per process
 
 ALL_STAGE_NAMES = [
     "triage", "version-resolver", "context", "api-diff",
-    "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback",
+    "ai-reasoning", "adr-fix", "build-validation", "pr-agent", "fortify-writeback",
 ]
 
 

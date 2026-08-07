@@ -743,6 +743,10 @@ def _prepare_git_branch(repo_root: str, jira_id: str, base_branch_override: str 
     else:
         print(f"{C.GREEN}[GIT] Created branch {branch} from {base_branch}{C.RESET}")
 
+    # Machine-readable line for callers (e.g. FortifyAI's adr_fix/build_validation
+    # nodes) that need the base branch to roll back a feature branch on build failure.
+    print(f"ADR_BRANCH_INFO:{json.dumps({'branch': branch, 'base_branch': base_branch})}")
+
     return branch, base_branch
 
 
@@ -1449,6 +1453,8 @@ def main():
             "  --commit FORTIFY_ID       Apply fixes + maven build + git branch/commit\n\n"
             "Options:\n"
             "  --push                    Push the created branch after committing (requires --commit)\n"
+            "  --skip-build              Skip 'mvn clean install' verification (requires --commit; "
+            "incompatible with --push — see build_validation node)\n"
             "  --base-branch BRANCH      Base branch to checkout from before creating the feature branch\n"
             "                            (auto-detected from remote HEAD if not provided)\n"
             "  --mvn PATH                Path to mvn executable (auto-detected if not provided)\n"
@@ -1495,6 +1501,11 @@ def main():
     mode_group.add_argument("--commit", metavar="FORTIFY_ID",
                             help="Apply fixes + maven build + git branch/commit, e.g. --commit FORTIFY-a4105c54")
 
+    parser.add_argument("--skip-build", action="store_true", dest="skip_build",
+                            help="Skip the internal 'mvn clean install' verification step (--commit only). "
+                                 "Fixes are applied and committed WITHOUT build validation or push — the "
+                                 "caller (FortifyAI's build_validation node) is responsible for running the "
+                                 "build itself, then pushing on success or rolling the branch back on failure.")
     parser.add_argument("--push",    action="store_true",
                         help="Push the created branch after committing (requires --commit)")
     parser.add_argument("--base-branch", default="", metavar="BRANCH",
@@ -1599,6 +1610,15 @@ def main():
     # Derive convenience aliases matching old names used throughout main()
     args.analyze_only = args.scan
     args.jira_id      = args.commit or ""
+
+    if args.skip_build and not args.commit:
+        print(f"{C.RED}[ERROR] --skip-build requires --commit.{C.RESET}")
+        sys.exit(1)
+    if args.skip_build and args.push:
+        print(f"{C.RED}[ERROR] --skip-build and --push are mutually exclusive — "
+              f"pushing before the build is validated would publish an unverified branch. "
+              f"Run the build separately (e.g. build_validation node) before pushing.{C.RESET}")
+        sys.exit(1)
 
     # Resolve pom.xml files to process
     pom_files = _discover_pom_files(args.project_path)
@@ -2024,7 +2044,10 @@ def main():
     # ─   Maven build verification (before any git commit) ─────────────────────
     maven_ok = None
     maven_duration = 0.0
-    if not args.analyze_only and all_applied:
+    if args.skip_build:
+        print()
+        print(f"  {C.GRAY}[BUILD] --skip-build set — deferring 'mvn clean install' to the caller.{C.RESET}")
+    elif not args.analyze_only and all_applied:
         project_root = (
             os.path.abspath(args.project_path)
             if os.path.isdir(args.project_path)

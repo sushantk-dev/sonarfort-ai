@@ -49,7 +49,8 @@ export class PipelineComponent {
   // ── Pipeline step labels ──────────────────────────────────────────────────
   readonly FORTIFY_STEPS = [
     'Triage', 'Version Resolver', 'Context', 'API Diff',
-    'AI Reasoning', 'Dependency Fix', 'AI Code Fix', 'PR Agent', 'Fortify Writeback',
+    'AI Reasoning', 'Dependency Fix', 'Build Validation', 'AI Code Fix',
+    'PR Agent', 'Fortify Writeback',
   ];
 
   readonly SONAR_STEPS = [

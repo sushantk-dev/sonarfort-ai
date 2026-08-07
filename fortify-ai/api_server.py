@@ -17,7 +17,7 @@ Execution Modes:
     GET  /pipeline/status/{pipeline_id}               — overall pipeline status + all stage statuses
     GET  /pipeline/status/{pipeline_id}/{stage_name}  — status of a single stage
          stage_name: triage | version-resolver | context | api-diff |
-                     ai-reasoning | adr-fix | pr-agent | fortify-writeback
+                     ai-reasoning | adr-fix | build-validation | pr-agent | fortify-writeback
     POST /pipeline/cancel/{pipeline_id}   — cooperative cancellation at the next stage boundary
     POST /pipeline/resume/{pipeline_id}   — resume an interrupted/failed/cancelled run from its
                                              last checkpointed stage (full-pipeline runs only).
@@ -52,7 +52,8 @@ Execution Modes:
     POST /stages/context           — Stage 3: locate dep in codebase
     POST /stages/api-diff          — Stage 4: run japicmp API diff
     POST /stages/ai-reasoning      — Stage 5: AI safety verdict
-    POST /stages/adr-fix           — Stage 6: invoke adr.py --commit --push
+    POST /stages/adr-fix           — Stage 6:  invoke adr.py --commit --skip-build (commit only)
+    POST /stages/build-validation  — Stage 6b: mvn clean install → push on success / rollback on failure
     POST /stages/ai-code-fix       — Stage 7: AI patch for broken call sites
     POST /stages/pr-agent          — Stage 8: create GitHub PR
     POST /stages/fortify-writeback — Stage 9: post outcome comment to SSC
@@ -64,6 +65,7 @@ Execution Modes:
     POST /pipeline/until/api-diff
     POST /pipeline/until/ai-reasoning
     POST /pipeline/until/adr-fix
+    POST /pipeline/until/build-validation
     POST /pipeline/until/pr-agent
 
   UTILITY
@@ -516,6 +518,16 @@ class AdrFixRequest(BaseModel):
     release_id: int = Field(default=0, description="Fortify release ID — used in branch name (feature/fortify-fix-{releaseId}-{randId})")
 
 
+class BuildValidationRequest(BaseModel):
+    adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix (commit-only — build not yet run)")
+    project_path: str = Field(..., description="Absolute path to Maven project root")
+    required_jdk: Optional[str] = Field(default=None, description="Java major version, e.g. '17' — looked up in FORTIFYAI_JDK_REGISTRY; falls back to PATH")
+    mvn_exe: str = Field(default="", description="Explicit mvn executable path; empty = auto-detect on PATH")
+    java_home: str = Field(default="", description="Explicit JAVA_HOME override; always wins over required_jdk")
+    skip_tests: bool = Field(default=True)
+    build_threads: str = Field(default="1C")
+
+
 class AiCodeFixRequest(BaseModel):
     groups: list[dict] = Field(..., description="Groups that failed build — need AI patching")
     project_path: str = Field(..., description="Absolute path to Maven project root")
@@ -525,7 +537,7 @@ class AiCodeFixRequest(BaseModel):
 
 class PrAgentRequest(BaseModel):
     groups: list[dict] = Field(..., description="Reasoned groups")
-    adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix")
+    adr_results: list[dict] = Field(..., description="Results from /stages/build-validation (build-validated — only pushed branches should be passed here; passing raw /stages/adr-fix output would open PRs for unbuilt commits)")
     release_id: int = Field(..., description="Fortify release ID (used in PR body)")
     github_token: str = Field(..., description="GitHub personal access token")
     github_repo: str = Field(..., description="GitHub repo in owner/repo format")
@@ -534,7 +546,7 @@ class PrAgentRequest(BaseModel):
 
 class FortifyWritebackRequest(BaseModel):
     groups: list[dict] = Field(..., description="Reasoned groups")
-    adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix")
+    adr_results: list[dict] = Field(..., description="Results from /stages/build-validation (or /stages/adr-fix merged with it)")
     pr_results: list[dict] = Field(default_factory=list)
     output_dir: str = Field(default="")  # empty = read ADR_OUTPUT_DIR from the environment at runtime
 
@@ -766,12 +778,12 @@ def _run_full_pipeline(
     POST /pipeline/resume/{pipeline_id}), stages already present in the
     checkpoint are skipped entirely and their persisted output is reused
     instead of recomputed. This is what makes resuming safe for
-    side-effecting stages: adr-fix (git commit/push) and pr-agent (opens a
-    GitHub PR) are NOT re-run once checkpointed — only stages after the
-    checkpoint's resume_stage actually execute. pr-agent additionally
-    guards against duplicate PRs via branch-name lookup (see
-    pr_agent._find_existing_pr) in case a checkpoint boundary is ever
-    re-crossed.
+    side-effecting stages: adr-fix (git commit only), build-validation
+    (mvn build + push-or-rollback), and pr-agent (opens a GitHub PR) are NOT
+    re-run once checkpointed — only stages after the checkpoint's
+    resume_stage actually execute. pr-agent additionally guards against
+    duplicate PRs via branch-name lookup (see pr_agent._find_existing_pr) in
+    case a checkpoint boundary is ever re-crossed.
     """
     if pipeline_id:
         token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
@@ -783,6 +795,7 @@ def _run_full_pipeline(
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
     from agents.adr_fix import run_adr_fix
+    from agents.build_validation import validate_one
     from agents.pr_agent import create_prs_for_all_groups
     from agents.fortify_writeback import run_all_reports
     from state import AdrResult
@@ -854,10 +867,11 @@ def _run_full_pipeline(
     # fortifyai.py's CLI entry point so the two don't drift with separate
     # copies of this logic.
     #
-    # Skipped on a resume where adr-fix is already checkpointed — that stage
-    # won't run again for this call, so warming the cache would be wasted work.
+    # Skipped on a resume where build-validation is already checkpointed —
+    # that stage (and the mvn build it runs) won't run again for this call,
+    # so warming the cache would be wasted work.
     maven_warmup_thread = None
-    if not _already_done("adr-fix"):
+    if not _already_done("build-validation"):
         maven_warmup_thread = start_maven_warmup(str(project_path))
 
     # Stage 1 — triage
@@ -875,7 +889,7 @@ def _run_full_pipeline(
                 "total_skipped": triage_skipped,
             })
             for s in ["version-resolver", "context", "api-diff",
-                      "ai-reasoning", "adr-fix", "pr-agent", "fortify-writeback"]:
+                      "ai-reasoning", "adr-fix", "build-validation", "pr-agent", "fortify-writeback"]:
                 _stage_skip(s)
             return {"status": "skipped", "reason": "No actionable findings"}
         _stage_done("triage", t, {
@@ -976,8 +990,8 @@ def _run_full_pipeline(
         })
         _checkpoint("adr-fix", reasoned=reasoned)
 
-    # Stage 6 — adr fix (side-effecting: commits + pushes — never re-run once checkpointed)
-    log_warmup_status(maven_warmup_thread)
+    # Stage 6 — adr fix (side-effecting: commits ONLY — no build, no push.
+    # Never re-run once checkpointed.)
     if _already_done("adr-fix"):
         adr_results = acc["adr_results"]
     else:
@@ -986,14 +1000,14 @@ def _run_full_pipeline(
         adr_results: list[dict] = []
         try:
             for group in reasoned:
-                _check_cancelled(pipeline_id)  # stop before pushing the next commit
+                _check_cancelled(pipeline_id)  # stop before committing the next group
                 artifact_id = group["parsed"]["artifact_id"]
                 if group.get("next_node") == "escalate":
                     adr_results.append({
                         "artifact_id": artifact_id,
                         "result": AdrResult(
-                            success=False, branch_name=None, commit_hash=None,
-                            build_time_seconds=None, pdf_path=None,
+                            success=False, branch_name=None, base_branch=None,
+                            commit_hash=None, build_time_seconds=None, pdf_path=None,
                             error_reason=_escalation_reason(group),
                         ),
                     })
@@ -1002,8 +1016,8 @@ def _run_full_pipeline(
                     adr_results.append({
                         "artifact_id": artifact_id,
                         "result": AdrResult(
-                            success=False, branch_name=None, commit_hash=None,
-                            build_time_seconds=None, pdf_path=None,
+                            success=False, branch_name=None, base_branch=None,
+                            commit_hash=None, build_time_seconds=None, pdf_path=None,
                             error_reason="dry_run=True — ADR not invoked" if dry_run else "ADR_PATH not configured",
                         ),
                     })
@@ -1019,12 +1033,53 @@ def _run_full_pipeline(
                     adr_results.append({"artifact_id": artifact_id, "result": result})
         except PipelineCancelledError:
             # Raised either between groups (_check_cancelled) or from inside
-            # run_adr_fix if cancellation landed mid-build/mid-push — either
-            # way the subprocess has already been terminated by this point.
+            # run_adr_fix if cancellation landed mid-commit — either way the
+            # subprocess has already been terminated by this point.
             _stage_fail("adr-fix", t, "Cancelled by user")
             raise
         _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-        _stage_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
+        _stage_done("adr-fix", t, {"committed": _adr_ok, "total": len(adr_results)})
+        _checkpoint("build-validation", adr_results=adr_results)
+
+    # Stage 6b — build validation (side-effecting: runs mvn, then pushes on
+    # success or rolls the branch back on failure. Never re-run once checkpointed.)
+    log_warmup_status(maven_warmup_thread)
+    if _already_done("build-validation"):
+        adr_results = acc["adr_results"]  # overwritten below with the merged/build-validated version
+    else:
+        _check_cancelled(pipeline_id)
+        t = _stage_start("build-validation")
+        merged_results: list[dict] = []
+        try:
+            for entry in adr_results:
+                _check_cancelled(pipeline_id)  # stop before pushing the next branch
+                artifact_id = entry["artifact_id"]
+                adr_result = entry["result"]
+                if not adr_result.get("success"):
+                    # Nothing was committed for this group — nothing to build.
+                    merged_results.append({"artifact_id": artifact_id, "result": {
+                        **adr_result, "build_time_seconds": None,
+                    }})
+                    continue
+                bv_result = validate_one(
+                    artifact_id, adr_result, str(project_path),
+                    required_jdk=required_jdk, cancel_check=cancel_check,
+                )
+                merged_results.append({"artifact_id": artifact_id, "result": {
+                    **adr_result,
+                    "success": bv_result["success"],
+                    "branch_name": bv_result["branch_name"],
+                    "build_time_seconds": bv_result["build_time_seconds"],
+                    "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+                }})
+        except PipelineCancelledError:
+            # Mid-build or mid-push termination — see validate_one's docstring;
+            # treat state as unknown, not a clean rollback.
+            _stage_fail("build-validation", t, "Cancelled by user")
+            raise
+        adr_results = merged_results
+        _bv_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+        _stage_done("build-validation", t, {"pushed": _bv_ok, "total": len(adr_results)})
         _checkpoint("pr-agent", adr_results=adr_results)
 
     # Stage 7 — pr agent (side-effecting: opens PRs — idempotent via branch-name lookup)
@@ -1483,7 +1538,7 @@ async def pipeline_live(req: LivePipelineRequest):
     to track progress stage-by-stage.
 
     Stages: triage → version-resolver → context → api-diff →
-            ai-reasoning → adr-fix → pr-agent → fortify-writeback
+            ai-reasoning → adr-fix → build-validation → pr-agent → fortify-writeback
     """
     job = _new_job()
     pid = job["pipeline_id"]
@@ -1555,7 +1610,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
     to track progress stage-by-stage.
 
     Stages: triage → version-resolver → context → api-diff →
-            ai-reasoning → adr-fix → pr-agent → fortify-writeback
+            ai-reasoning → adr-fix → build-validation → pr-agent → fortify-writeback
     """
     job = _new_job()
     pid = job["pipeline_id"]
@@ -1632,7 +1687,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
         python fortifyai.py --app-name <app_name> --repo <owner/repo>
 
     Stages: (name→app_id→release_id) → triage → version-resolver → context → api-diff →
-            ai-reasoning → adr-fix → pr-agent → fortify-writeback
+            ai-reasoning → adr-fix → build-validation → pr-agent → fortify-writeback
     """
     job = _new_job()
     pid = job["pipeline_id"]
@@ -1708,7 +1763,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
     Resolves `app_id → latest release_id` then runs the full pipeline.
 
     Stages: (release lookup) → triage → version-resolver → context → api-diff →
-            ai-reasoning → adr-fix → pr-agent → fortify-writeback
+            ai-reasoning → adr-fix → build-validation → pr-agent → fortify-writeback
     """
     job = _new_job()
     pid = job["pipeline_id"]
@@ -1774,9 +1829,10 @@ async def pipeline_dry_run(req: DryRunRequest):
     Returns a *pipeline_id* immediately. Poll **GET /pipeline/status/{pipeline_id}**
     to track progress stage-by-stage.
 
-    ADR (git commit/push), PR creation, and Fortify writeback are **skipped**.
-    Everything up to and including AI reasoning runs normally.
-    Useful for previewing what the pipeline would do.
+    ADR fix (git commit), build validation (mvn build + push), PR creation,
+    and Fortify writeback are **skipped**. Everything up to and including
+    AI reasoning runs normally. Useful for previewing what the pipeline
+    would do.
     """
     job = _new_job()
     pid = job["pipeline_id"]
@@ -1929,7 +1985,7 @@ def pipeline_stage_status(pipeline_id: str, stage_name: str):
 
     Valid `stage_name` values:
     `triage` · `version-resolver` · `context` · `api-diff` ·
-    `ai-reasoning` · `adr-fix` · `pr-agent` · `fortify-writeback`
+    `ai-reasoning` · `adr-fix` · `build-validation` · `pr-agent` · `fortify-writeback`
 
     Returns the same stage object as the full `/pipeline/status/{pipeline_id}` response
     but scoped to the requested stage only.
@@ -1957,7 +2013,8 @@ def cancel_pipeline(pipeline_id: str):
     (see `_check_cancelled` calls in `_run_full_pipeline` / `_run_until`).
     Work already executing inside the current stage's thread-pool call is
     NOT interrupted — cancellation takes effect at the next stage boundary
-    (and, for the `adr-fix` stage, between each dependency in the loop),
+    (and, for the `adr-fix` / `build-validation` stages, between each
+    dependency in the loop),
     which is what stops further side-effects like PR creation or Fortify
     writeback from firing after the user cancels.
 
@@ -2063,8 +2120,8 @@ def delete_pipeline_run(pipeline_id: str):
 
 # Resume is only supported for interruptions at or before this stage.
 # ai-reasoning is the last stage with no side effects — every stage after it
-# (adr-fix: git commit/push, pr-agent: opens a PR) writes to the outside
-# world. adr-fix in particular has no idempotence guard for a *partial*
+# (adr-fix: git commit, build-validation: mvn build + push/rollback,
+# pr-agent: opens a PR) writes to the outside world. adr-fix in particular has no idempotence guard for a *partial*
 # rerun the way pr-agent does (_find_existing_pr, keyed by branch name):
 # adr-fix mints a brand-new random branch name on every call and resume
 # re-clones the default branch (not whatever feature branch a prior
@@ -2304,9 +2361,10 @@ async def resume_pipeline(pipeline_id: str):
       - the checkpoint's next stage (`resume_stage`) to be at or before
         ai-reasoning ("AI Reasoning") — see `_RESUME_MAX_STAGE`. If
         ai-reasoning already completed (resume_stage is 'adr-fix',
-        'pr-agent', or 'fortify-writeback'), this returns 400: resume isn't
-        offered once the pipeline has reached a side-effecting stage
-        (adr-fix commits+pushes; pr-agent opens a PR). Whichever stage the
+        'build-validation', 'pr-agent', or 'fortify-writeback'), this
+        returns 400: resume isn't offered once the pipeline has reached a
+        side-effecting stage (adr-fix commits; build-validation builds +
+        pushes/rolls back; pr-agent opens a PR). Whichever stage the
         job was actually interrupted at — including ai-reasoning itself, if
         cancellation landed mid-stage — is re-run in full, not skipped;
         only stages that fully completed before the interruption are
@@ -2316,8 +2374,8 @@ async def resume_pipeline(pipeline_id: str):
     password, GitHub PAT, Sonar token — stored encrypted, see
     credential_vault.py) are transparently decrypted and reused here.
 
-    Side-effecting stages already checkpointed (adr-fix, pr-agent) are
-    reused as-is and NOT re-run — see `_run_full_pipeline`'s
+    Side-effecting stages already checkpointed (adr-fix, build-validation,
+    pr-agent) are reused as-is and NOT re-run — see `_run_full_pipeline`'s
     `resume_checkpoint` handling and `pr_agent._find_existing_pr` for the
     duplicate-PR guard.
 
@@ -2484,16 +2542,21 @@ def stage_ai_reasoning(req: AiReasoningRequest):
 @app.post("/stages/adr-fix", tags=["Individual Stages"])
 def stage_adr_fix(req: AdrFixRequest):
     """
-    **Stage 6 — ADR Fix**
+    **Stage 6 — ADR Fix (commit only)**
 
-    Invoke `adr.py --commit JIRA_ID --push` for each actionable group.
-    Parses exit code, branch name, commit hash, and PDF path from stdout.
+    Invoke `adr.py --commit JIRA_ID --skip-build` for each actionable group.
+    Applies the pom.xml version edit and creates a local git commit on a
+    fresh feature branch — does NOT run the Maven build and does NOT push.
+    Parses exit code, branch name, base branch, commit hash, and PDF path
+    from stdout. Feed the output to **POST /stages/build-validation** next —
+    that stage owns the actual build, and pushes (or rolls back) the branch.
 
     Input:  groups[]       (from /stages/ai-reasoning)
             adr_path       (absolute path to adr.py)
             project_path   (absolute path to Maven project root)
             jira_prefix    (e.g. "FORTIFY")
-    Output: adr_results[] with success/failure per dependency
+    Output: adr_results[] with success/failure per dependency (success here
+            means "committed", not "build passed")
     """
     t0 = time.time()
     try:
@@ -2507,8 +2570,8 @@ def stage_adr_fix(req: AdrFixRequest):
                 results.append({
                     "artifact_id": artifact_id,
                     "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
+                        success=False, branch_name=None, base_branch=None,
+                        commit_hash=None, build_time_seconds=None, pdf_path=None,
                         error_reason=_escalation_reason(group),
                     ),
                 })
@@ -2520,6 +2583,64 @@ def stage_adr_fix(req: AdrFixRequest):
                 release_id=req.release_id,
             )
             results.append({"artifact_id": artifact_id, "result": result})
+
+        return ok({"adr_results": results}, time.time() - t0)
+    except Exception as exc:
+        return err(str(exc), exc)
+
+
+@app.post("/stages/build-validation", tags=["Individual Stages"])
+def stage_build_validation(req: BuildValidationRequest):
+    """
+    **Stage 6b — Build Validation**
+
+    Runs immediately after /stages/adr-fix. For each committed group: checks
+    out its branch, runs `mvn clean install`, then pushes on success or
+    rolls the branch back (checkout base_branch + delete branch) on failure.
+    Groups where the adr-fix result was already unsuccessful (escalated,
+    dry-run, commit failure, no-op) are passed through unchanged — nothing
+    to build.
+
+    Input:  adr_results[]  (from /stages/adr-fix)
+            project_path   (absolute path to Maven project root)
+            required_jdk   (optional — same FORTIFYAI_JDK_REGISTRY lookup ADR uses internally)
+    Output: adr_results[] — SAME shape as /stages/adr-fix, with success/branch_name/
+            build_time_seconds/error_reason updated to reflect the build+push
+            outcome. Pass this (not the raw /stages/adr-fix output) to
+            /stages/pr-agent.
+    """
+    t0 = time.time()
+    try:
+        from agents.build_validation import validate_one
+
+        results = []
+        for entry in req.adr_results:
+            artifact_id = entry["artifact_id"]
+            adr_result = entry["result"]
+
+            if not adr_result.get("success"):
+                # Nothing was committed for this group — pass the failure through.
+                results.append({"artifact_id": artifact_id, "result": {
+                    **adr_result,
+                    "build_time_seconds": None,
+                }})
+                continue
+
+            bv_result = validate_one(
+                artifact_id, adr_result, req.project_path,
+                mvn_exe=req.mvn_exe, java_home=req.java_home,
+                required_jdk=req.required_jdk,
+                skip_tests=req.skip_tests, build_threads=req.build_threads,
+            )
+            # Merge into the AdrResult shape so downstream /stages/pr-agent and
+            # /stages/fortify-writeback (which expect adr_results[]) need no changes.
+            results.append({"artifact_id": artifact_id, "result": {
+                **adr_result,
+                "success": bv_result["success"],
+                "branch_name": bv_result["branch_name"],
+                "build_time_seconds": bv_result["build_time_seconds"],
+                "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+            }})
 
         return ok({"adr_results": results}, time.time() - t0)
     except Exception as exc:
@@ -2593,7 +2714,8 @@ def stage_pr_agent(req: PrAgentRequest):
     Sets title, body, labels, reviewers, and attaches the ADR PDF report.
 
     Input:  groups[]       (from /stages/ai-reasoning)
-            adr_results[]  (from /stages/adr-fix)
+            adr_results[]  (from /stages/build-validation — NOT raw /stages/adr-fix
+                            output, which doesn't yet reflect whether the build passed)
             release_id
             github_token
             github_repo
@@ -2626,7 +2748,7 @@ def stage_fortify_writeback(req: FortifyWritebackRequest):
     findings that could not be auto-remediated.
 
     Input:  groups[]       (from /stages/ai-reasoning)
-            adr_results[]  (from /stages/adr-fix)
+            adr_results[]  (from /stages/build-validation, or /stages/adr-fix merged with it)
             pr_results[]   (from /stages/pr-agent)
             output_dir     (directory for PDF reports and logs)
     Output: summary with total_fixed / total_escalated / total_failed
@@ -2651,12 +2773,12 @@ def stage_fortify_writeback(req: FortifyWritebackRequest):
 
 StageLabel = Literal[
     "triage", "version-resolver", "context",
-    "api-diff", "ai-reasoning", "adr-fix", "pr-agent",
+    "api-diff", "ai-reasoning", "adr-fix", "build-validation", "pr-agent",
 ]
 
 STAGE_ORDER: list[StageLabel] = [
     "triage", "version-resolver", "context",
-    "api-diff", "ai-reasoning", "adr-fix", "pr-agent",
+    "api-diff", "ai-reasoning", "adr-fix", "build-validation", "pr-agent",
 ]
 
 
@@ -2680,6 +2802,7 @@ def _run_until(
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
     from agents.adr_fix import run_adr_fix
+    from agents.build_validation import validate_one
     from agents.pr_agent import create_prs_for_all_groups
     from state import AdrResult
 
@@ -2797,20 +2920,20 @@ def _run_until(
             _s_skip(s)
         return result
 
-    # Stage 5 — adr fix
+    # Stage 5 — adr fix (commit only — no build, no push; see build-validation below)
     _check_cancelled(pipeline_id)
     t = _s_start("adr-fix")
     adr_results: list[dict] = []
     try:
         for group in reasoned:
-            _check_cancelled(pipeline_id)  # stop before pushing the next commit
+            _check_cancelled(pipeline_id)  # stop before committing the next group
             artifact_id = group["parsed"]["artifact_id"]
             if group.get("next_node") == "escalate" or not cfg.adr_path:
                 adr_results.append({
                     "artifact_id": artifact_id,
                     "result": AdrResult(
-                        success=False, branch_name=None, commit_hash=None,
-                        build_time_seconds=None, pdf_path=None,
+                        success=False, branch_name=None, base_branch=None,
+                        commit_hash=None, build_time_seconds=None, pdf_path=None,
                         error_reason="Escalated or ADR_PATH not set",
                     ),
                 })
@@ -2830,8 +2953,46 @@ def _run_until(
         raise
     _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
     result["adr_results"] = adr_results
-    _s_done("adr-fix", t, {"fixed": _adr_ok, "total": len(adr_results)})
+    _s_done("adr-fix", t, {"committed": _adr_ok, "total": len(adr_results)})
     if idx == 5:
+        for s in STAGE_ORDER[6:]:
+            _s_skip(s)
+        return result
+
+    # Stage 5b — build validation (runs mvn, then pushes on success or rolls
+    # the branch back on failure)
+    _check_cancelled(pipeline_id)
+    t = _s_start("build-validation")
+    merged_results: list[dict] = []
+    try:
+        for entry in adr_results:
+            _check_cancelled(pipeline_id)  # stop before pushing the next branch
+            artifact_id = entry["artifact_id"]
+            adr_result = entry["result"]
+            if not adr_result.get("success"):
+                merged_results.append({"artifact_id": artifact_id, "result": {
+                    **adr_result, "build_time_seconds": None,
+                }})
+                continue
+            bv_result = validate_one(
+                artifact_id, adr_result, str(project_path),
+                cancel_check=cancel_check,
+            )
+            merged_results.append({"artifact_id": artifact_id, "result": {
+                **adr_result,
+                "success": bv_result["success"],
+                "branch_name": bv_result["branch_name"],
+                "build_time_seconds": bv_result["build_time_seconds"],
+                "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+            }})
+    except PipelineCancelledError:
+        _s_fail("build-validation", t, "Cancelled by user")
+        raise
+    adr_results = merged_results
+    _bv_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+    result["adr_results"] = adr_results
+    _s_done("build-validation", t, {"pushed": _bv_ok, "total": len(adr_results)})
+    if idx == 6:
         _s_skip("pr-agent")
         return result
 
@@ -2912,7 +3073,8 @@ for _stage in STAGE_ORDER:
         "context":          "Run up to **Stage 3 — Context**. Returns groups with pom locations and calling files.",
         "api-diff":         "Run up to **Stage 4 — API Diff**. Returns groups with breaking-change analysis.",
         "ai-reasoning":     "Run up to **Stage 5 — AI Reasoning**. Returns groups with safety verdicts. No side-effects.",
-        "adr-fix":          "Run up to **Stage 6 — ADR Fix**. Commits and pushes version bumps to git.",
+        "adr-fix":          "Run up to **Stage 6 — ADR Fix**. Commits version bumps to git (no build, no push — see build-validation).",
+        "build-validation": "Run up to **Stage 6b — Build Validation**. Runs the Maven build; pushes on success, rolls back on failure.",
         "pr-agent":         "Run up to **Stage 7 — PR Agent**. Creates GitHub PRs. No Fortify writeback.",
     }
     app.add_api_route(

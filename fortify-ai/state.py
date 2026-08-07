@@ -71,10 +71,31 @@ class AiReasoningResult(TypedDict):
 
 
 class AdrResult(TypedDict):
+    """
+    Result of the adr_fix node (pom.xml edit + git commit ONLY — as of the
+    Maven-build split, adr_fix no longer runs or verifies the build; that is
+    build_validation_node's job). `success` here means "commit succeeded",
+    not "build passed". `build_time_seconds` is always None coming out of
+    adr_fix — it's populated by BuildValidationResult instead.
+    """
     success: bool
     branch_name: Optional[str]
+    base_branch: Optional[str]        # resolved by ADR (e.g. "main") — needed to roll back on build failure
     commit_hash: Optional[str]
     pdf_path: Optional[str]
+    build_time_seconds: Optional[int]  # always None from adr_fix; see BuildValidationResult
+    error_reason: Optional[str]
+
+
+class BuildValidationResult(TypedDict):
+    """
+    Result of the build_validation node — runs 'mvn clean install' on the
+    branch adr_fix just committed, then either pushes (success) or rolls the
+    branch back to base_branch and deletes it (failure).
+    """
+    success: bool
+    branch_name: Optional[str]
+    pushed: bool
     build_time_seconds: Optional[int]
     error_reason: Optional[str]
 
@@ -120,8 +141,11 @@ class AgentState(TypedDict):
     # ── AI reasoning agent output ─────────────────────────────────────────────
     ai_reasoning: Optional[AiReasoningResult]
 
-    # ── ADR fix agent output ──────────────────────────────────────────────────
+    # ── ADR fix agent output (commit only — no build) ─────────────────────────
     adr_result: Optional[AdrResult]
+
+    # ── Build validation agent output (mvn build + push/rollback) ────────────
+    build_validation_result: Optional[BuildValidationResult]
 
     # ── Retry loop ────────────────────────────────────────────────────────────
     retry_count: int                       # incremented on each ADR failure

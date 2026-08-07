@@ -1,18 +1,22 @@
 """
-FortifyAI — ADR Fix + Build Agent (Iteration 8)
--------------------------------------------------
+FortifyAI — ADR Fix Agent (Iteration 8 — commit only, build split out)
+------------------------------------------------------------------------
 Responsibility:
-  Invoke adr.py with --commit and --push to apply the version fix, run the
-  Maven build, and push the feature branch to origin.
+  Invoke adr.py with --commit and --skip-build to apply the version fix and
+  create a local git commit on a fresh feature branch. Maven build
+  verification and pushing to origin are NOT done here — see
+  agents/build_validation.py (Iteration 8b), which runs immediately after
+  this node in the graph and owns: mvn clean install, push-on-success,
+  rollback-on-failure.
 
   adr_fortify.py invocation:
     python <adr_path> <project_path> \\
         --commit feature/fortify-fix-{releaseId}-{randId} \\
-        --push \\
+        --skip-build \\
         --target-versions '{"groupId:artifactId": {"safe_version": "..."}}'
 
-  Exit 0  → parse branch name, commit hash, PDF path from stdout
-  Non-zero → rollback already done by ADR; capture Maven error log for Iteration 9
+  Exit 0  → parse branch name, base branch, commit hash, PDF path from stdout
+  Non-zero → a commit-step failure (not a build failure — build never ran)
 
   The JIRA/commit ID uses the first 8 chars of the representative_vuln_id from
   the Fortify API — e.g. FORTIFY-a4105c54 — matching the branch naming convention
@@ -20,8 +24,8 @@ Responsibility:
 
 Console output (done-when):
   [ADR Fix] Applying spring-context 5.3.31 → 6.1.20
-  [ADR Fix] ✅ Build passed (87s)
-  [ADR Fix] ✅ Branch: feature/fortify-fix-1697672-c6266fa8
+  [ADR Fix] ✅ Committed (build not yet verified)
+  [ADR Fix] ✅ Branch: feature/fortify-fix-1697672-c6266fa8 (from main)
   [ADR Fix] ✅ Commit: 3f8a21bc
 """
 
@@ -85,6 +89,7 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
     combined = stdout + "\n" + stderr
     result: dict = {
         "branch_name": None,
+        "base_branch": None,     # e.g. "main" — parsed from ADR_BRANCH_INFO, needed for rollback
         "commit_hash": None,
         "pdf_path": None,
         "build_time_seconds": None,
@@ -102,6 +107,19 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
         if line_s.startswith("ADR_MACHINE_RESULT:"):
             try:
                 result["machine_result"] = json.loads(line_s[len("ADR_MACHINE_RESULT:"):])
+            except json.JSONDecodeError:
+                pass
+            continue
+
+        # Branch/base-branch pair, emitted once by adr_fortify.py right after
+        # branch creation. Preferred over the regex branch-name matches below —
+        # this is the only source for base_branch, which build_validation needs
+        # to roll back to on a failed build.
+        if line_s.startswith("ADR_BRANCH_INFO:"):
+            try:
+                info = json.loads(line_s[len("ADR_BRANCH_INFO:"):])
+                result["branch_name"] = info.get("branch") or result["branch_name"]
+                result["base_branch"] = info.get("base_branch")
             except json.JSONDecodeError:
                 pass
             continue
@@ -313,7 +331,12 @@ def invoke_adr(
         clean rollback.
 
     Returns (success: bool, stdout: str, stderr: str).
-    success=True means exit code 0 (build passed, branch pushed).
+    success=True means exit code 0 (pom.xml edited + committed locally).
+    NOTE: as of the Maven-build split, this no longer means the build passed
+    or that anything was pushed — --skip-build is always passed, so ADR
+    commits straight after applying fixes. build_validation_node owns
+    running 'mvn clean install' and, on success, pushing the branch (or on
+    failure, rolling it back). See build_validation.py.
 
     Raises:
         PipelineCancelledError: if cancel_check() reports cancellation while
@@ -324,7 +347,7 @@ def invoke_adr(
         sys.executable, adr_path,
         project_path,
         "--commit", commit_id,
-        "--push",
+        "--skip-build",
     ]
     if target_versions:
         cmd += ["--target-versions", _json.dumps(target_versions)]
@@ -513,6 +536,7 @@ def run_adr_fix(
             return AdrResult(
                 success=False,
                 branch_name=None,
+                base_branch=None,
                 commit_hash=None,
                 pdf_path=parsed_out["pdf_path"],
                 build_time_seconds=None,
@@ -520,13 +544,12 @@ def run_adr_fix(
             )
 
         branch = parsed_out["branch_name"] or branch_name  # use pre-built name as fallback
+        base_branch = parsed_out["base_branch"]
         commit = parsed_out["commit_hash"] or "unknown"
         pdf = parsed_out["pdf_path"]
-        build_time = parsed_out["build_time_seconds"]
 
-        build_time_str = f"{build_time}s" if build_time else "unknown"
-        logger.info(f"[ADR Fix] ✅ Build passed ({build_time_str})")
-        logger.info(f"[ADR Fix] ✅ Branch: {branch}")
+        logger.info(f"[ADR Fix] ✅ Committed (build not yet verified)")
+        logger.info(f"[ADR Fix] ✅ Branch: {branch}" + (f" (from {base_branch})" if base_branch else ""))
         logger.info(f"[ADR Fix] ✅ Commit: {commit}")
         if pdf:
             logger.info(f"[ADR Fix] ✅ PDF: {pdf}")
@@ -534,20 +557,25 @@ def run_adr_fix(
         return AdrResult(
             success=True,
             branch_name=branch,
+            base_branch=base_branch,
             commit_hash=commit,
             pdf_path=pdf,
-            build_time_seconds=build_time,
+            build_time_seconds=None,  # not run here — see build_validation_node
             error_reason=None,
         )
 
     else:
+        # ADR exited non-zero. Since --skip-build means ADR never runs Maven,
+        # this is a commit-step failure (git error, unexpected exception,
+        # backup-restore failure) — not a build failure.
         error_reason = _extract_maven_error(stdout, stderr)
-        logger.error(f"[ADR Fix] ❌ Build failed — ADR rolled back all changes")
+        logger.error(f"[ADR Fix] ❌ Commit step failed — see error below")
         logger.debug(f"[ADR Fix] Error:\n{error_reason[:500]}")
 
         return AdrResult(
             success=False,
             branch_name=None,
+            base_branch=None,
             commit_hash=None,
             pdf_path=None,
             build_time_seconds=None,
@@ -564,14 +592,18 @@ def adr_fix_node(
     jira_prefix: str = "FORTIFY",
 ) -> AgentState:
     """
-    LangGraph node: adr_fix.
+    LangGraph node: adr_fix. Commit-only — does NOT build or push. Always
+    followed unconditionally by build_validation (see graph.py), which runs
+    the actual Maven build and decides push vs. rollback.
 
     Reads:  state["_reasoned_groups"]   (or _diff_groups as fallback)
             state["_cancel_check"]      optional zero-arg callable — see
                                          invoke_adr()'s docstring. Not required;
                                          without it this node behaves as before
-                                         (cancel has no effect mid-build).
+                                         (cancel has no effect mid-commit).
     Writes: state["_adr_results"]       list of AdrResult dicts, one per group
+                                         (success here means "committed", not
+                                         "build passed")
             state["adr_result"]         result of the first group (for routing)
             state["audit_trail"]
 

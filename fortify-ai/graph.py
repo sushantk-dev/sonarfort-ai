@@ -7,7 +7,12 @@ Real logic is wired in subsequent iterations.
 
 Node execution order (happy path):
   triage → version_resolver → context → api_diff
-         → ai_reasoning → adr_fix → pr_agent → fortify_writeback → END
+         → ai_reasoning → adr_fix → build_validation → pr_agent → fortify_writeback → END
+
+  adr_fix (Iteration 8) only edits pom.xml and creates a local git commit
+  (adr_fortify.py invoked with --skip-build). build_validation (Iteration 8b)
+  owns the actual 'mvn clean install' run, pushing the branch on success, and
+  rolling it back (checkout base + delete branch) on failure.
 
 Conditional edges (retry / escalate) are declared as stubs now and will
 be filled in during Iterations 8 & 9.
@@ -26,6 +31,7 @@ from agents.context import context_node
 from agents.api_diff import api_diff_node
 from agents.ai_reasoning import ai_reasoning_node, route_from_reasoning
 from agents.adr_fix import adr_fix_node
+from agents.build_validation import build_validation_node
 from agents.failure_analysis import failure_analysis_node, decide_retry_route
 from agents.ai_code_fix import ai_code_fix_node
 from agents.pr_agent import pr_agent_node
@@ -110,7 +116,8 @@ def ai_reasoning_agent(state: AgentState) -> AgentState:
 
 def adr_fix_agent(state: AgentState) -> AgentState:
     """
-    Iteration 8: Invoke adr.py --commit --push, parse exit code + branch.
+    Iteration 8: Invoke adr.py --commit --skip-build (commit only, no build/push
+    — see build_validation_agent for that), parse exit code + branch.
     Delegates to agents.adr_fix.adr_fix_node.
     """
     adr_path = state.get("_adr_path")          # type: ignore[attr-defined]
@@ -119,6 +126,25 @@ def adr_fix_agent(state: AgentState) -> AgentState:
     if adr_path is None or project_path is None:
         return _stub("AdrFix", state)
     return adr_fix_node(state, adr_path, project_path, jira_prefix)
+
+
+def build_validation_agent(state: AgentState) -> AgentState:
+    """
+    Iteration 8b: Run 'mvn clean install' on the branch adr_fix just committed;
+    push on success, roll back (checkout base, delete branch) on failure.
+    Delegates to agents.build_validation.build_validation_node.
+    """
+    project_path = state.get("_project_path")      # type: ignore[attr-defined]
+    mvn_exe       = state.get("_mvn_exe", "")       # type: ignore[attr-defined]
+    java_home     = state.get("_java_home", "")     # type: ignore[attr-defined] — explicit override, same as adr_fortify --java-home
+    skip_tests    = state.get("_skip_tests", True)  # type: ignore[attr-defined]
+    build_threads = state.get("_build_threads", "1C")  # type: ignore[attr-defined]
+    if project_path is None:
+        return _stub("BuildValidation", state)
+    return build_validation_node(
+        state, project_path, mvn_exe=mvn_exe, java_home=java_home,
+        skip_tests=skip_tests, build_threads=build_threads,
+    )
 
 
 def failure_analysis_agent(state: AgentState) -> AgentState:
@@ -246,15 +272,17 @@ def route_build_result(
     state: AgentState,
 ) -> Literal["pr_agent", "failure_analysis", "escalate"]:
     """
-    Iteration 8: Route based on ADR exit code.
-    Reads state["adr_result"] set by adr_fix_node.
+    Iteration 8b: Route based on the Maven build result.
+    Reads state["build_validation_result"] set by build_validation_node
+    (NOT state["adr_result"] — that only reflects whether the commit
+    succeeded, not whether the build passed, now that build is split out).
     """
-    adr_result = state.get("adr_result")
-    if adr_result is None:
+    build_result = state.get("build_validation_result")
+    if build_result is None:
         return "pr_agent"   # stub fallback
-    if adr_result.get("success"):
+    if build_result.get("success"):
         return "pr_agent"
-    # Build failed — check retry budget
+    # Build failed (or was rolled back) — check retry budget
     retry_count = state.get("retry_count", 0)
     max_retries = state.get("_max_retries", 3)  # type: ignore[attr-defined]
     if retry_count >= max_retries:
@@ -293,6 +321,7 @@ def build_graph() -> StateGraph:
     graph.add_node("api_diff_agent", api_diff_agent)
     graph.add_node("ai_reasoning_agent", ai_reasoning_agent)
     graph.add_node("adr_fix", adr_fix_agent)
+    graph.add_node("build_validation", build_validation_agent)
     graph.add_node("failure_analysis", failure_analysis_agent)
     graph.add_node("ai_code_fix", ai_code_fix_agent)
     graph.add_node("pr_agent", pr_agent)
@@ -342,9 +371,13 @@ def build_graph() -> StateGraph:
     # Pre-patch AI code fix → ADR fix
     graph.add_edge("ai_code_fix", "adr_fix")
 
-    # ADR fix → branch on build result
+    # ADR fix (commit only) → build validation (unconditional — build_validation
+    # itself handles the case where adr_fix didn't actually commit anything)
+    graph.add_edge("adr_fix", "build_validation")
+
+    # Build validation → branch on Maven build result
     graph.add_conditional_edges(
-        "adr_fix",
+        "build_validation",
         route_build_result,
         {
             "pr_agent": "pr_agent",

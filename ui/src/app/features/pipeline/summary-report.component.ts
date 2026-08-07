@@ -105,6 +105,7 @@ const STAGE_LABELS: Record<string, string> = {
   'api-diff':          'API Diff',
   'ai-reasoning':      'AI Reasoning',
   'adr-fix':           'Dependency Fix',
+  'build-validation':  'Build Validation',
   'pr-agent':          'PR Agent',
   'fortify-writeback': 'Fortify Writeback',
 };
@@ -1216,7 +1217,8 @@ export class SummaryReportComponent implements OnInit {
       case 'version-resolver':   return s.next_safe ? `Next safe: ${s.next_safe}` : '';
       case 'api-diff':           return s.has_breaking_changes ? `⚠ ${s.breaking_count} breaking` : '✓ No breaking changes';
       case 'ai-reasoning':       return s.confidence ? `${s.safe ? '✓ Safe' : '⚠ Unsafe'} · ${s.confidence}` : '';
-      case 'adr-fix':            return s.branch_name ?? s.error_reason ?? '';
+      case 'adr-fix':            return s.committed != null ? `Committed: ${s.committed}/${s.total}` : (s.branch_name ?? s.error_reason ?? '');
+      case 'build-validation':   return s.pushed != null ? `Pushed: ${s.pushed}/${s.total}` : (s.branch_name ?? s.error_reason ?? '');
       case 'pr-agent':           return s.pr_url ? `PR opened` : '';
       case 'fortify-writeback':  return s.total_fixed != null ? `Fixed: ${s.total_fixed}, Escalated: ${s.total_escalated ?? 0}` : '';
       default:                   return '';

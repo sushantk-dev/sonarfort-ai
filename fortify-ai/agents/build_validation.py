@@ -1,0 +1,330 @@
+"""
+FortifyAI — Build Validation Agent (Iteration 8b)
+----------------------------------------------------
+Responsibility:
+  Runs immediately after adr_fix in the graph. adr_fix now only edits
+  pom.xml and creates a local git commit on a fresh feature branch
+  (invoked with --skip-build) — this node owns everything that used to be
+  baked into that single ADR subprocess call:
+
+    1. Check out the branch adr_fix just committed.
+    2. Run 'mvn clean install' (skip tests by default, matching ADR's old
+       --skipTests default) directly against project_path, using the same
+       JDK-registry resolution as ADR (required_jdk → FORTIFYAI_JDK_REGISTRY
+       → PATH fallback) so the build runs under the same JDK ADR would have
+       used.
+    3. On success  → push the branch to origin. pr_agent only opens a PR
+       for a group whose build_validation result is a *pushed* branch (this
+       node overwrites state["_adr_results"]/state["adr_result"] in place
+       with the merged outcome, since pr_agent_node downstream still reads
+       those keys — see the "Merge" comment in build_validation_node).
+    4. On failure  → roll the branch back: checkout base_branch, delete the
+       feature branch (git branch -D) so the working tree is clean for the
+       next attempt, and extract the Maven error for failure_analysis.
+
+  Why split this out of adr_fix:
+    - adr_fix and build_validation can now fail independently and are
+      retried independently — a commit failure (e.g. dependency not found
+      in any pom.xml) never needs a Maven build, and a build failure never
+      needs to redo the pom.xml edit if we later want a "rebuild only"
+      retry path.
+    - The Maven build step is reusable for a future smoke-test / retry
+      pass (Tech_Stack.md already documents a second `mvn test -pl
+      <module> -Dtest=<generated_test>` invocation) without touching ADR.
+    - Push no longer happens speculatively before the build is known to
+      pass — nothing unbuildable reaches origin.
+
+Console output (done-when):
+  [Build Validation] Checking out feature/fortify-fix-1697672-c6266fa8
+  [Build Validation] Running mvn clean install -DskipTests ...
+  [Build Validation] ✅ Build passed (87s) — pushing branch
+  [Build Validation] ✅ Pushed feature/fortify-fix-1697672-c6266fa8
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import time
+from typing import Callable, Optional
+
+from loguru import logger
+
+from state import AgentState, BuildValidationResult, PipelineCancelledError
+
+try:  # flat layout (adr_fix.py / adr_fortify.py at repo root, next to state.py)
+    from adr_fix import _extract_maven_error
+    from adr_fortify import _resolve_java_home, _build_subprocess_env
+except ImportError:  # package layout
+    from agents.adr_fix import _extract_maven_error  # type: ignore
+    from agents.adr_fortify import _resolve_java_home, _build_subprocess_env  # type: ignore
+
+_BUILD_TIMEOUT_SECONDS = 600
+
+
+# ── git helpers ────────────────────────────────────────────────────────────────
+
+def _run_git(cmd: list[str], project_path: str, desc: str) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            cmd, cwd=project_path, capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            logger.warning(f"[Build Validation] git {desc} failed: {err}")
+            return False, err
+        return True, ""
+    except Exception as exc:
+        logger.warning(f"[Build Validation] git {desc} raised: {exc}")
+        return False, str(exc)
+
+
+def _rollback_branch(project_path: str, branch_name: str, base_branch: Optional[str]) -> None:
+    """Discard a feature branch whose build failed: checkout base, delete branch."""
+    target = base_branch or "main"
+    ok, _ = _run_git(["git", "checkout", target], project_path, f"checkout {target}")
+    if not ok and target != "master":
+        _run_git(["git", "checkout", "master"], project_path, "checkout master (fallback)")
+    _run_git(["git", "branch", "-D", branch_name], project_path, f"delete {branch_name}")
+    logger.warning(f"[Build Validation] ⚠️  Rolled back — deleted local branch {branch_name}")
+
+
+# ── Maven build ────────────────────────────────────────────────────────────────
+
+def _find_mvn(mvn_exe: str = "") -> str:
+    if mvn_exe:
+        return mvn_exe
+    for candidate in ("mvn", "mvn.cmd"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return "mvn"  # let subprocess raise FileNotFoundError if truly absent
+
+
+def _run_maven_build(
+    project_path: str,
+    mvn_exe: str = "",
+    skip_tests: bool = True,
+    java_home: str = "",
+    build_threads: str = "1C",
+) -> tuple[bool, int, str, str]:
+    """
+    Returns (success, duration_seconds, stdout, stderr).
+    java_home resolution (required_jdk → FORTIFYAI_JDK_REGISTRY → PATH) is
+    the caller's job — see build_validation_node, which mirrors exactly how
+    adr_fortify.py resolves it internally via _resolve_java_home.
+    """
+    exe = _find_mvn(mvn_exe)
+    cmd = [exe, "clean", "install", "--no-transfer-progress"]
+    if build_threads and build_threads != "1":
+        cmd += ["-T", build_threads]
+    if skip_tests:
+        cmd.append("-DskipTests")
+
+    env = _build_subprocess_env(java_home)  # None if java_home == "" → inherit parent env
+
+    logger.info(f"[Build Validation] Running {' '.join(cmd)} ...")
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            cmd, cwd=project_path, capture_output=True, text=True,
+            env=env, timeout=_BUILD_TIMEOUT_SECONDS,
+        )
+        duration = int(time.time() - t0)
+        return result.returncode == 0, duration, result.stdout, result.stderr
+    except subprocess.TimeoutExpired as exc:
+        duration = int(time.time() - t0)
+        logger.error(f"[Build Validation] Build timed out after {_BUILD_TIMEOUT_SECONDS}s")
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        return False, duration, stdout, f"Timed out after {_BUILD_TIMEOUT_SECONDS}s"
+    except FileNotFoundError:
+        duration = int(time.time() - t0)
+        logger.error(f"[Build Validation] Maven executable not found ({exe})")
+        return False, duration, "", f"Maven executable not found: {exe}"
+
+
+# ── Per-group validation ──────────────────────────────────────────────────────
+
+def validate_one(
+    artifact_id: str,
+    adr_result: dict,
+    project_path: str,
+    mvn_exe: str = "",
+    java_home: str = "",
+    required_jdk: Optional[str] = None,
+    skip_tests: bool = True,
+    build_threads: str = "1C",
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> BuildValidationResult:
+    """
+    Build-validate a single committed group. Assumes adr_result["success"]
+    is True and a branch was actually created — callers should pass through
+    a synthetic failed result for groups where adr_fix itself failed,
+    without calling this (there's nothing to build).
+
+    java_home / required_jdk: same semantics as adr_fortify.py's --java-home
+    / --required-jdk — explicit java_home wins, otherwise required_jdk is
+    looked up in FORTIFYAI_JDK_REGISTRY, otherwise inherit PATH. Resolving
+    it the same way here keeps the build under the same JDK ADR would have
+    used for this project.
+    """
+    branch_name = adr_result.get("branch_name")
+    base_branch = adr_result.get("base_branch")
+
+    if cancel_check is not None and cancel_check():
+        raise PipelineCancelledError(
+            f"Cancelled by user before build-validating {artifact_id}"
+        )
+
+    if not branch_name:
+        return BuildValidationResult(
+            success=False, branch_name=None, pushed=False,
+            build_time_seconds=None,
+            error_reason="No branch to validate (adr_fix did not create one).",
+        )
+
+    ok, err = _run_git(["git", "checkout", branch_name], project_path, f"checkout {branch_name}")
+    if not ok:
+        return BuildValidationResult(
+            success=False, branch_name=branch_name, pushed=False,
+            build_time_seconds=None,
+            error_reason=f"Could not check out {branch_name} for build validation: {err}",
+        )
+
+    logger.info(f"[Build Validation] Checking out {branch_name}")
+    resolved_java_home = _resolve_java_home(java_home or "", str(required_jdk) if required_jdk else "")
+    success, duration, stdout, stderr = _run_maven_build(
+        project_path, mvn_exe=mvn_exe, skip_tests=skip_tests,
+        java_home=resolved_java_home, build_threads=build_threads,
+    )
+
+    if success:
+        logger.info(f"[Build Validation] ✅ Build passed ({duration}s) — pushing branch")
+        pushed, push_err = _run_git(
+            ["git", "push", "-u", "origin", branch_name], project_path, "push branch",
+        )
+        if pushed:
+            logger.info(f"[Build Validation] ✅ Pushed {branch_name}")
+        else:
+            logger.error(f"[Build Validation] ❌ Build passed but push failed: {push_err}")
+        return BuildValidationResult(
+            success=pushed,
+            branch_name=branch_name,
+            pushed=pushed,
+            build_time_seconds=duration,
+            error_reason=None if pushed else f"Build passed but push failed: {push_err}",
+        )
+
+    error_reason = _extract_maven_error(stdout, stderr)
+    logger.error(f"[Build Validation] ❌ Build failed ({duration}s) — rolling back")
+    logger.debug(f"[Build Validation] Error:\n{error_reason[:500]}")
+    _rollback_branch(project_path, branch_name, base_branch)
+
+    return BuildValidationResult(
+        success=False,
+        branch_name=None,   # branch was deleted — nothing downstream should reference it
+        pushed=False,
+        build_time_seconds=duration,
+        error_reason=error_reason,
+    )
+
+
+# ── LangGraph node ────────────────────────────────────────────────────────────
+
+def build_validation_node(
+    state: AgentState,
+    project_path: str,
+    mvn_exe: str = "",
+    java_home: str = "",
+    skip_tests: bool = True,
+    build_threads: str = "1C",
+) -> AgentState:
+    """
+    LangGraph node: build_validation. Runs unconditionally after adr_fix.
+
+    Reads:  state["_adr_results"]          list of {"artifact_id", "result": AdrResult}
+            state["_cancel_check"]         optional zero-arg callable
+            state["required_jdk"]          same field adr_fix_node reads — set by
+                                            context_node; forwarded into the JDK
+                                            registry lookup for this build, same as
+                                            ADR would have done internally
+    Writes: state["_build_validation_results"]  list of {"artifact_id", "result": BuildValidationResult}
+            state["build_validation_result"]     result of the first group (for routing)
+            state["last_build_error"]            overwritten with this node's error, if any
+            state["audit_trail"]
+
+    Raises: PipelineCancelledError if cancel_check() reports cancellation.
+    """
+    adr_results: list[dict] = state.get("_adr_results", [])  # type: ignore[attr-defined]
+    cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
+    required_jdk = state.get("required_jdk")  # type: ignore[attr-defined] — set by context_node
+
+    if not adr_results:
+        logger.warning("[Build Validation] No ADR results in state — skipping")
+        state["status"] = "skipped"
+        state["skip_reason"] = "No committed groups to build-validate"
+        state["audit_trail"].append({"node": "build_validation", "status": "skipped"})
+        return state
+
+    bv_results: list[dict] = []
+    for entry in adr_results:
+        artifact_id = entry["artifact_id"]
+        adr_result = entry["result"]
+
+        if not adr_result.get("success"):
+            # adr_fix never committed anything for this group (no-op or commit
+            # failure) — nothing to build. Pass the failure through unchanged
+            # so routing/PR-gating still sees a coherent failed result.
+            bv_result = BuildValidationResult(
+                success=False, branch_name=None, pushed=False,
+                build_time_seconds=None,
+                error_reason=adr_result.get("error_reason") or "adr_fix did not commit — nothing to build",
+            )
+        else:
+            bv_result = validate_one(
+                artifact_id, adr_result, project_path,
+                mvn_exe=mvn_exe, java_home=java_home, required_jdk=required_jdk,
+                skip_tests=skip_tests, build_threads=build_threads,
+                cancel_check=cancel_check,
+            )
+
+        bv_results.append({"artifact_id": artifact_id, "result": bv_result})
+
+    first_result = bv_results[0]["result"] if bv_results else None
+    state["build_validation_result"] = first_result  # type: ignore[typeddict-item]
+    state["_build_validation_results"] = bv_results   # type: ignore[typeddict-unknown-key]
+
+    # Merge the build outcome back into _adr_results / adr_result. pr_agent_node
+    # (downstream in graph.py) reads state["_adr_results"] and gates PR creation
+    # on result["success"] + result["branch_name"] — without this merge it would
+    # still see adr_fix's "commit succeeded" result and try to open a PR against
+    # a branch that build_validation just rolled back and deleted on failure.
+    merged_adr_results: list[dict] = []
+    for adr_entry, bv_entry in zip(adr_results, bv_results):
+        ar = adr_entry["result"]
+        br = bv_entry["result"]
+        merged_adr_results.append({
+            "artifact_id": adr_entry["artifact_id"],
+            "result": {
+                **ar,
+                "success": br["success"],
+                "branch_name": br["branch_name"],  # None if rolled back
+                "build_time_seconds": br["build_time_seconds"],
+                "error_reason": br["error_reason"] or ar.get("error_reason"),
+            },
+        })
+    state["_adr_results"] = merged_adr_results  # type: ignore[typeddict-unknown-key]
+    if merged_adr_results:
+        state["adr_result"] = merged_adr_results[0]["result"]  # type: ignore[typeddict-item]
+
+    state["audit_trail"].append({
+        "node": "build_validation",
+        "status": "ok",
+        "passed": sum(1 for r in bv_results if r["result"]["success"]),
+        "failed": sum(1 for r in bv_results if not r["result"]["success"]),
+    })
+
+    if first_result and not first_result["success"]:
+        state["last_build_error"] = first_result["error_reason"]
+
+    return state

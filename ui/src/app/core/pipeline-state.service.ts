@@ -19,6 +19,7 @@ const FORTIFY_STAGE_LABELS: Record<string, string> = {
   'api-diff':           'API Diff',
   'ai-reasoning':       'AI Reasoning',
   'adr-fix':            'Dependency Fix',
+  'build-validation':   'Build Validation',
   'ai-code-fix':        'AI Code Fix',
   'pr-agent':           'PR Agent',
   'fortify-writeback':  'Fortify Writeback',
@@ -702,7 +703,12 @@ export class PipelineStateService {
         : '✓ No breaking changes';
       case 'ai-reasoning':    return summary.confidence
         ? `${summary.safe ? '✓ Safe' : '⚠ Unsafe'} · confidence: ${summary.confidence}` : '';
-      case 'adr-fix':         return summary.branch_name ? `Branch: ${summary.branch_name}` : summary.error_reason ?? '';
+      case 'adr-fix':         return summary.committed != null
+        ? `Committed: ${summary.committed}/${summary.total}`
+        : (summary.branch_name ? `Branch: ${summary.branch_name}` : summary.error_reason ?? '');
+      case 'build-validation': return summary.pushed != null
+        ? `Pushed: ${summary.pushed}/${summary.total}`
+        : (summary.branch_name ? `Branch: ${summary.branch_name}` : summary.error_reason ?? '');
       case 'pr-agent':        return summary.pr_url ? `PR: ${summary.pr_url}` : '';
       case 'fortify-writeback': return summary.total_fixed != null
         ? `Fixed: ${summary.total_fixed}, Escalated: ${summary.total_escalated ?? 0}` : '';
@@ -1177,11 +1183,11 @@ export class PipelineStateService {
    *  (Sonar runs have no resume endpoint; queued/running runs are already live.)
    *  Resume is only supported up to the AI Reasoning stage — once a job's
    *  checkpoint shows it already progressed past that (resumeStage is
-   *  'adr-fix', 'pr-agent', or 'fortify-writeback'), the backend rejects a
-   *  resume request, so don't offer the button for it. resumeStage being
-   *  unset (not loaded yet, or no checkpoint at all) doesn't hide the
-   *  button — the backend's error message is the real source of truth for
-   *  that case. */
+   *  'adr-fix', 'build-validation', 'pr-agent', or 'fortify-writeback'), the
+   *  backend rejects a resume request, so don't offer the button for it.
+   *  resumeStage being unset (not loaded yet, or no checkpoint at all)
+   *  doesn't hide the button — the backend's error message is the real
+   *  source of truth for that case. */
   canResume(run: UiRun): boolean {
     if (run.source !== 'fortify' || (run.status !== 'error' && run.status !== 'cancelled')) {
       return false;
@@ -1203,9 +1209,10 @@ export class PipelineStateService {
    * RESUME_MAX_STAGE_INDEX above and the matching backend check in
    * api_server.py::_resume_precheck. Once a job's checkpoint shows it's
    * already past that (adr-fix or later), the backend rejects the request:
-   * those stages have side effects (adr-fix commits+pushes, pr-agent opens
-   * a PR) that resume doesn't safely re-enter mid-way, so a job that got
-   * that far is expected to start over as a fresh run instead.
+   * those stages have side effects (adr-fix commits, build-validation
+   * builds+pushes/rolls back, pr-agent opens a PR) that resume doesn't
+   * safely re-enter mid-way, so a job that got that far is expected to
+   * start over as a fresh run instead.
    *
    * Shows the full-screen loader ('resume') from the moment it's clicked
    * until a follow-up GET /pipeline/status/{id} confirms the backend's
