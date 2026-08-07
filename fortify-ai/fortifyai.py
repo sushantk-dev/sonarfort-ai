@@ -308,11 +308,12 @@ def main(argv: list[str] | None = None) -> int:
     # project_path is now final (cloned dir, or the pre-validated PROJECT_PATH)
     # regardless of which branch above ran. Kick off 'mvn dependency:go-offline'
     # here, in the background, so the .m2 cache has the whole triage /
-    # version-resolution / context / api-diff window to warm up before
-    # adr_fix's Phase 1b (mvn dependency:tree) needs it. See maven_warmup.py
-    # for why this makes ADR noticeably faster without changing its own
-    # offline/online fallback behaviour. Shared with api_server.py so the
-    # two entry points don't drift with separate copies of this logic.
+    # version-resolution / context / api-diff / ai-reasoning / adr-fix window
+    # to warm up before build-validation's actual 'mvn clean install' needs
+    # it. See maven_warmup.py for why this makes that build noticeably faster
+    # without changing its own offline/online fallback behaviour. Shared with
+    # api_server.py so the two entry points don't drift with separate copies
+    # of this logic.
     maven_warmup_thread = start_maven_warmup(
         config.project_path,
         log_info=logger.info, log_warning=logger.warning, log_debug=logger.debug,
@@ -452,9 +453,8 @@ def main(argv: list[str] | None = None) -> int:
     gcp_location = config.gcp_location
     reasoned_groups = reason_all_groups(diff_groups, gcp_project, gcp_location)
 
-    # ── ADR fix ───────────────────────────────────────────────────────────────
+    # ── ADR fix (commit only — no build, no push; see build-validation below) ──
     logger.info("─" * 60)
-    log_warmup_status(maven_warmup_thread, log_info=logger.info)
     from agents.adr_fix import run_adr_fix
     adr_results: list[dict] = []
     for group in reasoned_groups:
@@ -465,8 +465,8 @@ def main(argv: list[str] | None = None) -> int:
             adr_results.append({
                 "artifact_id": group["parsed"]["artifact_id"],
                 "result": {
-                    "success": False, "branch_name": None, "commit_hash": None,
-                    "build_time_seconds": None, "pdf_path": None,
+                    "success": False, "branch_name": None, "base_branch": None,
+                    "commit_hash": None, "build_time_seconds": None, "pdf_path": None,
                     # NOTE: group["escalation_reason"] is never actually set by
                     # either version_resolver.py or ai_reasoning.py — the real
                     # reason lives at group["escalate_reason"] (version
@@ -494,8 +494,8 @@ def main(argv: list[str] | None = None) -> int:
             from state import AdrResult
             logger.warning("[ADR Fix] ADR_PATH not set — skipping ADR invocation")
             result = AdrResult(
-                success=False, branch_name=None, commit_hash=None,
-                build_time_seconds=None, pdf_path=None,
+                success=False, branch_name=None, base_branch=None,
+                commit_hash=None, build_time_seconds=None, pdf_path=None,
                 error_reason="ADR_PATH not configured",
             )
 
@@ -503,6 +503,42 @@ def main(argv: list[str] | None = None) -> int:
             "artifact_id": group["parsed"]["artifact_id"],
             "result": result,
         })
+
+    # ── Build validation ─────────────────────────────────────────────────────
+    # Runs the Maven build ADR no longer runs itself (adr_fortify.py was
+    # invoked above with --skip-build): checks out each committed group's
+    # branch, runs mvn, pushes on success or rolls the branch back on
+    # failure. Like the ADR fix step above, this CLI path doesn't go through
+    # build_validation_node (the LangGraph node) — it calls the same
+    # agents.build_validation.validate_one() helper directly — so this has
+    # to happen here explicitly too, or committed-but-unbuilt branches would
+    # silently flow straight into PR creation.
+    logger.info("─" * 60)
+    log_warmup_status(maven_warmup_thread, log_info=logger.info)
+    from agents.build_validation import validate_one
+    merged_results: list[dict] = []
+    for entry in adr_results:
+        artifact_id = entry["artifact_id"]
+        adr_result = entry["result"]
+        if not adr_result.get("success"):
+            # Nothing was committed for this group (escalated / ADR_PATH not
+            # set / commit failed) — nothing to build.
+            merged_results.append({"artifact_id": artifact_id, "result": {
+                **adr_result, "build_time_seconds": None,
+            }})
+            continue
+        bv_result = validate_one(
+            artifact_id, adr_result, str(project_path),
+            required_jdk=required_jdk,
+        )
+        merged_results.append({"artifact_id": artifact_id, "result": {
+            **adr_result,
+            "success": bv_result["success"],
+            "branch_name": bv_result["branch_name"],
+            "build_time_seconds": bv_result["build_time_seconds"],
+            "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+        }})
+    adr_results = merged_results
 
     # ── PR creation ───────────────────────────────────────────────────────────
     logger.info("─" * 60)
