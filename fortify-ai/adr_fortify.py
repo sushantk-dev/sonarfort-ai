@@ -1078,7 +1078,7 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         return False, time.time() - t0
 
 
-def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
+def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 600,
                              java_home: str = "", build_threads: str = "1C") -> dict:
     """
     Runs 'mvn dependency:tree' ONCE on the project root pom and returns
@@ -1674,7 +1674,7 @@ def main():
               flush=True)
         t_pool = time.time()
         transitive_pool = collect_transitive_pool(
-            os.path.abspath(args.project_path), args.mvn, timeout=300, java_home=java_home,
+            os.path.abspath(args.project_path), args.mvn, timeout=600, java_home=java_home,
             build_threads=args.build_threads,
         )
         elapsed_pool = time.time() - t_pool
