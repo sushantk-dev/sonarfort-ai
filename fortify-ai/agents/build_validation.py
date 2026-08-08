@@ -8,11 +8,15 @@ Responsibility:
   baked into that single ADR subprocess call:
 
     1. Check out the branch adr_fix just committed.
-    2. Run 'mvn clean install' (skip tests by default, matching ADR's old
+    2. Run 'mvn clean compile' (skip tests by default, matching ADR's old
        --skipTests default) directly against project_path, using the same
        JDK-registry resolution as ADR (required_jdk → FORTIFYAI_JDK_REGISTRY
        → PATH fallback) so the build runs under the same JDK ADR would have
-       used.
+       used. "compile" rather than "install" — see _run_maven_build's
+       docstring for why: this only needs to confirm the fix compiles
+       across the reactor, and skipping packaging/install cuts real time
+       off every run and removes several of the .m2-repo writes that could
+       stall waiting on a lock.
     3. On success  → push the branch to origin. pr_agent only opens a PR
        for a group whose build_validation result is a *pushed* branch (this
        node overwrites state["_adr_results"]/state["adr_result"] in place
@@ -36,7 +40,7 @@ Responsibility:
 
 Console output (done-when):
   [Build Validation] Checking out feature/fortify-fix-1697672-c6266fa8
-  [Build Validation] Running mvn clean install -DskipTests ...
+  [Build Validation] Running mvn clean compile -X -DskipTests ...
   [Build Validation] ✅ Build passed (87s) — pushing branch
   [Build Validation] ✅ Pushed feature/fortify-fix-1697672-c6266fa8
 """
@@ -289,67 +293,6 @@ def _clear_git_index_lock(project_path: str) -> bool:
     return False
 
 
-def _kill_orphaned_maven_java_processes() -> int:
-    """
-    Kill any java.exe process that is actually running Maven — i.e. its
-    command line shows Maven's own entry point,
-    org.codehaus.plexus.classworlds.launcher.Launcher — and is NOT a child
-    of the current process tree (so a build we're actively streaming output
-    from right now is never touched).
-
-    Deliberately does NOT kill every java.exe: that would also take down
-    IDEs, other Java applications, or unrelated services on the same
-    machine. Maven's launcher class is a reliable, Maven-specific fingerprint
-    in the command line, so filtering on it targets exactly the thing that
-    can leave a stale lock/handle into the local .m2 repo — a mvn.cmd whose
-    wrapper was killed on a previous run but whose actual JVM child kept
-    running — without collateral damage to anything else on the box.
-
-    Windows-only for now (matches the mvn.cmd-spawns-java.exe orphan pattern
-    described in _kill_process_tree above); a no-op elsewhere. Never raises.
-    """
-    if os.name != "nt":
-        return 0
-    try:
-        # WMIC is deprecated but still present on every supported Windows
-        # version this pipeline targets, and needs no extra dependency
-        # (Get-CimInstance would work too but costs a PowerShell startup).
-        result = subprocess.run(
-            ["wmic", "process", "where", "name='java.exe'", "get", "ProcessId,CommandLine", "/format:csv"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            logger.warning(f"[Build Validation] Could not enumerate java.exe processes: {result.stderr.strip()}")
-            return 0
-    except Exception as exc:
-        logger.warning(f"[Build Validation] Could not enumerate java.exe processes: {exc}")
-        return 0
-
-    killed = 0
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line or line.lower().startswith("node,"):
-            continue  # header row
-        parts = line.split(",")
-        if len(parts) < 3:
-            continue
-        pid = parts[-1].strip()
-        command_line = ",".join(parts[1:-1])  # CommandLine may itself contain commas
-        if not pid.isdigit():
-            continue
-        if "org.codehaus.plexus.classworlds.launcher.Launcher" not in command_line:
-            continue  # a java.exe that isn't running Maven — leave it alone
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=10)
-            logger.info(f"[Build Validation] Killed orphaned Maven java.exe (pid={pid})")
-            killed += 1
-        except Exception as exc:
-            logger.warning(f"[Build Validation] Could not kill orphaned Maven java.exe (pid={pid}): {exc}")
-    if killed:
-        logger.info(f"[Build Validation] Killed {killed} orphaned Maven java.exe process(es) before starting build")
-    return killed
-
-
 def _clear_stale_locks(project_path: str, local_repo: Optional[str] = None) -> None:
     """Clear both lock sources up front — call before checkout + before mvn."""
     _clear_git_index_lock(project_path)
@@ -447,6 +390,7 @@ def _run_maven_build(
     skip_tests: bool = True,
     java_home: str = "",
     build_threads: str = "1C",
+    build_goal: str = "compile",
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[bool, int, str, str]:
     """
@@ -469,9 +413,27 @@ def _run_maven_build(
     _CANCEL_GRACE_SECONDS to exit, then SIGKILL'd, and
     PipelineCancelledError is raised — same pattern as adr_fix.py's
     invoke_adr().
+
+    build_goal (default "compile"): deliberately NOT "install". This node
+    only needs to know the fix compiles cleanly across the reactor before
+    pushing the branch — it doesn't need packaged jars or anything written
+    to the local .m2 repo. "install" additionally runs test-compile,
+    packaging (incl. shade/assembly plugins), JaCoCo, and an install:install
+    write into .m2 per module — all extra wall-clock time and extra .m2
+    writes that were never needed for this check, and every .m2 write is one
+    more thing that can stall waiting on a lock (see _clear_maven_repo_locks
+    above). "compile" resolves the same reactor dependencies via the
+    in-session reactor build order rather than needing anything installed
+    to .m2 first, so multi-module inter-module dependencies still work
+    correctly without "install".
+
+    Runs with -X (Maven debug output) so a stall shows exactly which
+    plugin/goal/resolution step it's stuck on instead of going silent —
+    see the stall-timeout branch below, which now has real detail to log
+    when it fires.
     """
     exe = _find_mvn(mvn_exe)
-    cmd = [exe, "clean", "install", "--no-transfer-progress"]
+    cmd = [exe, "clean", build_goal, "-X", "--no-transfer-progress"]
     if build_threads and build_threads != "1":
         cmd += ["-T", build_threads]
     if skip_tests:
@@ -482,12 +444,7 @@ def _run_maven_build(
     # Clear any stale locks left over from a killed prior build (timeout/
     # cancel paths below both SIGKILL the mvn subprocess) before starting a
     # new one — otherwise this run just blocks waiting on the old lock,
-    # which is what actually shows up as a "deadlock" upstream. Also kill
-    # any orphaned Maven JVM that survived an older run predating the
-    # process-tree-kill fix above (Windows: mvn.cmd's java.exe child can
-    # outlive the wrapper) — a still-live handle into .m2\repository is
-    # exactly the kind of thing lock-file cleanup alone can't clear.
-    _kill_orphaned_maven_java_processes()
+    # which is what actually shows up as a "deadlock" upstream.
     _clear_maven_repo_locks()
 
     logger.info(f"[Build Validation] Running {' '.join(cmd)} ...")
@@ -614,6 +571,7 @@ def validate_one(
     required_jdk: Optional[str] = None,
     skip_tests: bool = True,
     build_threads: str = "1C",
+    build_goal: str = "compile",
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> BuildValidationResult:
     """
@@ -627,6 +585,9 @@ def validate_one(
     looked up in FORTIFYAI_JDK_REGISTRY, otherwise inherit PATH. Resolving
     it the same way here keeps the build under the same JDK ADR would have
     used for this project.
+
+    build_goal: forwarded to _run_maven_build — see its docstring for why
+    "compile" (not "install") is the default.
     """
     branch_name = adr_result.get("branch_name")
     base_branch = adr_result.get("base_branch")
@@ -661,7 +622,7 @@ def validate_one(
     success, duration, stdout, stderr = _run_maven_build(
         project_path, mvn_exe=mvn_exe, skip_tests=skip_tests,
         java_home=resolved_java_home, build_threads=build_threads,
-        cancel_check=cancel_check,
+        build_goal=build_goal, cancel_check=cancel_check,
     )
 
     if success:
@@ -704,6 +665,7 @@ def build_validation_node(
     java_home: str = "",
     skip_tests: bool = True,
     build_threads: str = "1C",
+    build_goal: str = "compile",
 ) -> AgentState:
     """
     LangGraph node: build_validation. Runs unconditionally after adr_fix.
@@ -718,6 +680,9 @@ def build_validation_node(
             state["build_validation_result"]     result of the first group (for routing)
             state["last_build_error"]            overwritten with this node's error, if any
             state["audit_trail"]
+
+    build_goal (default "compile"): forwarded to validate_one/_run_maven_build
+    — see _run_maven_build's docstring for why this isn't "install".
 
     Raises: PipelineCancelledError if cancel_check() reports cancellation.
     """
@@ -751,7 +716,7 @@ def build_validation_node(
                 artifact_id, adr_result, project_path,
                 mvn_exe=mvn_exe, java_home=java_home, required_jdk=required_jdk,
                 skip_tests=skip_tests, build_threads=build_threads,
-                cancel_check=cancel_check,
+                build_goal=build_goal, cancel_check=cancel_check,
             )
 
         bv_results.append({"artifact_id": artifact_id, "result": bv_result})
