@@ -12,7 +12,10 @@ Responsibility:
        so the branch has to exist on origin before anything can build it).
     3. Dispatch `workflow_file` (default runMavenSharedWorkflow.yml, must
        declare `on: workflow_dispatch`) against that branch and poll until
-       it completes.
+       the specific Maven step finishes (default; see stop_at_maven_step)
+       — not the whole workflow. A later, unrelated step (artifact upload,
+       notification, deploy) failing after Maven itself succeeded no
+       longer causes a false build-failure/rollback here.
     4. On success → nothing further to push (already pushed in step 2).
        pr_agent only opens a PR for a group whose build_validation result
        is a *pushed* branch (this node overwrites state["_adr_results"]/
@@ -67,6 +70,9 @@ except ImportError:  # package layout
     from agents.adr_fix import _extract_maven_error  # type: ignore
 
 _DEFAULT_WORKFLOW_FILE = "runMavenSharedWorkflow.yml"
+# Passing this as workflow_file triggers _discover_workflow_file instead of
+# using a fixed filename — see validate_one / build_validation_node.
+_AUTO_WORKFLOW_SENTINEL = "auto"
 
 # Overall wall-clock budget for a dispatched run: dispatch lookup + CI queue
 # time + the build itself. Generous relative to the old local-subprocess
@@ -251,6 +257,25 @@ def _stream_run_progress(
                     logger.info(f"[Build Validation]   {line}")
 
 
+def _find_maven_step(jobs) -> Optional[tuple]:
+    """
+    Look for the specific step that runs Maven (name containing "mvn" or
+    "maven", case-insensitive — matches step names like "Run mvn clean
+    compile" or "Build with Maven") and has itself reached "completed".
+
+    Returns (job, step_dict) for the first match, or None if no such step
+    exists yet (workflow hasn't gotten there) or the workflow has no step
+    identifiable as the Maven build at all (naming doesn't match — caller
+    falls back to waiting for the whole run in that case).
+    """
+    for job in jobs:
+        for step in (job.raw_data or {}).get("steps", []):
+            name = (step.get("name") or "").lower()
+            if ("mvn" in name or "maven" in name) and step.get("status") == "completed":
+                return job, step
+    return None
+
+
 def _find_dispatched_run(repo, workflow, ref: str, dispatched_after: "datetime", cancel_check):
     """
     Poll the workflow's run list for the run created by our dispatch: the
@@ -290,13 +315,92 @@ def _cancel_run(run) -> None:
         logger.warning(f"[Build Validation] Requested cancellation of {run.html_url}")
     except Exception as exc:
         logger.warning(f"[Build Validation] Could not cancel {run.html_url}: {exc}")
-
-
 # Consecutive polling failures (network blip, transient 5xx, rate limiting)
 # tolerated before giving up — a single run.update() exception here used to
 # crash the whole node uncaught; now it's retried with backoff and only
 # treated as a real failure once it's persistent, not transient.
 _GH_ACTIONS_MAX_CONSECUTIVE_POLL_ERRORS = 5
+
+
+def discover_maven_workflow(github_token: str, github_repo: str) -> Optional[str]:
+    """
+    Best-effort auto-detection of which workflow file in .github/workflows/
+    is "the" Maven build pipeline, for cases where hardcoding
+    _DEFAULT_WORKFLOW_FILE isn't reliable (repo renamed it, multiple repos
+    with different filenames sharing this codebase, etc).
+
+    Approach: list every workflow GitHub knows about for this repo (this is
+    metadata GitHub already indexes — no need to walk .github/workflows/
+    ourselves), keep only the ones that are (a) active and (b) actually
+    declare `workflow_dispatch` as a trigger (checked by fetching each
+    candidate's raw YAML — there's no API field for "supported triggers"),
+    then rank by how strongly the name/path suggests a Maven build ("maven",
+    "mvn", "build" in that order of preference). Returns the workflow's
+    filename (e.g. "runMavenSharedWorkflow.yml") — the same string
+    workflow_file expects elsewhere in this module — or None if nothing
+    qualifies.
+
+    This does real API calls per candidate workflow (one to fetch content
+    for each), so it's meant to be called once and the result reused/cached
+    by the caller (e.g. stored in config, not re-discovered on every build).
+    """
+    try:
+        from github import Github, GithubException  # type: ignore
+    except ImportError:
+        logger.warning("[Build Validation] PyGithub not installed — cannot auto-discover workflow file")
+        return None
+
+    try:
+        gh = Github(github_token)
+        repo = gh.get_repo(github_repo)
+        workflows = [w for w in repo.get_workflows() if w.state == "active"]
+    except Exception as exc:
+        logger.warning(f"[Build Validation] Could not list workflows for {github_repo}: {exc}")
+        return None
+
+    candidates: list[tuple[int, str]] = []  # (rank, filename) — lower rank is better
+    for wf in workflows:
+        filename = wf.path.rsplit("/", 1)[-1]
+        try:
+            content = repo.get_contents(wf.path).decoded_content.decode("utf-8", errors="replace")
+        except GithubException as exc:
+            logger.debug(f"[Build Validation] Could not read {wf.path}: {exc}")
+            continue
+
+        # Cheap text check rather than a full YAML parse (avoids adding a
+        # PyYAML dependency for a single boolean check). "on:" triggers are
+        # a top-level mapping/sequence in every real-world workflow file, so
+        # the keyword appearing at all is a reliable enough signal here.
+        if "workflow_dispatch" not in content:
+            continue
+
+        haystack = f"{wf.name} {filename}".lower()
+        if "maven" in haystack or "mvn" in content.lower():
+            rank = 0
+        elif "build" in haystack:
+            rank = 1
+        else:
+            rank = 2
+        candidates.append((rank, filename))
+
+    if not candidates:
+        logger.warning(
+            f"[Build Validation] No workflow_dispatch-enabled workflow found in {github_repo} "
+            f"— nothing to auto-discover."
+        )
+        return None
+
+    candidates.sort(key=lambda c: c[0])
+    best_rank, best_filename = candidates[0]
+    if best_rank > 0:
+        logger.info(
+            f"[Build Validation] Auto-discovered {best_filename} as the build workflow "
+            f"(no name/content match for 'maven' — picked by weaker 'build' heuristic; "
+            f"consider setting workflow_file explicitly if this is wrong)"
+        )
+    else:
+        logger.info(f"[Build Validation] Auto-discovered {best_filename} as the build workflow")
+    return best_filename
 
 
 def _run_maven_build_via_actions(
@@ -306,12 +410,25 @@ def _run_maven_build_via_actions(
     workflow_file: str = _DEFAULT_WORKFLOW_FILE,
     workflow_inputs: Optional[dict] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    stop_at_maven_step: bool = True,
 ) -> tuple[bool, int, str, str, bool]:
     """
     Dispatch `workflow_file` against `branch_name` in `github_repo`, stream
     step-level progress + each job's log as it finishes (see
     _stream_run_progress) while waiting for it to complete, and return
     (success, duration_seconds, stdout, stderr, triggered).
+
+    stop_at_maven_step (default True): once the specific step running Maven
+    reaches "completed" (matched by name containing "mvn"/"maven" — see
+    _find_maven_step), stop right there instead of waiting for the rest of
+    the workflow (artifact upload, notifications, deploy steps, etc.) to
+    finish. success/error are then that Maven step's own outcome, not the
+    whole run's — so a build that compiles fine but a later, unrelated
+    workflow step fails no longer causes this to report (and roll back) a
+    false build failure, and a build that fails doesn't need the rest of
+    the workflow to finish before it's reported. Falls back to waiting for
+    the whole run (as before) if no step name matches "mvn"/"maven" — some
+    workflows may not name the step that distinctively.
 
     `triggered` distinguishes "the pipeline never actually started" (bad
     token/repo/workflow_file, or workflow_dispatch not declared on this
@@ -422,6 +539,30 @@ def _run_maven_build_via_actions(
             time.sleep(_GH_ACTIONS_POLL_SECONDS)
             continue
         _stream_run_progress(run, github_repo, github_token, printed_steps, printed_job_logs)
+
+        if stop_at_maven_step:
+            maven_hit = _find_maven_step(run.jobs())
+            if maven_hit is not None:
+                mvn_job, mvn_step = maven_hit
+                duration = int(time.time() - t0)
+                mvn_success = mvn_step.get("conclusion") == "success"
+                if mvn_success:
+                    logger.info(
+                        f"[Build Validation] ✅ Maven step '{mvn_step['name']}' succeeded "
+                        f"({duration}s) — stopping here, not waiting on the rest of the workflow"
+                    )
+                    return True, duration, "", "", True
+                log_text = _download_job_log_text(github_repo, mvn_job.id, github_token)
+                stderr = (
+                    f"Maven step '{mvn_step['name']}' concluded '{mvn_step.get('conclusion')}' "
+                    f"(job: {mvn_job.html_url})"
+                )
+                logger.error(
+                    f"[Build Validation] ❌ Maven step '{mvn_step['name']}' concluded "
+                    f"'{mvn_step.get('conclusion')}' ({duration}s) — stopping here"
+                )
+                return False, duration, log_text, stderr, True
+
         if run.status == "completed":
             break
         time.sleep(_GH_ACTIONS_POLL_SECONDS)
@@ -454,6 +595,7 @@ def validate_one(
     workflow_file: str = _DEFAULT_WORKFLOW_FILE,
     workflow_inputs: Optional[dict] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    stop_at_maven_step: bool = True,
 ) -> BuildValidationResult:
     """
     Build-validate a single committed group. Assumes adr_result["success"]
@@ -500,6 +642,19 @@ def validate_one(
             error_reason="github_token/github_repo not provided — cannot dispatch a GitHub Actions build.",
         )
 
+    if workflow_file == _AUTO_WORKFLOW_SENTINEL:
+        discovered = discover_maven_workflow(github_token, github_repo)
+        if not discovered:
+            return BuildValidationResult(
+                success=False, branch_name=branch_name, pushed=False,
+                build_time_seconds=None,
+                error_reason=(
+                    "SKIPPED — workflow_file='auto' but no workflow_dispatch-enabled "
+                    "build workflow could be found; set workflow_file explicitly."
+                ),
+            )
+        workflow_file = discovered
+
     # Clear a stale git index.lock (e.g. left behind by a previous killed/
     # timed-out run against this same project_path) before touching git,
     # so this attempt doesn't hang waiting on it.
@@ -530,7 +685,7 @@ def validate_one(
     success, duration, stdout, stderr, triggered = _run_maven_build_via_actions(
         branch_name, github_token=github_token, github_repo=github_repo,
         workflow_file=workflow_file, workflow_inputs=workflow_inputs,
-        cancel_check=cancel_check,
+        cancel_check=cancel_check, stop_at_maven_step=stop_at_maven_step,
     )
 
     if success:
@@ -575,6 +730,7 @@ def build_validation_node(
     github_repo: str = "",
     workflow_file: str = _DEFAULT_WORKFLOW_FILE,
     workflow_inputs: Optional[dict] = None,
+    stop_at_maven_step: bool = True,
 ) -> AgentState:
     """
     LangGraph node: build_validation. Runs unconditionally after adr_fix.
@@ -624,7 +780,7 @@ def build_validation_node(
                 artifact_id, adr_result, project_path,
                 github_token=github_token, github_repo=github_repo,
                 workflow_file=workflow_file, workflow_inputs=workflow_inputs,
-                cancel_check=cancel_check,
+                cancel_check=cancel_check, stop_at_maven_step=stop_at_maven_step,
             )
 
         bv_results.append({"artifact_id": artifact_id, "result": bv_result})
