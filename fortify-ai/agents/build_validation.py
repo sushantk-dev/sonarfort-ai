@@ -40,7 +40,7 @@ Responsibility:
 
 Console output (done-when):
   [Build Validation] Checking out feature/fortify-fix-1697672-c6266fa8
-  [Build Validation] Running mvn clean compile -X -DskipTests ...
+  [Build Validation] Running mvn clean compile -DskipTests ...
   [Build Validation] ✅ Build passed (87s) — pushing branch
   [Build Validation] ✅ Pushed feature/fortify-fix-1697672-c6266fa8
 """
@@ -427,13 +427,16 @@ def _run_maven_build(
     to .m2 first, so multi-module inter-module dependencies still work
     correctly without "install".
 
-    Runs with -X (Maven debug output) so a stall shows exactly which
-    plugin/goal/resolution step it's stuck on instead of going silent —
-    see the stall-timeout branch below, which now has real detail to log
-    when it fires.
+    Deliberately no --no-transfer-progress here — that flag suppresses
+    Maven's "Downloading from central: ..." / "Downloaded from central: ..."
+    lines entirely, which is exactly the output that shows which artifact a
+    resolution stall is stuck on. Losing that was making every stall look
+    identical (silence, then nothing) with no way to tell a network hang
+    from a lock from something else — worth the extra log lines to get it
+    back.
     """
     exe = _find_mvn(mvn_exe)
-    cmd = [exe, "clean", build_goal, "-X", "--no-transfer-progress"]
+    cmd = [exe, "clean", build_goal]
     if build_threads and build_threads != "1":
         cmd += ["-T", build_threads]
     if skip_tests:
