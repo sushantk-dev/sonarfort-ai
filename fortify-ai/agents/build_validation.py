@@ -257,15 +257,18 @@ def _stream_run_progress(
                     logger.info(f"[Build Validation]   {line}")
 
 
-_MAVEN_STEP_NAME_MARKERS = ("mvn", "maven", "build command")
+_MAVEN_STEP_NAME_MARKERS = ("build command",)
 
 
 def _find_maven_step(jobs) -> Optional[tuple]:
     """
-    Look for the specific step that runs Maven (name containing "mvn",
-    "maven", or "build command", case-insensitive — matches step names
-    like "Run mvn clean compile", "Build with Maven", or "Run Build
+    Look for the specific step that runs Maven (name containing "build
+    command", case-insensitive — matches step names like "Run Build
     Commands") and has itself reached "completed".
+
+    Deliberately does NOT match on "mvn"/"maven" alone — a step like
+    "Setup Maven" also contains "maven" but is just environment setup,
+    not the actual build, and would cause a false-positive early stop.
 
     Returns (job, step_dict) for the first match, or None if no such step
     exists yet (workflow hasn't gotten there) or the workflow has no step
