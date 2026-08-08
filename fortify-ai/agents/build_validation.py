@@ -77,6 +77,18 @@ except ImportError:  # package layout
 
 _BUILD_TIMEOUT_SECONDS = 600
 
+# If mvn produces zero new lines of output for this long, treat it as
+# stalled rather than waiting out the full _BUILD_TIMEOUT_SECONDS. Maven
+# normally logs "Scanning for projects..." within a second or two of
+# starting; a silence this long almost always means it's blocked on
+# something outside the build itself — a network connect() that's being
+# silently dropped rather than refused, or a file lock held by a process
+# this pipeline didn't spawn and therefore can't clean up — rather than
+# genuinely slow, visible work. Well under _BUILD_TIMEOUT_SECONDS so a
+# real stall is reported (with a distinguishing message) long before the
+# blanket timeout would otherwise fire.
+_STALL_TIMEOUT_SECONDS = 120
+
 # How often the streaming loop checks cancel_check() / the overall timeout
 # while waiting for mvn's stdout, and how long a SIGTERM'd mvn subprocess
 # gets before we escalate to SIGKILL — mirrors adr_fix.py's invoke_adr().
@@ -277,6 +289,67 @@ def _clear_git_index_lock(project_path: str) -> bool:
     return False
 
 
+def _kill_orphaned_maven_java_processes() -> int:
+    """
+    Kill any java.exe process that is actually running Maven — i.e. its
+    command line shows Maven's own entry point,
+    org.codehaus.plexus.classworlds.launcher.Launcher — and is NOT a child
+    of the current process tree (so a build we're actively streaming output
+    from right now is never touched).
+
+    Deliberately does NOT kill every java.exe: that would also take down
+    IDEs, other Java applications, or unrelated services on the same
+    machine. Maven's launcher class is a reliable, Maven-specific fingerprint
+    in the command line, so filtering on it targets exactly the thing that
+    can leave a stale lock/handle into the local .m2 repo — a mvn.cmd whose
+    wrapper was killed on a previous run but whose actual JVM child kept
+    running — without collateral damage to anything else on the box.
+
+    Windows-only for now (matches the mvn.cmd-spawns-java.exe orphan pattern
+    described in _kill_process_tree above); a no-op elsewhere. Never raises.
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        # WMIC is deprecated but still present on every supported Windows
+        # version this pipeline targets, and needs no extra dependency
+        # (Get-CimInstance would work too but costs a PowerShell startup).
+        result = subprocess.run(
+            ["wmic", "process", "where", "name='java.exe'", "get", "ProcessId,CommandLine", "/format:csv"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            logger.warning(f"[Build Validation] Could not enumerate java.exe processes: {result.stderr.strip()}")
+            return 0
+    except Exception as exc:
+        logger.warning(f"[Build Validation] Could not enumerate java.exe processes: {exc}")
+        return 0
+
+    killed = 0
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("node,"):
+            continue  # header row
+        parts = line.split(",")
+        if len(parts) < 3:
+            continue
+        pid = parts[-1].strip()
+        command_line = ",".join(parts[1:-1])  # CommandLine may itself contain commas
+        if not pid.isdigit():
+            continue
+        if "org.codehaus.plexus.classworlds.launcher.Launcher" not in command_line:
+            continue  # a java.exe that isn't running Maven — leave it alone
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=10)
+            logger.info(f"[Build Validation] Killed orphaned Maven java.exe (pid={pid})")
+            killed += 1
+        except Exception as exc:
+            logger.warning(f"[Build Validation] Could not kill orphaned Maven java.exe (pid={pid}): {exc}")
+    if killed:
+        logger.info(f"[Build Validation] Killed {killed} orphaned Maven java.exe process(es) before starting build")
+    return killed
+
+
 def _clear_stale_locks(project_path: str, local_repo: Optional[str] = None) -> None:
     """Clear both lock sources up front — call before checkout + before mvn."""
     _clear_git_index_lock(project_path)
@@ -409,7 +482,12 @@ def _run_maven_build(
     # Clear any stale locks left over from a killed prior build (timeout/
     # cancel paths below both SIGKILL the mvn subprocess) before starting a
     # new one — otherwise this run just blocks waiting on the old lock,
-    # which is what actually shows up as a "deadlock" upstream.
+    # which is what actually shows up as a "deadlock" upstream. Also kill
+    # any orphaned Maven JVM that survived an older run predating the
+    # process-tree-kill fix above (Windows: mvn.cmd's java.exe child can
+    # outlive the wrapper) — a still-live handle into .m2\repository is
+    # exactly the kind of thing lock-file cleanup alone can't clear.
+    _kill_orphaned_maven_java_processes()
     _clear_maven_repo_locks()
 
     logger.info(f"[Build Validation] Running {' '.join(cmd)} ...")
@@ -448,12 +526,18 @@ def _run_maven_build(
 
         cancelled = False
         timed_out = False
+        stalled = False
+        last_output_t = t0
         while True:
             if cancel_check is not None and cancel_check():
                 cancelled = True
                 break
-            if time.time() - t0 > _BUILD_TIMEOUT_SECONDS:
+            now = time.time()
+            if now - t0 > _BUILD_TIMEOUT_SECONDS:
                 timed_out = True
+                break
+            if now - last_output_t > _STALL_TIMEOUT_SECONDS:
+                stalled = True
                 break
             try:
                 raw = line_queue.get(timeout=_CANCEL_POLL_SECONDS)
@@ -461,9 +545,29 @@ def _run_maven_build(
                 continue
             if raw is None:   # EOF — subprocess closed stdout
                 break
+            last_output_t = time.time()
             line = raw.decode("utf-8", errors="replace").rstrip()
             output_lines.append(line)
             logger.info(f"[Build Validation]   {line}")   # streams live, matches adr_fortify.py's visibility
+
+        if stalled:
+            logger.error(
+                f"[Build Validation] mvn produced no output for {_STALL_TIMEOUT_SECONDS}s "
+                f"(after {int(time.time() - t0)}s total) — this is not normal build slowness, "
+                f"mvn should be logging within a second or two of starting. Likely blocked on "
+                f"something outside the build: a network connect() being silently dropped rather "
+                f"than refused, or a file lock held by a process this pipeline didn't spawn (check "
+                f"for stray java.exe/mvn processes predating this run). Killing and failing fast "
+                f"instead of waiting out the full {_BUILD_TIMEOUT_SECONDS}s timeout."
+            )
+            _kill_process_tree(proc, _CANCEL_GRACE_SECONDS)
+            duration = int(time.time() - t0)
+            return False, duration, "\n".join(output_lines), (
+                f"mvn produced no output for {_STALL_TIMEOUT_SECONDS}s and was killed — likely "
+                f"blocked on network I/O or a lock held by a process outside this pipeline, not a "
+                f"normal build failure. Check for stray java.exe/mvn processes and network "
+                f"connectivity to your Maven repo."
+            )
 
         if timed_out:
             logger.error(f"[Build Validation] Build timed out after {_BUILD_TIMEOUT_SECONDS}s — killing mvn")
