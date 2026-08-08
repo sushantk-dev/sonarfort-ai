@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
 from typing import Callable, Optional
 
 from loguru import logger
@@ -139,6 +140,141 @@ def _build_subprocess_env(java_home: str) -> Optional[dict]:
     return env
 
 
+# ── lock cleanup ──────────────────────────────────────────────────────────────
+#
+# Two independent lock sources can deadlock this node:
+#   1. .git/index.lock — left behind if a previous git process in this same
+#      project_path was killed (SIGKILL from the cancel/timeout path above,
+#      a crashed prior run, etc.). Any subsequent `git` command just hangs/
+#      errors ("Another git process seems to be running") instead of failing
+#      fast, which is what actually looks like a "deadlock" from the caller's
+#      side.
+#   2. Maven local-repository resolver lock files (*.lock under the local
+#      .m2 repo) — written by Maven's Aether resolver while it holds a file
+#      lock on an artifact/metadata entry. If a previous `mvn` process was
+#      SIGKILL'd (timeout/cancel paths in _run_maven_build) mid-resolution,
+#      the lock file is never released and the next build blocks forever
+#      waiting on it.
+#
+# Both are safe to remove pre-emptively immediately before we start our own
+# git/mvn work: by construction nothing else should be concurrently using
+# this checkout or this local repo at that point.
+
+def _localrepo_from_settings_xml(settings_path: str) -> Optional[str]:
+    """
+    Parse <localRepository> out of a settings.xml, if present and set.
+    Returns None on any parse failure or if the element is absent/empty —
+    callers fall through to the next source in the priority chain.
+    """
+    if not os.path.isfile(settings_path):
+        return None
+    try:
+        tree = ET.parse(settings_path)
+        root = tree.getroot()
+        # settings.xml is namespaced in modern POMs/schemas; strip it so
+        # this works regardless of whether xmlns is declared.
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = root.tag.split("}")[0] + "}"
+        elem = root.find(f"{ns}localRepository")
+        if elem is None or not (elem.text or "").strip():
+            return None
+        value = elem.text.strip()
+        # Only the common ${user.home} placeholder is expanded — settings.xml
+        # can reference arbitrary properties/profiles, but resolving those
+        # properly needs `mvn help:evaluate`, which is exactly the slow path
+        # this helper exists to avoid.
+        value = value.replace("${user.home}", os.path.expanduser("~"))
+        return os.path.expanduser(value)
+    except ET.ParseError as exc:
+        logger.warning(f"[Build Validation] Could not parse {settings_path}: {exc}")
+        return None
+    except OSError as exc:
+        logger.warning(f"[Build Validation] Could not read {settings_path}: {exc}")
+        return None
+
+
+def _resolve_maven_local_repo() -> str:
+    """
+    Best-effort local repo path, without shelling out to `mvn help:evaluate`
+    (slow, and the whole point here is to unblock a build that's stuck).
+
+    Priority (matches Maven's own precedence for this setting):
+      1. MAVEN_REPO_LOCAL env var (this project's own override hook)
+      2. -Dmaven.repo.local parsed out of MAVEN_OPTS
+      3. <localRepository> in the user settings.xml (~/.m2/settings.xml,
+         or $MAVEN_SETTINGS_PATH if set)
+      4. <localRepository> in the global settings.xml
+         ($M2_HOME/conf/settings.xml or $MAVEN_HOME/conf/settings.xml)
+      5. default ~/.m2/repository
+    """
+    override = os.environ.get("MAVEN_REPO_LOCAL", "").strip()
+    if override:
+        return override
+
+    for opt in os.environ.get("MAVEN_OPTS", "").split():
+        if opt.startswith("-Dmaven.repo.local="):
+            return opt.split("=", 1)[1]
+
+    user_settings = os.environ.get(
+        "MAVEN_SETTINGS_PATH", os.path.expanduser(os.path.join("~", ".m2", "settings.xml"))
+    )
+    from_user = _localrepo_from_settings_xml(user_settings)
+    if from_user:
+        return from_user
+
+    maven_home = os.environ.get("M2_HOME") or os.environ.get("MAVEN_HOME")
+    if maven_home:
+        from_global = _localrepo_from_settings_xml(os.path.join(maven_home, "conf", "settings.xml"))
+        if from_global:
+            return from_global
+
+    return os.path.expanduser(os.path.join("~", ".m2", "repository"))
+
+
+def _clear_maven_repo_locks(local_repo: Optional[str] = None) -> int:
+    """
+    Remove stale *.lock files under the Maven local repository. Returns the
+    count removed. Never raises — a failed cleanup attempt shouldn't block
+    the build any more than the lock itself would.
+    """
+    repo = local_repo or _resolve_maven_local_repo()
+    if not repo or not os.path.isdir(repo):
+        return 0
+    removed = 0
+    for root, _dirs, files in os.walk(repo):
+        for name in files:
+            if name.endswith(".lock"):
+                path = os.path.join(root, name)
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError as exc:
+                    logger.warning(f"[Build Validation] Could not remove lock {path}: {exc}")
+    if removed:
+        logger.info(f"[Build Validation] Removed {removed} stale Maven repository lock file(s) under {repo}")
+    return removed
+
+
+def _clear_git_index_lock(project_path: str) -> bool:
+    """Remove a stale .git/index.lock in project_path, if present."""
+    lock_path = os.path.join(project_path, ".git", "index.lock")
+    if os.path.exists(lock_path):
+        try:
+            os.remove(lock_path)
+            logger.info(f"[Build Validation] Removed stale git lock: {lock_path}")
+            return True
+        except OSError as exc:
+            logger.warning(f"[Build Validation] Could not remove git lock {lock_path}: {exc}")
+    return False
+
+
+def _clear_stale_locks(project_path: str, local_repo: Optional[str] = None) -> None:
+    """Clear both lock sources up front — call before checkout + before mvn."""
+    _clear_git_index_lock(project_path)
+    _clear_maven_repo_locks(local_repo)
+
+
 # ── git helpers ────────────────────────────────────────────────────────────────
 
 def _run_git(cmd: list[str], project_path: str, desc: str) -> tuple[bool, str]:
@@ -215,6 +351,12 @@ def _run_maven_build(
         cmd.append("-DskipTests")
 
     env = _build_subprocess_env(java_home)  # None if java_home == "" → inherit parent env
+
+    # Clear any stale locks left over from a killed prior build (timeout/
+    # cancel paths below both SIGKILL the mvn subprocess) before starting a
+    # new one — otherwise this run just blocks waiting on the old lock,
+    # which is what actually shows up as a "deadlock" upstream.
+    _clear_maven_repo_locks()
 
     logger.info(f"[Build Validation] Running {' '.join(cmd)} ...")
     t0 = time.time()
@@ -344,6 +486,11 @@ def validate_one(
             build_time_seconds=None,
             error_reason="No branch to validate (adr_fix did not create one).",
         )
+
+    # Clear stale git index.lock / Maven repo locks (e.g. left behind by a
+    # previous killed/timed-out run against this same project_path) before
+    # touching git or mvn, so this attempt doesn't hang waiting on them.
+    _clear_stale_locks(project_path)
 
     ok, err = _run_git(["git", "checkout", branch_name], project_path, f"checkout {branch_name}")
     if not ok:
