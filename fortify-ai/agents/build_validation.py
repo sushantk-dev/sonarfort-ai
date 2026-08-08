@@ -71,7 +71,7 @@ _DEFAULT_WORKFLOW_FILE = "runMavenSharedWorkflow.yml"
 # Overall wall-clock budget for a dispatched run: dispatch lookup + CI queue
 # time + the build itself. Generous relative to the old local-subprocess
 # timeout since a shared runner can be queued behind other jobs.
-_GH_ACTIONS_TIMEOUT_SECONDS = int(os.environ.get("FORTIFYAI_GH_ACTIONS_TIMEOUT", 900))
+_GH_ACTIONS_TIMEOUT_SECONDS = int(os.environ.get("FORTIFYAI_GH_ACTIONS_TIMEOUT", 1200))
 _GH_ACTIONS_POLL_SECONDS = 10
 # How long to wait for the dispatched run to show up in the workflow's run
 # list before giving up — workflow_dispatch's REST response is just a 204,
@@ -306,50 +306,61 @@ def _run_maven_build_via_actions(
     workflow_file: str = _DEFAULT_WORKFLOW_FILE,
     workflow_inputs: Optional[dict] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
-) -> tuple[bool, int, str, str]:
+) -> tuple[bool, int, str, str, bool]:
     """
     Dispatch `workflow_file` against `branch_name` in `github_repo`, stream
     step-level progress + each job's log as it finishes (see
     _stream_run_progress) while waiting for it to complete, and return
-    (success, duration_seconds, stdout, stderr) — stdout carries the
-    downloaded job log text on failure so _extract_maven_error still gets
-    real Maven output to parse.
+    (success, duration_seconds, stdout, stderr, triggered).
+
+    `triggered` distinguishes "the pipeline never actually started" (bad
+    token/repo/workflow_file, or workflow_dispatch not declared on this
+    branch — stop conditions #1/#2 below) from "the pipeline ran and then
+    failed/timed out/lost contact" (#3-6). validate_one uses this to skip
+    build validation (leave the pushed branch alone, no rollback) rather
+    than treat an infra/config problem as a build failure.
 
     branch_name must already be pushed to origin — GitHub Actions builds
     what's on the remote, not this pod's working tree (see validate_one,
     which pushes before calling this).
 
-    Stop conditions (all treated as build failure — see validate_one, which
-    rolls the branch back on any of these):
+    Stop conditions:
       1. Dispatch itself fails (bad token/repo/workflow_file, network) —
          stops immediately, nothing to cancel remotely (no run exists yet).
+         triggered=False → validate_one skips build validation instead of
+         rolling back.
       2. No matching run appears within _GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS
          (60s) of dispatching — usually means workflow_file doesn't declare
          `on: workflow_dispatch` on this branch, or the token lacks
          actions:write. Nothing to cancel (dispatch may not have created a
-         run at all).
+         run at all). triggered=False → same skip treatment as #1.
       3. The run reaches GitHub's own "completed" status with any
          conclusion other than "success" (failure, cancelled, timed_out,
          action_required, stale, neutral, skipped) — the run finished on
-         its own; nothing to cancel, just report it.
+         its own; nothing to cancel, just report it. triggered=True → a
+         real build failure, validate_one rolls the branch back.
       4. cancel_check() returns True (user/pipeline cancellation) — the
          run is actively cancelled on GitHub via _cancel_run before
          PipelineCancelledError propagates, so a user-cancelled pipeline
          doesn't leave an orphaned run still building on GitHub's infra.
-      5. Wall-clock exceeds _GH_ACTIONS_TIMEOUT_SECONDS (900s default,
+      5. Wall-clock exceeds _GH_ACTIONS_TIMEOUT_SECONDS (1200s default,
          override via FORTIFYAI_GH_ACTIONS_TIMEOUT) while the run is still
          in progress — the run is actively cancelled via _cancel_run before
          returning failure, for the same orphaned-run reason as #4.
+         triggered=True → treated as a real build failure (the run did
+         start; it just didn't finish in time).
       6. Polling the run's status itself fails
          _GH_ACTIONS_MAX_CONSECUTIVE_POLL_ERRORS (5) times in a row — a
          persistent API/network problem, not a build failure. The run is
          left running in this case (we can't reliably talk to the API to
          cancel it either) and reported as an inconclusive failure.
+         triggered=True → still rolled back, since we can't confirm the
+         branch is safe to leave pushed without knowing the outcome.
     """
     try:
         from github import Github  # type: ignore
     except ImportError:
-        return False, 0, "", "PyGithub not installed — cannot dispatch GitHub Actions build"
+        return False, 0, "", "PyGithub not installed — cannot dispatch GitHub Actions build", False
 
     t0 = time.time()
     dispatched_at = datetime.now(timezone.utc)
@@ -359,9 +370,9 @@ def _run_maven_build_via_actions(
         workflow = repo.get_workflow(workflow_file)
         ok = workflow.create_dispatch(ref=branch_name, inputs=workflow_inputs or {})
         if not ok:
-            return False, 0, "", f"GitHub rejected the dispatch request for {workflow_file} @ {branch_name}"
+            return False, 0, "", f"GitHub rejected the dispatch request for {workflow_file} @ {branch_name}", False
     except Exception as exc:
-        return False, 0, "", f"Could not dispatch {workflow_file}: {exc}"
+        return False, 0, "", f"Could not dispatch {workflow_file}: {exc}", False
 
     logger.info(f"[Build Validation] Dispatched {workflow_file} for {branch_name} — waiting for run to start")
     try:
@@ -374,7 +385,7 @@ def _run_maven_build_via_actions(
             f"Dispatched {workflow_file} but no matching run appeared within "
             f"{_GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS}s — check that the workflow file on "
             f"{branch_name} declares 'on: workflow_dispatch' and that the token has actions:write."
-        )
+        ), False
 
     logger.info(f"[Build Validation] Tracking run {run.html_url}")
     printed_steps: set = set()
@@ -392,7 +403,7 @@ def _run_maven_build_via_actions(
             return False, duration, "", (
                 f"GitHub Actions run did not complete within {_GH_ACTIONS_TIMEOUT_SECONDS}s "
                 f"and was cancelled: {run.html_url}"
-            )
+            ), True
         try:
             run.update()  # refresh status/conclusion from the API
             consecutive_poll_errors = 0
@@ -407,7 +418,7 @@ def _run_maven_build_via_actions(
                 return False, duration, "", (
                     f"Lost contact with the GitHub API after {consecutive_poll_errors} consecutive "
                     f"polling failures — run may still be in progress, check manually: {run.html_url}"
-                )
+                ), True
             time.sleep(_GH_ACTIONS_POLL_SECONDS)
             continue
         _stream_run_progress(run, github_repo, github_token, printed_steps, printed_job_logs)
@@ -428,7 +439,7 @@ def _run_maven_build_via_actions(
         f"[Build Validation] Run {'✅ succeeded' if success else f'❌ {run.conclusion}'} "
         f"({duration}s) — {run.html_url}"
     )
-    return success, duration, log_text, stderr
+    return success, duration, log_text, stderr, True
 
 
 
@@ -452,9 +463,16 @@ def validate_one(
 
     The build always runs on GitHub Actions (see _run_maven_build_via_actions):
     the branch is checked out locally then pushed to origin *before* the
-    build starts (the runner can only build what's on origin) — a failed
-    build therefore also deletes the now-stale branch on origin, not just
-    the local checkout.
+    build starts (the runner can only build what's on origin) — a build
+    that actually ran and failed therefore also deletes the now-stale
+    branch on origin, not just the local checkout.
+
+    If the pipeline itself couldn't be triggered (dispatch rejected, or no
+    matching run ever showed up — see _run_maven_build_via_actions'
+    `triggered` flag), that's treated as a skip, not a build failure: the
+    branch is left pushed and unrolled-back, success=False, and
+    error_reason is prefixed "SKIPPED — ..." so callers can tell the
+    difference from an actual failed build.
 
     workflow_file must declare `on: workflow_dispatch`. workflow_inputs is
     passed through to the dispatch as-is — only pass keys the workflow
@@ -509,7 +527,7 @@ def validate_one(
         )
     logger.info(f"[Build Validation] Pushed {branch_name} — dispatching {workflow_file}")
 
-    success, duration, stdout, stderr = _run_maven_build_via_actions(
+    success, duration, stdout, stderr, triggered = _run_maven_build_via_actions(
         branch_name, github_token=github_token, github_repo=github_repo,
         workflow_file=workflow_file, workflow_inputs=workflow_inputs,
         cancel_check=cancel_check,
@@ -519,6 +537,19 @@ def validate_one(
         return BuildValidationResult(
             success=True, branch_name=branch_name, pushed=True,
             build_time_seconds=duration, error_reason=None,
+        )
+
+    if not triggered:
+        # The pipeline itself never started (dispatch failed, or no matching
+        # run showed up — bad token/repo/workflow_file, or workflow_dispatch
+        # not declared on this branch). Not a build failure: skip validation
+        # rather than rolling back a branch whose build was never attempted.
+        # The branch stays pushed on origin, unvalidated.
+        logger.warning(f"[Build Validation] ⚠️  Skipped — could not trigger the pipeline: {stderr}")
+        return BuildValidationResult(
+            success=False, branch_name=branch_name, pushed=True,
+            build_time_seconds=duration,
+            error_reason=f"SKIPPED — could not trigger build pipeline: {stderr}",
         )
 
     error_reason = _extract_maven_error(stdout, stderr) if stdout else (stderr or "Remote build failed")
