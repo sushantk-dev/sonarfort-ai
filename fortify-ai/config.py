@@ -60,6 +60,14 @@ class FortifyAIConfig(BaseSettings):
         default="",
         description="Target GitHub repo in owner/repo format, e.g. acme/backend",
     )
+    build_workflow_file: str = Field(
+        default="runMavenSharedWorkflow.yml",
+        description=(
+            "Workflow file under .github/workflows/ dispatched by build_validation "
+            "to run the Maven build on a GitHub Actions runner (this pipeline no "
+            "longer runs mvn locally). Must declare 'on: workflow_dispatch'."
+        ),
+    )
 
     # ── Project / ADR ────────────────────────────────────────────────────────
     project_path: str = Field(

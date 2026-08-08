@@ -532,11 +532,10 @@ class AdrFixRequest(BaseModel):
 class BuildValidationRequest(BaseModel):
     adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix (commit-only — build not yet run)")
     project_path: str = Field(..., description="Absolute path to Maven project root")
-    required_jdk: Optional[str] = Field(default=None, description="Java major version, e.g. '17' — looked up in FORTIFYAI_JDK_REGISTRY; falls back to PATH")
-    mvn_exe: str = Field(default="", description="Explicit mvn executable path; empty = auto-detect on PATH")
-    java_home: str = Field(default="", description="Explicit JAVA_HOME override; always wins over required_jdk")
-    skip_tests: bool = Field(default=True)
-    build_threads: str = Field(default="1C")
+    github_token: str = Field(default="", description="GitHub token with actions:write + contents:write; defaults to cfg.github_token if empty")
+    github_repo: str = Field(default="", description="owner/repo; defaults to cfg.github_repo if empty")
+    workflow_file: str = Field(default="runMavenSharedWorkflow.yml", description="Workflow file under .github/workflows/ to dispatch — must declare 'on: workflow_dispatch'")
+    workflow_inputs: Optional[dict] = Field(default=None, description="Passed through to the workflow_dispatch call as-is — only include keys the workflow declares under on.workflow_dispatch.inputs")
 
 
 class AiCodeFixRequest(BaseModel):
@@ -1074,7 +1073,8 @@ def _run_full_pipeline(
                     continue
                 bv_result = validate_one(
                     artifact_id, adr_result, str(project_path),
-                    required_jdk=required_jdk, cancel_check=cancel_check,
+                    github_token=cfg.github_token, github_repo=cfg.github_repo,
+                    workflow_file=cfg.build_workflow_file, cancel_check=cancel_check,
                 )
                 merged_results.append({"artifact_id": artifact_id, "result": {
                     **adr_result,
@@ -2606,15 +2606,18 @@ def stage_build_validation(req: BuildValidationRequest):
     **Stage 6b — Build Validation**
 
     Runs immediately after /stages/adr-fix. For each committed group: checks
-    out its branch, runs `mvn clean install`, then pushes on success or
-    rolls the branch back (checkout base_branch + delete branch) on failure.
+    out its branch, pushes it, dispatches a GitHub Actions build
+    (workflow_file, must declare `on: workflow_dispatch`) and waits for it,
+    then leaves the branch pushed on success or rolls it back (checkout
+    base_branch + delete branch, locally and on origin) on failure.
     Groups where the adr-fix result was already unsuccessful (escalated,
     dry-run, commit failure, no-op) are passed through unchanged — nothing
     to build.
 
-    Input:  adr_results[]  (from /stages/adr-fix)
-            project_path   (absolute path to Maven project root)
-            required_jdk   (optional — same FORTIFYAI_JDK_REGISTRY lookup ADR uses internally)
+    Input:  adr_results[]     (from /stages/adr-fix)
+            project_path      (absolute path to Maven project root)
+            github_token/repo (optional — falls back to cfg.github_token/github_repo)
+            workflow_file     (optional — defaults to cfg.build_workflow_file)
     Output: adr_results[] — SAME shape as /stages/adr-fix, with success/branch_name/
             build_time_seconds/error_reason updated to reflect the build+push
             outcome. Pass this (not the raw /stages/adr-fix output) to
@@ -2623,6 +2626,8 @@ def stage_build_validation(req: BuildValidationRequest):
     t0 = time.time()
     try:
         from agents.build_validation import validate_one
+
+        cfg = load_config()
 
         results = []
         for entry in req.adr_results:
@@ -2639,9 +2644,10 @@ def stage_build_validation(req: BuildValidationRequest):
 
             bv_result = validate_one(
                 artifact_id, adr_result, req.project_path,
-                mvn_exe=req.mvn_exe, java_home=req.java_home,
-                required_jdk=req.required_jdk,
-                skip_tests=req.skip_tests, build_threads=req.build_threads,
+                github_token=req.github_token or cfg.github_token,
+                github_repo=req.github_repo or cfg.github_repo,
+                workflow_file=req.workflow_file or cfg.build_workflow_file,
+                workflow_inputs=req.workflow_inputs,
             )
             # Merge into the AdrResult shape so downstream /stages/pr-agent and
             # /stages/fortify-writeback (which expect adr_results[]) need no changes.
@@ -2987,7 +2993,8 @@ def _run_until(
                 continue
             bv_result = validate_one(
                 artifact_id, adr_result, str(project_path),
-                cancel_check=cancel_check,
+                github_token=cfg.github_token, github_repo=cfg.github_repo,
+                workflow_file=cfg.build_workflow_file, cancel_check=cancel_check,
             )
             merged_results.append({"artifact_id": artifact_id, "result": {
                 **adr_result,

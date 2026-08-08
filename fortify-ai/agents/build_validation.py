@@ -1,62 +1,62 @@
 """
-FortifyAI — Build Validation Agent (Iteration 8b)
-----------------------------------------------------
+FortifyAI — Build Validation Agent (Iteration 9 — remote build)
+------------------------------------------------------------------
 Responsibility:
-  Runs immediately after adr_fix in the graph. adr_fix now only edits
-  pom.xml and creates a local git commit on a fresh feature branch
-  (invoked with --skip-build) — this node owns everything that used to be
-  baked into that single ADR subprocess call:
+  Runs immediately after adr_fix in the graph. adr_fix only edits pom.xml
+  and creates a local git commit on a fresh feature branch — this node
+  owns everything downstream of that commit:
 
     1. Check out the branch adr_fix just committed.
-    2. Run 'mvn clean compile' (skip tests by default, matching ADR's old
-       --skipTests default) directly against project_path, using the same
-       JDK-registry resolution as ADR (required_jdk → FORTIFYAI_JDK_REGISTRY
-       → PATH fallback) so the build runs under the same JDK ADR would have
-       used. "compile" rather than "install" — see _run_maven_build's
-       docstring for why: this only needs to confirm the fix compiles
-       across the reactor, and skipping packaging/install cuts real time
-       off every run and removes several of the .m2-repo writes that could
-       stall waiting on a lock.
-    3. On success  → push the branch to origin. pr_agent only opens a PR
-       for a group whose build_validation result is a *pushed* branch (this
-       node overwrites state["_adr_results"]/state["adr_result"] in place
-       with the merged outcome, since pr_agent_node downstream still reads
-       those keys — see the "Merge" comment in build_validation_node).
-    4. On failure  → roll the branch back: checkout base_branch, delete the
-       feature branch (git branch -D) so the working tree is clean for the
-       next attempt, and extract the Maven error for failure_analysis.
+    2. Push it to origin (the build always runs on a GitHub Actions
+       runner, not on this pod — see _run_maven_build_via_actions below —
+       so the branch has to exist on origin before anything can build it).
+    3. Dispatch `workflow_file` (default runMavenSharedWorkflow.yml, must
+       declare `on: workflow_dispatch`) against that branch and poll until
+       it completes.
+    4. On success → nothing further to push (already pushed in step 2).
+       pr_agent only opens a PR for a group whose build_validation result
+       is a *pushed* branch (this node overwrites state["_adr_results"]/
+       state["adr_result"] in place with the merged outcome, since
+       pr_agent_node downstream still reads those keys — see the "Merge"
+       comment in build_validation_node).
+    5. On failure → roll the branch back: checkout base_branch, delete the
+       feature branch locally AND on origin (it was pushed in step 2, so
+       origin needs cleaning up too, not just the local checkout), and
+       extract the Maven error (from the failed run's downloaded logs) for
+       failure_analysis.
 
-  Why split this out of adr_fix:
-    - adr_fix and build_validation can now fail independently and are
-      retried independently — a commit failure (e.g. dependency not found
-      in any pom.xml) never needs a Maven build, and a build failure never
-      needs to redo the pom.xml edit if we later want a "rebuild only"
-      retry path.
-    - The Maven build step is reusable for a future smoke-test / retry
-      pass (Tech_Stack.md already documents a second `mvn test -pl
-      <module> -Dtest=<generated_test>` invocation) without touching ADR.
-    - Push no longer happens speculatively before the build is known to
-      pass — nothing unbuildable reaches origin.
+  Why the build runs on GitHub Actions rather than as a local subprocess:
+    This pod doesn't carry the corporate proxy / internal Nexus mirror
+    settings.xml, JDK registry, etc. that the existing CI runner already
+    has configured and known-working. Building there instead of
+    replicating that environment on every pipeline pod avoids drift
+    between "what this pipeline validates" and "what CI actually builds".
 
 Console output (done-when):
   [Build Validation] Checking out feature/fortify-fix-1697672-c6266fa8
-  [Build Validation] Running mvn clean compile -DskipTests ...
-  [Build Validation] ✅ Build passed (87s) — pushing branch
-  [Build Validation] ✅ Pushed feature/fortify-fix-1697672-c6266fa8
+  [Build Validation] Pushed feature/fortify-fix-1697672-c6266fa8 — dispatching runMavenSharedWorkflow.yml
+  [Build Validation] Tracking run https://github.com/OWNER/REPO/actions/runs/123456
+  [Build Validation]   build › Set up job: completed
+  [Build Validation]   build › Run mvn clean compile: in_progress
+  [Build Validation]   build › Run mvn clean compile: completed
+  [Build Validation] ── build log ──
+  [Build Validation]   ##[group]Run mvn clean compile ...
+  [Build Validation]   [INFO] Scanning for projects...
+  [Build Validation]   ...
+  [Build Validation] ✅ succeeded (87s) — https://github.com/OWNER/REPO/actions/runs/123456
 """
 
 from __future__ import annotations
 
-import json
+import io
 import os
-import queue
-import shutil
 import subprocess
-import threading
 import time
-import xml.etree.ElementTree as ET
+import zipfile
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
+import requests
 from loguru import logger
 
 from state import AgentState, BuildValidationResult, PipelineCancelledError
@@ -66,222 +66,26 @@ try:  # flat layout (adr_fix.py at repo root, next to state.py)
 except ImportError:  # package layout
     from agents.adr_fix import _extract_maven_error  # type: ignore
 
-# NOTE: deliberately does NOT import from adr_fortify.py. adr_path (and
-# therefore wherever adr_fortify.py actually lives) is a runtime-configured,
-# arbitrary filesystem path — see FortifyAIConfig.adr_path in config.py — the
-# same category as japicmp_jar_path. adr_fix.py only ever invokes it via
-# `subprocess.Popen([sys.executable, adr_path, ...])`, never as an importable
-# module, precisely because it isn't guaranteed to be co-located with this
-# package or even be the same script (different checkout, different version,
-# a compiled/bundled tool, etc.). The JDK-registry resolution below is
-# therefore duplicated in full (not imported) so this module stays correct
-# regardless of what adr_path points at — see adr_fortify.py's
-# _load_jdk_registry / _resolve_java_home / _build_subprocess_env for the
-# canonical version this must stay behaviourally identical to.
+_DEFAULT_WORKFLOW_FILE = "runMavenSharedWorkflow.yml"
 
-_BUILD_TIMEOUT_SECONDS = 600
+# Overall wall-clock budget for a dispatched run: dispatch lookup + CI queue
+# time + the build itself. Generous relative to the old local-subprocess
+# timeout since a shared runner can be queued behind other jobs.
+_GH_ACTIONS_TIMEOUT_SECONDS = int(os.environ.get("FORTIFYAI_GH_ACTIONS_TIMEOUT", 900))
+_GH_ACTIONS_POLL_SECONDS = 10
+# How long to wait for the dispatched run to show up in the workflow's run
+# list before giving up — workflow_dispatch's REST response is just a 204,
+# it never returns a run id, so the run has to be found by polling.
+_GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS = 60
 
-# If mvn produces zero new lines of output for this long, treat it as
-# stalled rather than waiting out the full _BUILD_TIMEOUT_SECONDS. Maven
-# normally logs "Scanning for projects..." within a second or two of
-# starting; a silence this long almost always means it's blocked on
-# something outside the build itself — a network connect() that's being
-# silently dropped rather than refused, or a file lock held by a process
-# this pipeline didn't spawn and therefore can't clean up — rather than
-# genuinely slow, visible work. Well under _BUILD_TIMEOUT_SECONDS so a
-# real stall is reported (with a distinguishing message) long before the
-# blanket timeout would otherwise fire.
-_STALL_TIMEOUT_SECONDS = 120
-
-# How often the streaming loop checks cancel_check() / the overall timeout
-# while waiting for mvn's stdout, and how long a SIGTERM'd mvn subprocess
-# gets before we escalate to SIGKILL — mirrors adr_fix.py's invoke_adr().
-_CANCEL_POLL_SECONDS = 0.5
-_CANCEL_GRACE_SECONDS = 10.0
-
-
-# ── JDK resolution (duplicated from adr_fortify.py — see note above) ───────────
-
-def _load_jdk_registry() -> dict:
-    """
-    Load a {major_version: java_home_path} map from the FORTIFYAI_JDK_REGISTRY
-    env var (a JSON object), e.g.:
-        FORTIFYAI_JDK_REGISTRY='{"8":"/opt/jdks/jdk8","17":"/opt/jdks/jdk17"}'
-    Returns {} if the env var is unset or not valid JSON.
-    """
-    raw = os.environ.get("FORTIFYAI_JDK_REGISTRY", "").strip()
-    if not raw:
-        return {}
-    try:
-        registry = json.loads(raw)
-        if isinstance(registry, dict):
-            return {str(k): str(v) for k, v in registry.items()}
-    except (ValueError, TypeError):
-        pass
-    logger.warning("[Build Validation] FORTIFYAI_JDK_REGISTRY is set but not valid JSON — ignoring.")
-    return {}
-
-
-def _resolve_java_home(explicit_java_home: str, required_jdk: str) -> str:
-    """
-    Priority: explicit java_home wins; else required_jdk looked up in
-    FORTIFYAI_JDK_REGISTRY; else "" (inherit whatever JDK is on PATH).
-    """
-    if explicit_java_home:
-        return explicit_java_home
-    if required_jdk:
-        registry = _load_jdk_registry()
-        match = registry.get(str(required_jdk))
-        if match:
-            return match
-        logger.warning(
-            f"[Build Validation] Project requires JDK {required_jdk} but no matching "
-            f"entry found in FORTIFYAI_JDK_REGISTRY — using the JDK already on PATH."
-        )
-    return ""
-
-
-def _build_subprocess_env(java_home: str) -> Optional[dict]:
-    """
-    Env dict pointing JAVA_HOME/PATH at a specific JDK, without discarding
-    the rest of the inherited environment. None (inherit unchanged) when
-    java_home is empty.
-    """
-    if not java_home:
-        return None
-    java_home = os.path.abspath(java_home)
-    env = os.environ.copy()
-    env["JAVA_HOME"] = java_home
-    env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
-    return env
 
 
 # ── lock cleanup ──────────────────────────────────────────────────────────────
-#
-# Two independent lock sources can deadlock this node:
-#   1. .git/index.lock — left behind if a previous git process in this same
-#      project_path was killed (SIGKILL from the cancel/timeout path above,
-#      a crashed prior run, etc.). Any subsequent `git` command just hangs/
-#      errors ("Another git process seems to be running") instead of failing
-#      fast, which is what actually looks like a "deadlock" from the caller's
-#      side.
-#   2. Maven local-repository resolver lock files (*.lock under the local
-#      .m2 repo) — written by Maven's Aether resolver while it holds a file
-#      lock on an artifact/metadata entry. If a previous `mvn` process was
-#      SIGKILL'd (timeout/cancel paths in _run_maven_build) mid-resolution,
-#      the lock file is never released and the next build blocks forever
-#      waiting on it.
-#
-# Both are safe to remove pre-emptively immediately before we start our own
-# git/mvn work: by construction nothing else should be concurrently using
-# this checkout or this local repo at that point.
-
-def _localrepo_from_settings_xml(settings_path: str) -> Optional[str]:
-    """
-    Parse <localRepository> out of a settings.xml, if present and set.
-    Returns None on any parse failure or if the element is absent/empty —
-    callers fall through to the next source in the priority chain.
-    """
-    if not os.path.isfile(settings_path):
-        return None
-    try:
-        tree = ET.parse(settings_path)
-        root = tree.getroot()
-        # settings.xml is namespaced in modern POMs/schemas; strip it so
-        # this works regardless of whether xmlns is declared.
-        ns = ""
-        if root.tag.startswith("{"):
-            ns = root.tag.split("}")[0] + "}"
-        elem = root.find(f"{ns}localRepository")
-        if elem is None or not (elem.text or "").strip():
-            return None
-        value = elem.text.strip()
-        # Only the common ${user.home} placeholder is expanded — settings.xml
-        # can reference arbitrary properties/profiles, but resolving those
-        # properly needs `mvn help:evaluate`, which is exactly the slow path
-        # this helper exists to avoid.
-        value = value.replace("${user.home}", os.path.expanduser("~"))
-        return os.path.expanduser(value)
-    except ET.ParseError as exc:
-        logger.warning(f"[Build Validation] Could not parse {settings_path}: {exc}")
-        return None
-    except OSError as exc:
-        logger.warning(f"[Build Validation] Could not read {settings_path}: {exc}")
-        return None
-
-
-def _resolve_maven_local_repo() -> str:
-    """
-    Best-effort local repo path, without shelling out to `mvn help:evaluate`
-    (slow, and the whole point here is to unblock a build that's stuck).
-
-    Priority (matches Maven's own precedence for this setting):
-      1. MAVEN_REPO_LOCAL env var (this project's own override hook)
-      2. -Dmaven.repo.local parsed out of MAVEN_OPTS
-      3. <localRepository> in the user settings.xml (~/.m2/settings.xml,
-         or $MAVEN_SETTINGS_PATH if set)
-      4. <localRepository> in the global settings.xml
-         ($M2_HOME/conf/settings.xml or $MAVEN_HOME/conf/settings.xml)
-      5. default ~/.m2/repository
-    """
-    override = os.environ.get("MAVEN_REPO_LOCAL", "").strip()
-    if override:
-        return override
-
-    for opt in os.environ.get("MAVEN_OPTS", "").split():
-        if opt.startswith("-Dmaven.repo.local="):
-            return opt.split("=", 1)[1]
-
-    user_settings = os.environ.get(
-        "MAVEN_SETTINGS_PATH", os.path.expanduser(os.path.join("~", ".m2", "settings.xml"))
-    )
-    from_user = _localrepo_from_settings_xml(user_settings)
-    if from_user:
-        return from_user
-
-    maven_home = os.environ.get("M2_HOME") or os.environ.get("MAVEN_HOME")
-    if maven_home:
-        from_global = _localrepo_from_settings_xml(os.path.join(maven_home, "conf", "settings.xml"))
-        if from_global:
-            return from_global
-
-    return os.path.expanduser(os.path.join("~", ".m2", "repository"))
-
-
-def _clear_maven_repo_locks(local_repo: Optional[str] = None) -> int:
-    """
-    Remove stale *.lock and *.lastUpdated files under the Maven local
-    repository. Returns the count removed. Never raises — a failed cleanup
-    attempt shouldn't block the build any more than the lock itself would.
-
-    *.lastUpdated files are Maven's own download-tracking markers, written
-    while the resolver is fetching/checking an artifact. A build killed
-    mid-resolution (timeout/cancel paths in _run_maven_build) can leave one
-    behind; the next build then fails resolving that exact artifact with a
-    FileNotFoundException/"Access is denied" on it (Windows) instead of
-    just re-attempting the download — which is what actually showed up as
-    the repeated "deadlock" here. Safe to delete: Maven regenerates them.
-    """
-    repo = local_repo or _resolve_maven_local_repo()
-    if not repo or not os.path.isdir(repo):
-        return 0
-    removed = 0
-    for root, _dirs, files in os.walk(repo):
-        for name in files:
-            if name.endswith(".lock") or name.endswith(".lastUpdated"):
-                path = os.path.join(root, name)
-                try:
-                    os.remove(path)
-                    removed += 1
-                except OSError as exc:
-                    logger.warning(f"[Build Validation] Could not remove {path}: {exc}")
-    if removed:
-        logger.info(f"[Build Validation] Removed {removed} stale Maven repository lock/marker file(s) under {repo}")
-    return removed
-
 
 def _clear_git_index_lock(project_path: str) -> bool:
-    """Remove a stale .git/index.lock in project_path, if present."""
+    """Remove a stale .git/index.lock in project_path, if present — e.g. left
+    behind by a previous killed/timed-out run against this same project_path,
+    which would otherwise block this run's checkout/push indefinitely."""
     lock_path = os.path.join(project_path, ".git", "index.lock")
     if os.path.exists(lock_path):
         try:
@@ -291,12 +95,6 @@ def _clear_git_index_lock(project_path: str) -> bool:
         except OSError as exc:
             logger.warning(f"[Build Validation] Could not remove git lock {lock_path}: {exc}")
     return False
-
-
-def _clear_stale_locks(project_path: str, local_repo: Optional[str] = None) -> None:
-    """Clear both lock sources up front — call before checkout + before mvn."""
-    _clear_git_index_lock(project_path)
-    _clear_maven_repo_locks(local_repo)
 
 
 # ── git helpers ────────────────────────────────────────────────────────────────
@@ -316,251 +114,322 @@ def _run_git(cmd: list[str], project_path: str, desc: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _rollback_branch(project_path: str, branch_name: str, base_branch: Optional[str]) -> None:
-    """Discard a feature branch whose build failed: checkout base, delete branch."""
+def _rollback_branch(
+    project_path: str, branch_name: str, base_branch: Optional[str], delete_remote: bool = False,
+) -> None:
+    """
+    Discard a feature branch whose build failed: checkout base, delete the
+    local branch. delete_remote=True additionally deletes it on origin —
+    needed here because the branch is always pushed *before* the GitHub
+    Actions build runs (the runner can only build what's already on
+    origin), so a failed build has already left the branch on origin and
+    it must be cleaned up there too, not just locally.
+    """
     target = base_branch or "main"
     ok, _ = _run_git(["git", "checkout", target], project_path, f"checkout {target}")
     if not ok and target != "master":
         _run_git(["git", "checkout", "master"], project_path, "checkout master (fallback)")
     _run_git(["git", "branch", "-D", branch_name], project_path, f"delete {branch_name}")
-    logger.warning(f"[Build Validation] ⚠️  Rolled back — deleted local branch {branch_name}")
+    if delete_remote:
+        ok, err = _run_git(
+            ["git", "push", "origin", "--delete", branch_name], project_path, f"delete origin/{branch_name}",
+        )
+        if not ok:
+            logger.warning(f"[Build Validation] Could not delete origin/{branch_name}: {err}")
+    logger.warning(
+        f"[Build Validation] ⚠️  Rolled back — deleted local"
+        f"{' + remote' if delete_remote else ''} branch {branch_name}"
+    )
 
 
-# ── Maven build ────────────────────────────────────────────────────────────────
+# ── Remote build via GitHub Actions ─────────────────────────────────────────
+#
+# The build always runs on a GitHub Actions runner, not on this pod: push
+# the branch, dispatch `workflow_file` (must declare `on: workflow_dispatch`)
+# against it, and poll until the run completes. workflow_dispatch's REST
+# response is just a 204 (no run id), so the run has to be located by
+# listing recent runs on that branch/event after the dispatch.
 
-def _find_mvn(mvn_exe: str = "") -> str:
-    if mvn_exe:
-        return mvn_exe
-    for candidate in ("mvn", "mvn.cmd"):
-        found = shutil.which(candidate)
-        if found:
-            return found
-    return "mvn"  # let subprocess raise FileNotFoundError if truly absent
-
-
-def _kill_process_tree(proc: "subprocess.Popen", grace_seconds: float) -> None:
+def _download_run_log_text(run, github_token: str) -> str:
     """
-    Terminate proc and any descendants it spawned, waiting up to
-    grace_seconds for a clean exit before escalating to a hard kill.
-
-    proc.terminate()/proc.kill() alone only ever signal the *direct* child.
-    On Windows that direct child is cmd.exe running mvn.cmd, not the java.exe
-    it launches — killing just the wrapper leaves the JVM running in the
-    background, still holding open file handles into the local Maven repo
-    (e.g. mid-write *.lastUpdated files). The next build then fails
-    resolving that exact artifact with "Access is denied" instead of a
-    normal retry, which is what actually presented as a repeated deadlock
-    here. taskkill /T kills the whole process tree by PID, avoiding that.
-    On POSIX, the process group started via start_new_session covers the
-    same case (e.g. a forked mvn wrapper shell spawning the JVM).
+    Fetch the full combined text of every job's log for a finished
+    WorkflowRun, so build-failure output flows into _extract_maven_error
+    exactly the way local mvn output used to. GitHub's logs endpoint
+    returns a zip archive (one .txt per job/step group); PyGithub has no
+    built-in helper for it, so it's fetched directly here with `requests`.
+    Returns "" on any failure (network, auth, malformed zip) — callers
+    should treat that as "no log text available", not as a build failure.
     """
-    if proc.poll() is not None:
-        return  # already exited
     try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, timeout=grace_seconds,
-            )
-        else:
-            import signal
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=grace_seconds)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        resp = requests.get(
+            run.logs_url,
+            headers={
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        chunks: list[str] = []
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            for name in sorted(zf.namelist()):
+                if not name.endswith(".txt"):
+                    continue
+                chunks.append(f"── {name} ──")
+                chunks.append(zf.read(name).decode("utf-8", errors="replace"))
+        return "\n".join(chunks)
     except Exception as exc:
-        logger.warning(f"[Build Validation] Process-tree kill for pid={proc.pid} raised: {exc}")
+        logger.warning(f"[Build Validation] Could not download GitHub Actions run logs: {exc}")
+        return ""
+
+
+def _download_job_log_text(github_repo: str, job_id: int, github_token: str) -> str:
+    """
+    Fetch the raw text log for a single completed job (plain text, not a
+    zip — that's only for the whole-run endpoint used by
+    _download_run_log_text). Used to print a job's output the moment it
+    finishes, for live progress, rather than waiting for the whole run.
+    Returns "" on any failure — logs may briefly 404 right after a job
+    transitions to completed, before GitHub finishes persisting them.
+    """
     try:
-        proc.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        pass
+        resp = requests.get(
+            f"https://api.github.com/repos/{github_repo}/actions/jobs/{job_id}/logs",
+            headers={
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.text
+        # NOTE: requests strips the Authorization header on any redirect to a
+        # different host by default — this endpoint 302s to short-lived blob
+        # storage, so the token is never sent there.
+    except Exception as exc:
+        logger.debug(f"[Build Validation] Could not download job {job_id} log yet: {exc}")
+        return ""
 
 
-def _run_maven_build(
-    project_path: str,
-    mvn_exe: str = "",
-    skip_tests: bool = True,
-    java_home: str = "",
-    build_threads: str = "1C",
-    build_goal: str = "compile",
+def _stream_run_progress(
+    run, github_repo: str, github_token: str, printed_steps: set, printed_job_logs: set,
+) -> None:
+    """
+    Called on every poll iteration while a run is in progress. Prints:
+      - each step's status the first time it's seen in a new state
+        (queued → in_progress → completed), so progress is visible turn by
+        turn even though GitHub has no true log-streaming API for a run
+        that's still executing;
+      - the full log text of a job the moment that job completes, rather
+        than waiting for the whole run to finish (multi-job workflows then
+        show earlier jobs' output while later jobs are still running).
+
+    printed_steps / printed_job_logs are caller-owned sets used to avoid
+    re-printing the same step transition or job log on the next poll.
+    """
+    try:
+        jobs = list(run.jobs())
+    except Exception as exc:
+        logger.debug(f"[Build Validation] Could not list jobs for run {run.id}: {exc}")
+        return
+
+    for job in jobs:
+        for step in (job.raw_data or {}).get("steps", []):
+            key = (job.id, step["name"], step["status"], step.get("conclusion"))
+            if key in printed_steps:
+                continue
+            printed_steps.add(key)
+            state = step.get("conclusion") or step["status"]
+            logger.info(f"[Build Validation]   {job.name} › {step['name']}: {state}")
+
+        if job.status == "completed" and job.id not in printed_job_logs:
+            printed_job_logs.add(job.id)
+            log_text = _download_job_log_text(github_repo, job.id, github_token)
+            if log_text:
+                logger.info(f"[Build Validation] ── {job.name} log ──")
+                for line in log_text.splitlines():
+                    logger.info(f"[Build Validation]   {line}")
+
+
+def _find_dispatched_run(repo, workflow, ref: str, dispatched_after: "datetime", cancel_check):
+    """
+    Poll the workflow's run list for the run created by our dispatch: the
+    newest workflow_dispatch run on `ref` whose created_at is at/after
+    dispatched_after. Returns the WorkflowRun, or None if it never showed
+    up within _GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS (dispatch may have
+    silently failed — e.g. workflow_dispatch not declared in the yml on
+    that ref, or a permissions error that the 204 response hides).
+    """
+    deadline = time.time() + _GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if cancel_check is not None and cancel_check():
+            raise PipelineCancelledError("Cancelled while waiting for the GitHub Actions run to start")
+        try:
+            runs = workflow.get_runs(branch=ref, event="workflow_dispatch")
+            for run in runs:  # PagedList, newest first
+                if run.created_at.replace(tzinfo=timezone.utc) >= dispatched_after:
+                    return run
+        except Exception as exc:
+            logger.warning(f"[Build Validation] Error polling for dispatched run: {exc}")
+        time.sleep(3)
+    return None
+
+
+def _cancel_run(run) -> None:
+    """
+    Best-effort: ask GitHub to cancel an in-progress run. Called whenever
+    this function is about to give up on a run for a reason that has
+    nothing to do with the run's own conclusion (our timeout, a user
+    cancellation, or polling itself breaking) — otherwise the run keeps
+    consuming a runner and can still push/succeed *after* we've already
+    reported failure and rolled the branch back, leaving an orphaned run
+    racing an already-deleted branch. Never raises.
+    """
+    try:
+        run.cancel()
+        logger.warning(f"[Build Validation] Requested cancellation of {run.html_url}")
+    except Exception as exc:
+        logger.warning(f"[Build Validation] Could not cancel {run.html_url}: {exc}")
+
+
+# Consecutive polling failures (network blip, transient 5xx, rate limiting)
+# tolerated before giving up — a single run.update() exception here used to
+# crash the whole node uncaught; now it's retried with backoff and only
+# treated as a real failure once it's persistent, not transient.
+_GH_ACTIONS_MAX_CONSECUTIVE_POLL_ERRORS = 5
+
+
+def _run_maven_build_via_actions(
+    branch_name: str,
+    github_token: str,
+    github_repo: str,
+    workflow_file: str = _DEFAULT_WORKFLOW_FILE,
+    workflow_inputs: Optional[dict] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[bool, int, str, str]:
     """
-    Returns (success, duration_seconds, stdout, stderr).
-    java_home resolution (required_jdk → FORTIFYAI_JDK_REGISTRY → PATH) is
-    the caller's job — see build_validation_node, which mirrors exactly how
-    adr_fortify.py resolves it internally via _resolve_java_home.
+    Dispatch `workflow_file` against `branch_name` in `github_repo`, stream
+    step-level progress + each job's log as it finishes (see
+    _stream_run_progress) while waiting for it to complete, and return
+    (success, duration_seconds, stdout, stderr) — stdout carries the
+    downloaded job log text on failure so _extract_maven_error still gets
+    real Maven output to parse.
 
-    Streams Maven's output line-by-line via logger.info as it runs — a
-    subprocess.run(capture_output=True) call here would silently buffer the
-    entire build until it exits (no progress visible, and even then nothing
-    gets printed unless the caller explicitly logs the returned text), which
-    is exactly the "no console output" regression this replaced: the build
-    used to be visible because adr_fortify.py's own _run_maven_build printed
-    every line live. This restores that behaviour instead of just capturing
-    text for post-hoc error extraction.
+    branch_name must already be pushed to origin — GitHub Actions builds
+    what's on the remote, not this pod's working tree (see validate_one,
+    which pushes before calling this).
 
-    cancel_check (optional): checked every _CANCEL_POLL_SECONDS while
-    streaming. On a positive check the subprocess is SIGTERM'd, given
-    _CANCEL_GRACE_SECONDS to exit, then SIGKILL'd, and
-    PipelineCancelledError is raised — same pattern as adr_fix.py's
-    invoke_adr().
-
-    build_goal (default "compile"): deliberately NOT "install". This node
-    only needs to know the fix compiles cleanly across the reactor before
-    pushing the branch — it doesn't need packaged jars or anything written
-    to the local .m2 repo. "install" additionally runs test-compile,
-    packaging (incl. shade/assembly plugins), JaCoCo, and an install:install
-    write into .m2 per module — all extra wall-clock time and extra .m2
-    writes that were never needed for this check, and every .m2 write is one
-    more thing that can stall waiting on a lock (see _clear_maven_repo_locks
-    above). "compile" resolves the same reactor dependencies via the
-    in-session reactor build order rather than needing anything installed
-    to .m2 first, so multi-module inter-module dependencies still work
-    correctly without "install".
-
-    Deliberately no --no-transfer-progress here — that flag suppresses
-    Maven's "Downloading from central: ..." / "Downloaded from central: ..."
-    lines entirely, which is exactly the output that shows which artifact a
-    resolution stall is stuck on. Losing that was making every stall look
-    identical (silence, then nothing) with no way to tell a network hang
-    from a lock from something else — worth the extra log lines to get it
-    back.
+    Stop conditions (all treated as build failure — see validate_one, which
+    rolls the branch back on any of these):
+      1. Dispatch itself fails (bad token/repo/workflow_file, network) —
+         stops immediately, nothing to cancel remotely (no run exists yet).
+      2. No matching run appears within _GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS
+         (60s) of dispatching — usually means workflow_file doesn't declare
+         `on: workflow_dispatch` on this branch, or the token lacks
+         actions:write. Nothing to cancel (dispatch may not have created a
+         run at all).
+      3. The run reaches GitHub's own "completed" status with any
+         conclusion other than "success" (failure, cancelled, timed_out,
+         action_required, stale, neutral, skipped) — the run finished on
+         its own; nothing to cancel, just report it.
+      4. cancel_check() returns True (user/pipeline cancellation) — the
+         run is actively cancelled on GitHub via _cancel_run before
+         PipelineCancelledError propagates, so a user-cancelled pipeline
+         doesn't leave an orphaned run still building on GitHub's infra.
+      5. Wall-clock exceeds _GH_ACTIONS_TIMEOUT_SECONDS (900s default,
+         override via FORTIFYAI_GH_ACTIONS_TIMEOUT) while the run is still
+         in progress — the run is actively cancelled via _cancel_run before
+         returning failure, for the same orphaned-run reason as #4.
+      6. Polling the run's status itself fails
+         _GH_ACTIONS_MAX_CONSECUTIVE_POLL_ERRORS (5) times in a row — a
+         persistent API/network problem, not a build failure. The run is
+         left running in this case (we can't reliably talk to the API to
+         cancel it either) and reported as an inconclusive failure.
     """
-    exe = _find_mvn(mvn_exe)
-    cmd = [exe, "clean", build_goal]
-    if build_threads and build_threads != "1":
-        cmd += ["-T", build_threads]
-    if skip_tests:
-        cmd.append("-DskipTests")
-
-    env = _build_subprocess_env(java_home)  # None if java_home == "" → inherit parent env
-
-    # Clear any stale locks left over from a killed prior build (timeout/
-    # cancel paths below both SIGKILL the mvn subprocess) before starting a
-    # new one — otherwise this run just blocks waiting on the old lock,
-    # which is what actually shows up as a "deadlock" upstream.
-    _clear_maven_repo_locks()
-
-    logger.info(f"[Build Validation] Running {' '.join(cmd)} ...")
-    t0 = time.time()
-    proc = None
-    output_lines: list[str] = []
     try:
-        popen_kwargs: dict = {}
-        if os.name == "nt":
-            # New process group so a future taskkill /T targets this mvn
-            # tree cleanly rather than whatever console group launched us.
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            # New session ⇒ new process group, so os.killpg below reaches
-            # the whole tree (e.g. a shell wrapper spawning the JVM) and
-            # not just this direct child.
-            popen_kwargs["start_new_session"] = True
+        from github import Github  # type: ignore
+    except ImportError:
+        return False, 0, "", "PyGithub not installed — cannot dispatch GitHub Actions build"
 
-        proc = subprocess.Popen(
-            cmd, cwd=project_path, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            **popen_kwargs,
-        )
+    t0 = time.time()
+    dispatched_at = datetime.now(timezone.utc)
+    try:
+        gh = Github(github_token)
+        repo = gh.get_repo(github_repo)
+        workflow = repo.get_workflow(workflow_file)
+        ok = workflow.create_dispatch(ref=branch_name, inputs=workflow_inputs or {})
+        if not ok:
+            return False, 0, "", f"GitHub rejected the dispatch request for {workflow_file} @ {branch_name}"
+    except Exception as exc:
+        return False, 0, "", f"Could not dispatch {workflow_file}: {exc}"
 
-        line_queue: "queue.Queue[bytes | None]" = queue.Queue()
-
-        def _reader() -> None:
-            try:
-                for raw in iter(proc.stdout.readline, b""):
-                    line_queue.put(raw)
-            finally:
-                line_queue.put(None)  # EOF sentinel
-
-        reader_thread = threading.Thread(target=_reader, daemon=True)
-        reader_thread.start()
-
-        cancelled = False
-        timed_out = False
-        stalled = False
-        last_output_t = t0
-        while True:
-            if cancel_check is not None and cancel_check():
-                cancelled = True
-                break
-            now = time.time()
-            if now - t0 > _BUILD_TIMEOUT_SECONDS:
-                timed_out = True
-                break
-            if now - last_output_t > _STALL_TIMEOUT_SECONDS:
-                stalled = True
-                break
-            try:
-                raw = line_queue.get(timeout=_CANCEL_POLL_SECONDS)
-            except queue.Empty:
-                continue
-            if raw is None:   # EOF — subprocess closed stdout
-                break
-            last_output_t = time.time()
-            line = raw.decode("utf-8", errors="replace").rstrip()
-            output_lines.append(line)
-            logger.info(f"[Build Validation]   {line}")   # streams live, matches adr_fortify.py's visibility
-
-        if stalled:
-            logger.error(
-                f"[Build Validation] mvn produced no output for {_STALL_TIMEOUT_SECONDS}s "
-                f"(after {int(time.time() - t0)}s total) — this is not normal build slowness, "
-                f"mvn should be logging within a second or two of starting. Likely blocked on "
-                f"something outside the build: a network connect() being silently dropped rather "
-                f"than refused, or a file lock held by a process this pipeline didn't spawn (check "
-                f"for stray java.exe/mvn processes predating this run). Killing and failing fast "
-                f"instead of waiting out the full {_BUILD_TIMEOUT_SECONDS}s timeout."
-            )
-            _kill_process_tree(proc, _CANCEL_GRACE_SECONDS)
-            duration = int(time.time() - t0)
-            return False, duration, "\n".join(output_lines), (
-                f"mvn produced no output for {_STALL_TIMEOUT_SECONDS}s and was killed — likely "
-                f"blocked on network I/O or a lock held by a process outside this pipeline, not a "
-                f"normal build failure. Check for stray java.exe/mvn processes and network "
-                f"connectivity to your Maven repo."
-            )
-
-        if timed_out:
-            logger.error(f"[Build Validation] Build timed out after {_BUILD_TIMEOUT_SECONDS}s — killing mvn")
-            _kill_process_tree(proc, _CANCEL_GRACE_SECONDS)
-            duration = int(time.time() - t0)
-            return False, duration, "\n".join(output_lines), f"Timed out after {_BUILD_TIMEOUT_SECONDS}s"
-
-        if cancelled:
-            logger.warning(
-                f"[Build Validation] Cancellation requested — terminating mvn "
-                f"subprocess tree (pid={proc.pid})"
-            )
-            _kill_process_tree(proc, _CANCEL_GRACE_SECONDS)
-            raise PipelineCancelledError(
-                f"Cancelled by user while the Maven build was in progress "
-                f"(pid={proc.pid}); partial output captured for the audit log."
-            )
-
-        proc.wait()   # reader hit EOF, so this returns immediately
-        duration = int(time.time() - t0)
-        combined = "\n".join(output_lines)
-        return proc.returncode == 0, duration, combined, ""
-
+    logger.info(f"[Build Validation] Dispatched {workflow_file} for {branch_name} — waiting for run to start")
+    try:
+        run = _find_dispatched_run(repo, workflow, branch_name, dispatched_at, cancel_check)
     except PipelineCancelledError:
         raise
-    except FileNotFoundError:
+    if run is None:
         duration = int(time.time() - t0)
-        logger.error(f"[Build Validation] Maven executable not found ({exe})")
-        return False, duration, "", f"Maven executable not found: {exe}"
-    except Exception as exc:
-        duration = int(time.time() - t0)
-        logger.error(f"[Build Validation] Error running maven: {exc}")
-        return False, duration, "\n".join(output_lines), str(exc)
+        return False, duration, "", (
+            f"Dispatched {workflow_file} but no matching run appeared within "
+            f"{_GH_ACTIONS_RUN_LOOKUP_TIMEOUT_SECONDS}s — check that the workflow file on "
+            f"{branch_name} declares 'on: workflow_dispatch' and that the token has actions:write."
+        )
+
+    logger.info(f"[Build Validation] Tracking run {run.html_url}")
+    printed_steps: set = set()
+    printed_job_logs: set = set()
+    consecutive_poll_errors = 0
+    while True:
+        if cancel_check is not None and cancel_check():
+            _cancel_run(run)
+            raise PipelineCancelledError(
+                f"Cancelled while the GitHub Actions build was running ({run.html_url})"
+            )
+        if time.time() - t0 > _GH_ACTIONS_TIMEOUT_SECONDS:
+            duration = int(time.time() - t0)
+            _cancel_run(run)
+            return False, duration, "", (
+                f"GitHub Actions run did not complete within {_GH_ACTIONS_TIMEOUT_SECONDS}s "
+                f"and was cancelled: {run.html_url}"
+            )
+        try:
+            run.update()  # refresh status/conclusion from the API
+            consecutive_poll_errors = 0
+        except Exception as exc:
+            consecutive_poll_errors += 1
+            logger.warning(
+                f"[Build Validation] Error polling run status "
+                f"({consecutive_poll_errors}/{_GH_ACTIONS_MAX_CONSECUTIVE_POLL_ERRORS}): {exc}"
+            )
+            if consecutive_poll_errors >= _GH_ACTIONS_MAX_CONSECUTIVE_POLL_ERRORS:
+                duration = int(time.time() - t0)
+                return False, duration, "", (
+                    f"Lost contact with the GitHub API after {consecutive_poll_errors} consecutive "
+                    f"polling failures — run may still be in progress, check manually: {run.html_url}"
+                )
+            time.sleep(_GH_ACTIONS_POLL_SECONDS)
+            continue
+        _stream_run_progress(run, github_repo, github_token, printed_steps, printed_job_logs)
+        if run.status == "completed":
+            break
+        time.sleep(_GH_ACTIONS_POLL_SECONDS)
+
+    # One last pass — the final job(s) may have completed between the last
+    # poll's status check and run.status flipping to "completed", so their
+    # step transitions/log might not have been printed yet above.
+    _stream_run_progress(run, github_repo, github_token, printed_steps, printed_job_logs)
+
+    duration = int(time.time() - t0)
+    success = run.conclusion == "success"
+    log_text = "" if success else _download_run_log_text(run, github_token)
+    stderr = "" if success else f"GitHub Actions run concluded '{run.conclusion}': {run.html_url}"
+    logger.info(
+        f"[Build Validation] Run {'✅ succeeded' if success else f'❌ {run.conclusion}'} "
+        f"({duration}s) — {run.html_url}"
+    )
+    return success, duration, log_text, stderr
+
 
 
 # ── Per-group validation ──────────────────────────────────────────────────────
@@ -569,12 +438,10 @@ def validate_one(
     artifact_id: str,
     adr_result: dict,
     project_path: str,
-    mvn_exe: str = "",
-    java_home: str = "",
-    required_jdk: Optional[str] = None,
-    skip_tests: bool = True,
-    build_threads: str = "1C",
-    build_goal: str = "compile",
+    github_token: str = "",
+    github_repo: str = "",
+    workflow_file: str = _DEFAULT_WORKFLOW_FILE,
+    workflow_inputs: Optional[dict] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> BuildValidationResult:
     """
@@ -583,14 +450,15 @@ def validate_one(
     a synthetic failed result for groups where adr_fix itself failed,
     without calling this (there's nothing to build).
 
-    java_home / required_jdk: same semantics as adr_fortify.py's --java-home
-    / --required-jdk — explicit java_home wins, otherwise required_jdk is
-    looked up in FORTIFYAI_JDK_REGISTRY, otherwise inherit PATH. Resolving
-    it the same way here keeps the build under the same JDK ADR would have
-    used for this project.
+    The build always runs on GitHub Actions (see _run_maven_build_via_actions):
+    the branch is checked out locally then pushed to origin *before* the
+    build starts (the runner can only build what's on origin) — a failed
+    build therefore also deletes the now-stale branch on origin, not just
+    the local checkout.
 
-    build_goal: forwarded to _run_maven_build — see its docstring for why
-    "compile" (not "install") is the default.
+    workflow_file must declare `on: workflow_dispatch`. workflow_inputs is
+    passed through to the dispatch as-is — only pass keys the workflow
+    actually declares under `on.workflow_dispatch.inputs`.
     """
     branch_name = adr_result.get("branch_name")
     base_branch = adr_result.get("base_branch")
@@ -607,10 +475,17 @@ def validate_one(
             error_reason="No branch to validate (adr_fix did not create one).",
         )
 
-    # Clear stale git index.lock / Maven repo locks (e.g. left behind by a
-    # previous killed/timed-out run against this same project_path) before
-    # touching git or mvn, so this attempt doesn't hang waiting on them.
-    _clear_stale_locks(project_path)
+    if not github_token or not github_repo:
+        return BuildValidationResult(
+            success=False, branch_name=branch_name, pushed=False,
+            build_time_seconds=None,
+            error_reason="github_token/github_repo not provided — cannot dispatch a GitHub Actions build.",
+        )
+
+    # Clear a stale git index.lock (e.g. left behind by a previous killed/
+    # timed-out run against this same project_path) before touching git,
+    # so this attempt doesn't hang waiting on it.
+    _clear_git_index_lock(project_path)
 
     ok, err = _run_git(["git", "checkout", branch_name], project_path, f"checkout {branch_name}")
     if not ok:
@@ -619,40 +494,41 @@ def validate_one(
             build_time_seconds=None,
             error_reason=f"Could not check out {branch_name} for build validation: {err}",
         )
-
     logger.info(f"[Build Validation] Checking out {branch_name}")
-    resolved_java_home = _resolve_java_home(java_home or "", str(required_jdk) if required_jdk else "")
-    success, duration, stdout, stderr = _run_maven_build(
-        project_path, mvn_exe=mvn_exe, skip_tests=skip_tests,
-        java_home=resolved_java_home, build_threads=build_threads,
-        build_goal=build_goal, cancel_check=cancel_check,
+
+    # Runner builds whatever is on origin, so the branch has to exist there
+    # before we can dispatch a run against it.
+    pushed, push_err = _run_git(
+        ["git", "push", "-u", "origin", branch_name], project_path, "push branch (pre-build)",
+    )
+    if not pushed:
+        return BuildValidationResult(
+            success=False, branch_name=branch_name, pushed=False,
+            build_time_seconds=None,
+            error_reason=f"Could not push {branch_name} for remote build: {push_err}",
+        )
+    logger.info(f"[Build Validation] Pushed {branch_name} — dispatching {workflow_file}")
+
+    success, duration, stdout, stderr = _run_maven_build_via_actions(
+        branch_name, github_token=github_token, github_repo=github_repo,
+        workflow_file=workflow_file, workflow_inputs=workflow_inputs,
+        cancel_check=cancel_check,
     )
 
     if success:
-        logger.info(f"[Build Validation] ✅ Build passed ({duration}s) — pushing branch")
-        pushed, push_err = _run_git(
-            ["git", "push", "-u", "origin", branch_name], project_path, "push branch",
-        )
-        if pushed:
-            logger.info(f"[Build Validation] ✅ Pushed {branch_name}")
-        else:
-            logger.error(f"[Build Validation] ❌ Build passed but push failed: {push_err}")
         return BuildValidationResult(
-            success=pushed,
-            branch_name=branch_name,
-            pushed=pushed,
-            build_time_seconds=duration,
-            error_reason=None if pushed else f"Build passed but push failed: {push_err}",
+            success=True, branch_name=branch_name, pushed=True,
+            build_time_seconds=duration, error_reason=None,
         )
 
-    error_reason = _extract_maven_error(stdout, stderr)
-    logger.error(f"[Build Validation] ❌ Build failed ({duration}s) — rolling back")
+    error_reason = _extract_maven_error(stdout, stderr) if stdout else (stderr or "Remote build failed")
+    logger.error(f"[Build Validation] ❌ Remote build failed ({duration}s) — rolling back")
     logger.debug(f"[Build Validation] Error:\n{error_reason[:500]}")
-    _rollback_branch(project_path, branch_name, base_branch)
+    _rollback_branch(project_path, branch_name, base_branch, delete_remote=True)
 
     return BuildValidationResult(
         success=False,
-        branch_name=None,   # branch was deleted — nothing downstream should reference it
+        branch_name=None,   # branch was deleted (local + origin) — nothing downstream should reference it
         pushed=False,
         build_time_seconds=duration,
         error_reason=error_reason,
@@ -664,34 +540,32 @@ def validate_one(
 def build_validation_node(
     state: AgentState,
     project_path: str,
-    mvn_exe: str = "",
-    java_home: str = "",
-    skip_tests: bool = True,
-    build_threads: str = "1C",
-    build_goal: str = "compile",
+    github_token: str = "",
+    github_repo: str = "",
+    workflow_file: str = _DEFAULT_WORKFLOW_FILE,
+    workflow_inputs: Optional[dict] = None,
 ) -> AgentState:
     """
     LangGraph node: build_validation. Runs unconditionally after adr_fix.
+    The actual `mvn` build always runs on a GitHub Actions runner (see
+    validate_one / _run_maven_build_via_actions) — this node never shells
+    out to mvn locally.
 
     Reads:  state["_adr_results"]          list of {"artifact_id", "result": AdrResult}
             state["_cancel_check"]         optional zero-arg callable
-            state["required_jdk"]          same field adr_fix_node reads — set by
-                                            context_node; forwarded into the JDK
-                                            registry lookup for this build, same as
-                                            ADR would have done internally
     Writes: state["_build_validation_results"]  list of {"artifact_id", "result": BuildValidationResult}
             state["build_validation_result"]     result of the first group (for routing)
             state["last_build_error"]            overwritten with this node's error, if any
             state["audit_trail"]
 
-    build_goal (default "compile"): forwarded to validate_one/_run_maven_build
-    — see _run_maven_build's docstring for why this isn't "install".
+    workflow_file must declare `on: workflow_dispatch`. github_token /
+    github_repo are required — typically the same values config.py already
+    holds for pr_agent.py's PR creation.
 
     Raises: PipelineCancelledError if cancel_check() reports cancellation.
     """
     adr_results: list[dict] = state.get("_adr_results", [])  # type: ignore[attr-defined]
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
-    required_jdk = state.get("required_jdk")  # type: ignore[attr-defined] — set by context_node
 
     if not adr_results:
         logger.warning("[Build Validation] No ADR results in state — skipping")
@@ -717,9 +591,9 @@ def build_validation_node(
         else:
             bv_result = validate_one(
                 artifact_id, adr_result, project_path,
-                mvn_exe=mvn_exe, java_home=java_home, required_jdk=required_jdk,
-                skip_tests=skip_tests, build_threads=build_threads,
-                build_goal=build_goal, cancel_check=cancel_check,
+                github_token=github_token, github_repo=github_repo,
+                workflow_file=workflow_file, workflow_inputs=workflow_inputs,
+                cancel_check=cancel_check,
             )
 
         bv_results.append({"artifact_id": artifact_id, "result": bv_result})
