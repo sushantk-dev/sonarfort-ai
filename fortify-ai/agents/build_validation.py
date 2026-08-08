@@ -234,9 +234,17 @@ def _resolve_maven_local_repo() -> str:
 
 def _clear_maven_repo_locks(local_repo: Optional[str] = None) -> int:
     """
-    Remove stale *.lock files under the Maven local repository. Returns the
-    count removed. Never raises — a failed cleanup attempt shouldn't block
-    the build any more than the lock itself would.
+    Remove stale *.lock and *.lastUpdated files under the Maven local
+    repository. Returns the count removed. Never raises — a failed cleanup
+    attempt shouldn't block the build any more than the lock itself would.
+
+    *.lastUpdated files are Maven's own download-tracking markers, written
+    while the resolver is fetching/checking an artifact. A build killed
+    mid-resolution (timeout/cancel paths in _run_maven_build) can leave one
+    behind; the next build then fails resolving that exact artifact with a
+    FileNotFoundException/"Access is denied" on it (Windows) instead of
+    just re-attempting the download — which is what actually showed up as
+    the repeated "deadlock" here. Safe to delete: Maven regenerates them.
     """
     repo = local_repo or _resolve_maven_local_repo()
     if not repo or not os.path.isdir(repo):
@@ -244,15 +252,15 @@ def _clear_maven_repo_locks(local_repo: Optional[str] = None) -> int:
     removed = 0
     for root, _dirs, files in os.walk(repo):
         for name in files:
-            if name.endswith(".lock"):
+            if name.endswith(".lock") or name.endswith(".lastUpdated"):
                 path = os.path.join(root, name)
                 try:
                     os.remove(path)
                     removed += 1
                 except OSError as exc:
-                    logger.warning(f"[Build Validation] Could not remove lock {path}: {exc}")
+                    logger.warning(f"[Build Validation] Could not remove {path}: {exc}")
     if removed:
-        logger.info(f"[Build Validation] Removed {removed} stale Maven repository lock file(s) under {repo}")
+        logger.info(f"[Build Validation] Removed {removed} stale Maven repository lock/marker file(s) under {repo}")
     return removed
 
 
@@ -314,6 +322,52 @@ def _find_mvn(mvn_exe: str = "") -> str:
     return "mvn"  # let subprocess raise FileNotFoundError if truly absent
 
 
+def _kill_process_tree(proc: "subprocess.Popen", grace_seconds: float) -> None:
+    """
+    Terminate proc and any descendants it spawned, waiting up to
+    grace_seconds for a clean exit before escalating to a hard kill.
+
+    proc.terminate()/proc.kill() alone only ever signal the *direct* child.
+    On Windows that direct child is cmd.exe running mvn.cmd, not the java.exe
+    it launches — killing just the wrapper leaves the JVM running in the
+    background, still holding open file handles into the local Maven repo
+    (e.g. mid-write *.lastUpdated files). The next build then fails
+    resolving that exact artifact with "Access is denied" instead of a
+    normal retry, which is what actually presented as a repeated deadlock
+    here. taskkill /T kills the whole process tree by PID, avoiding that.
+    On POSIX, the process group started via start_new_session covers the
+    same case (e.g. a forked mvn wrapper shell spawning the JVM).
+    """
+    if proc.poll() is not None:
+        return  # already exited
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=grace_seconds,
+            )
+        else:
+            import signal
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    except Exception as exc:
+        logger.warning(f"[Build Validation] Process-tree kill for pid={proc.pid} raised: {exc}")
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_maven_build(
     project_path: str,
     mvn_exe: str = "",
@@ -363,9 +417,21 @@ def _run_maven_build(
     proc = None
     output_lines: list[str] = []
     try:
+        popen_kwargs: dict = {}
+        if os.name == "nt":
+            # New process group so a future taskkill /T targets this mvn
+            # tree cleanly rather than whatever console group launched us.
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            # New session ⇒ new process group, so os.killpg below reaches
+            # the whole tree (e.g. a shell wrapper spawning the JVM) and
+            # not just this direct child.
+            popen_kwargs["start_new_session"] = True
+
         proc = subprocess.Popen(
             cmd, cwd=project_path, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            **popen_kwargs,
         )
 
         line_queue: "queue.Queue[bytes | None]" = queue.Queue()
@@ -401,30 +467,16 @@ def _run_maven_build(
 
         if timed_out:
             logger.error(f"[Build Validation] Build timed out after {_BUILD_TIMEOUT_SECONDS}s — killing mvn")
-            proc.terminate()
-            try:
-                proc.wait(timeout=_CANCEL_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            _kill_process_tree(proc, _CANCEL_GRACE_SECONDS)
             duration = int(time.time() - t0)
             return False, duration, "\n".join(output_lines), f"Timed out after {_BUILD_TIMEOUT_SECONDS}s"
 
         if cancelled:
             logger.warning(
                 f"[Build Validation] Cancellation requested — terminating mvn "
-                f"subprocess (pid={proc.pid})"
+                f"subprocess tree (pid={proc.pid})"
             )
-            proc.terminate()
-            try:
-                proc.wait(timeout=_CANCEL_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"[Build Validation] mvn subprocess (pid={proc.pid}) did not "
-                    f"exit within {_CANCEL_GRACE_SECONDS}s of SIGTERM — sending SIGKILL"
-                )
-                proc.kill()
-                proc.wait()
+            _kill_process_tree(proc, _CANCEL_GRACE_SECONDS)
             raise PipelineCancelledError(
                 f"Cancelled by user while the Maven build was in progress "
                 f"(pid={proc.pid}); partial output captured for the audit log."

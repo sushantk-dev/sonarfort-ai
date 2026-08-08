@@ -106,6 +106,17 @@ from runtime_config import apply_overrides, persist_overrides, is_persisted
 from credential_vault import encrypt_resume_meta, decrypt_resume_meta
 from state import AgentState, PipelineCancelledError
 
+# Temporarily disabled: the background 'mvn dependency:go-offline' warm-up
+# (maven_warmup.py) runs on its own thread with no synchronization against
+# adr-fix's own 'mvn dependency:tree' or build-validation's 'mvn clean
+# install' — it's fire-and-forget, and log_warmup_status() only reports
+# whether it's still running rather than waiting for it. Two live mvn
+# processes writing into the same .m2 repository at once can produce
+# resolver-lock / *.lastUpdated "Access is denied" failures that look like
+# a build deadlock. Flipping this back to True restores the warm-up once
+# it's synchronized (a shared lock, or an actual join before adr-fix runs).
+_MAVEN_WARMUP_ENABLED = False
+
 # Pull any GCS-persisted runtime config overrides (Settings-page saves,
 # refreshed Fortify tokens) into this pod's environment before anything
 # else reads load_config().
@@ -871,7 +882,7 @@ def _run_full_pipeline(
     # that stage (and the mvn build it runs) won't run again for this call,
     # so warming the cache would be wasted work.
     maven_warmup_thread = None
-    if not _already_done("build-validation"):
+    if _MAVEN_WARMUP_ENABLED and not _already_done("build-validation"):
         maven_warmup_thread = start_maven_warmup(str(project_path))
 
     # Stage 1 — triage
