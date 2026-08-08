@@ -1018,7 +1018,7 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
     if java_home:
         print(f"  {C.GRAY}[BUILD] Using JDK: {os.path.abspath(java_home)}{C.RESET}")
 
-    mvn_cmd = [mvn_exe, "clean", "install", "--no-transfer-progress"]
+    mvn_cmd = [mvn_exe, "clean", "install"]
     build_threads = (build_threads or "").strip()
     threaded = bool(build_threads) and build_threads != "1"
     if build_threads:
