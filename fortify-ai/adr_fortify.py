@@ -1697,9 +1697,20 @@ def main():
                 except Exception:
                     _eff_pom_cache[pom_path_key] = ""
                 done_eff[0] += 1
-                print(f"\r  {C.GRAY}[EFF]{C.RESET}   {done_eff[0]}/{len(pom_files)} "
-                      f"effective POM(s) resolved ...", end="", flush=True)
-        print()   # clear \r line
+                if _is_tty():
+                    # Interactive terminal: redraw the same line in place.
+                    print(f"\r  {C.GRAY}[EFF]{C.RESET}   {done_eff[0]}/{len(pom_files)} "
+                          f"effective POM(s) resolved ...", end="", flush=True)
+                else:
+                    # Non-interactive (CI console, docker logs, redirected/piped
+                    # output, etc.): a bare \r with no trailing \n is routinely
+                    # buffered/hidden by log consumers until a real newline
+                    # arrives, which makes this whole phase look hung until it
+                    # finishes. Emit one real line per completion instead.
+                    print(f"  {C.GRAY}[EFF]{C.RESET}   {done_eff[0]}/{len(pom_files)} "
+                          f"effective POM(s) resolved ...", flush=True)
+        if _is_tty():
+            print()   # clear \r line
         resolved = sum(1 for v in _eff_pom_cache.values() if v)
         print(f"  {C.GREEN if resolved == len(pom_files) else C.YELLOW}"
               f"{resolved}/{len(pom_files)} effective POM(s) resolved"
