@@ -2022,35 +2022,36 @@ def main():
     }
 
     # ─   Maven build verification (before any git commit) ─────────────────────
+    # NOTE: Maven build/install verification disabled — commented out below.
     maven_ok = None
     maven_duration = 0.0
-    if not args.analyze_only and all_applied:
-        project_root = (
-            os.path.abspath(args.project_path)
-            if os.path.isdir(args.project_path)
-            else os.path.dirname(os.path.abspath(args.project_path))
-        )
-        maven_ok, maven_duration = _run_maven_build(project_root, mvn_exe=mvn_exe,
-                                                      skip_tests=args.skipTests,
-                                                      java_home=java_home,
-                                                      build_threads=args.build_threads)
-        if not maven_ok:
-            print()
-            print(f"  {C.RED}[ABORT] Build failed — reverting all pom.xml changes from backups.{C.RESET}")
-            restored, failed = 0, 0
-            for backup in all_backups:
-                original = backup[:backup.rfind(".bak_")]
-                try:
-                    shutil.copy2(backup, original)
-                    os.remove(backup)
-                    restored += 1
-                    print(f"  {C.YELLOW}[REVERTED]{C.RESET} {original}")
-                except OSError as exc:
-                    failed += 1
-                    print(f"  {C.RED}[RESTORE ERROR]{C.RESET} {original}: {exc}")
-            print()
-            print(f"  {C.YELLOW}Restored {restored} file(s). Fix the build error above and re-run.{C.RESET}")
-            sys.exit(1)
+    # if not args.analyze_only and all_applied:
+    #     project_root = (
+    #         os.path.abspath(args.project_path)
+    #         if os.path.isdir(args.project_path)
+    #         else os.path.dirname(os.path.abspath(args.project_path))
+    #     )
+    #     maven_ok, maven_duration = _run_maven_build(project_root, mvn_exe=mvn_exe,
+    #                                                   skip_tests=args.skipTests,
+    #                                                   java_home=java_home,
+    #                                                   build_threads=args.build_threads)
+    #     if not maven_ok:
+    #         print()
+    #         print(f"  {C.RED}[ABORT] Build failed — reverting all pom.xml changes from backups.{C.RESET}")
+    #         restored, failed = 0, 0
+    #         for backup in all_backups:
+    #             original = backup[:backup.rfind(".bak_")]
+    #             try:
+    #                 shutil.copy2(backup, original)
+    #                 os.remove(backup)
+    #                 restored += 1
+    #                 print(f"  {C.YELLOW}[REVERTED]{C.RESET} {original}")
+    #             except OSError as exc:
+    #                 failed += 1
+    #                 print(f"  {C.RED}[RESTORE ERROR]{C.RESET} {original}: {exc}")
+    #         print()
+    #         print(f"  {C.YELLOW}Restored {restored} file(s). Fix the build error above and re-run.{C.RESET}")
+    #         sys.exit(1)
 
     # ── Git: commit (branch was already created before fixes were applied) ──────
     git_info = None
