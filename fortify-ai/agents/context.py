@@ -23,6 +23,7 @@ Console output (done-when):
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -33,6 +34,28 @@ from xml.etree import ElementTree as ET
 from loguru import logger
 
 from state import AgentState, PomLocation
+
+# Default per-JVM heap cap for the (single, sequential) Maven subprocess
+# calls in this module — see _build_mvn_env below for rationale.
+_DEFAULT_MAVEN_HEAP_MB = 512
+
+
+def _build_mvn_env(maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB) -> dict:
+    """
+    Environment for the mvn subprocess calls in this module, with a capped
+    JVM heap via MAVEN_OPTS (unless MAVEN_OPTS is already set — an explicit
+    operator override always wins, and maven_heap_mb=0 disables the cap).
+
+    These calls run one at a time (never concurrently within this module),
+    so this isn't about speed — it's about not letting an uncapped JVM add
+    to memory pressure if this process shares a pod with other concurrent
+    Maven subprocesses (see adr_fortify.py's Phase 1, which is where an
+    uncapped multi-JVM heap actually caused a pod-level OOM kill).
+    """
+    env = os.environ.copy()
+    if maven_heap_mb and not env.get("MAVEN_OPTS", "").strip():
+        env["MAVEN_OPTS"] = f"-Xmx{maven_heap_mb}m"
+    return env
 
 # Maven XML namespace used in pom.xml files
 _MVN_NS = "http://maven.apache.org/POM/4.0.0"
@@ -275,6 +298,7 @@ def _detect_required_jdk_via_effective_pom(
     project_path: Path,
     mvn_exe: str = "",
     timeout: int = 90,
+    maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB,
 ) -> Optional[str]:
     """
     Fallback used when NO local pom.xml in the project tree contains a
@@ -304,6 +328,9 @@ def _detect_required_jdk_via_effective_pom(
 
     Returns None if mvn is unavailable, the project can't be resolved, or
     the effective POM has no JDK signal either.
+
+    maven_heap_mb: per-JVM heap cap applied via MAVEN_OPTS (see
+        _build_mvn_env); 0 disables the cap.
     """
     root_pom = project_path if project_path.is_file() else project_path / "pom.xml"
     if not root_pom.is_file():
@@ -335,6 +362,11 @@ def _detect_required_jdk_via_effective_pom(
             cwd=cwd,
             capture_output=True,
             timeout=timeout,
+            env=_build_mvn_env(maven_heap_mb),
+            start_new_session=True,  # isolate into its own process group so
+                                      # a timeout kill can't reach the parent
+                                      # process, and any grandchild JVM it
+                                      # spawns is reachable for cleanup
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         logger.warning(f"[Context] mvn help:effective-pom failed to run: {exc}")
@@ -469,11 +501,14 @@ def _find_transitive_introducer(
     project_path: Path,
     group_id: str,
     artifact_id: str,
+    maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB,
 ) -> Optional[str]:
     """
     Run `mvn dependency:tree` to find which direct dependency pulls in
     the transitive dep. Returns the introducer artifact ID or None.
     Uses offline mode first (fast), falls back to online (slow).
+    maven_heap_mb: per-JVM heap cap applied via MAVEN_OPTS (see
+        _build_mvn_env); 0 disables the cap.
     """
     ga = f"{group_id}:{artifact_id}"
 
@@ -486,6 +521,9 @@ def _find_transitive_introducer(
                 text=True,
                 timeout=120,
                 cwd=str(project_path),
+                env=_build_mvn_env(maven_heap_mb),
+                start_new_session=True,  # isolate into its own process group
+                                          # (see _detect_required_jdk_via_effective_pom)
             )
             output = result.stdout
 

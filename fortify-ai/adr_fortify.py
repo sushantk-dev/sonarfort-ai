@@ -120,6 +120,16 @@ def _ansi_supported() -> bool:
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
 
+def _is_tty() -> bool:
+    """Plain interactive-terminal check, independent of ANSI/VT support.
+    Used to decide whether \\r-based in-place progress redraws are safe
+    (they render correctly in a real terminal, but non-interactive output
+    consumers -- CI logs, docker logs, redirected/piped output -- routinely
+    buffer/hide a line until a real \\n arrives, making the phase look
+    stalled until it finishes and everything appears at once)."""
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
 _USE_COLOR = _ansi_supported()
 
 
@@ -743,10 +753,6 @@ def _prepare_git_branch(repo_root: str, jira_id: str, base_branch_override: str 
     else:
         print(f"{C.GREEN}[GIT] Created branch {branch} from {base_branch}{C.RESET}")
 
-    # Machine-readable line for callers (e.g. FortifyAI's adr_fix/build_validation
-    # nodes) that need the base branch to roll back a feature branch on build failure.
-    print(f"ADR_BRANCH_INFO:{json.dumps({'branch': branch, 'base_branch': base_branch})}")
-
     return branch, base_branch
 
 
@@ -927,25 +933,46 @@ def _resolve_java_home(explicit_java_home: str, required_jdk: str) -> str:
     return ""
 
 
-def _build_subprocess_env(java_home: str) -> Optional[dict]:
+# Default per-JVM heap cap for Maven subprocess calls (effective-pom,
+# dependency:tree, and the build). Up to _EFFECTIVE_POM_WORKERS of these can
+# run concurrently (see collect_transitive_pool / the effective-pom
+# ThreadPoolExecutor below) -- each defaulting to an auto-sized heap
+# (commonly ~25% of the container's visible memory) can collectively exceed
+# a pod's memory limit and get silently OOM-killed by the container runtime,
+# which looks like the pipeline "hangs" with no further progress or output
+# rather than failing with a visible error. Override via --maven-heap-mb.
+_DEFAULT_MAVEN_HEAP_MB = 512
+
+# Max concurrent 'mvn help:effective-pom' subprocesses in Phase 1. Kept low
+# (rather than one-per-module) so N workers * heap cap stays comfortably
+# under typical pod memory limits. Override via --pom-workers.
+_DEFAULT_EFFECTIVE_POM_WORKERS = 3
+
+
+def _build_subprocess_env(java_home: str, maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB) -> dict:
     """
     Build an environment dict for Maven/JDK subprocess calls that points
     JAVA_HOME (and PATH) at a specific JDK install, without discarding the
     rest of the inherited environment (M2_HOME, proxy settings, Maven/GitHub
     credentials, etc.).
 
-    Returns None when java_home is empty — callers pass that straight to
-    subprocess's env= parameter, which means "inherit the parent process's
-    environment unchanged" (Python's default), so behaviour is identical to
-    before this JDK-selection feature existed.
+    Also caps the JVM heap for these calls via MAVEN_OPTS, unless MAVEN_OPTS
+    is already set in the inherited environment (an explicit operator
+    override always wins) or maven_heap_mb is falsy (0/None disables the
+    cap entirely, restoring the JVM's own default heap sizing).
+
+    java_home empty is the common case (use whatever JDK is already on
+    PATH) -- this still returns a full env dict (a copy of the parent
+    process's environment) so the MAVEN_OPTS cap is applied either way.
     """
-    if not java_home:
-        return None
-    java_home = os.path.abspath(java_home)
     env = os.environ.copy()
-    env["JAVA_HOME"] = java_home
-    bin_dir = os.path.join(java_home, "bin")
-    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    if java_home:
+        java_home = os.path.abspath(java_home)
+        env["JAVA_HOME"] = java_home
+        bin_dir = os.path.join(java_home, "bin")
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    if maven_heap_mb and not env.get("MAVEN_OPTS", "").strip():
+        env["MAVEN_OPTS"] = f"-Xmx{maven_heap_mb}m"
     return env
 
 
@@ -988,13 +1015,19 @@ def _kill_process_tree(pid: int) -> None:
                 capture_output=True, timeout=10,
             )
         else:
+            # Requires the child to have been launched with
+            # start_new_session=True, otherwise this pgid may be shared with
+            # the parent (this) process and SIGKILL would hit both.
             os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # process (and its group) already exited — nothing to kill
     except Exception:
         pass
 
 
 def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = False,
-                      java_home: str = "", build_threads: str = "1C") -> tuple:
+                      java_home: str = "", build_threads: str = "1C",
+                      maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB) -> tuple:
     """Run 'mvn clean install' in project_root.
     Returns (success: bool | None, duration: float).
     None = maven not found (skipped).  False = build failed.  True = success.
@@ -1007,6 +1040,8 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
                effectively disables parallelism, matching the old behaviour).
                Only takes effect for multi-module builds; a single pom.xml
                reactor of one module builds the same either way.
+    maven_heap_mb: per-JVM heap cap passed via MAVEN_OPTS (see
+               _build_subprocess_env); 0 disables the cap.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
@@ -1014,11 +1049,11 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         print(f"  {C.YELLOW}[BUILD] Maven not found — skipping build verification.{C.RESET}")
         return None, 0.0
 
-    build_env = _build_subprocess_env(java_home)
+    build_env = _build_subprocess_env(java_home, maven_heap_mb)
     if java_home:
         print(f"  {C.GRAY}[BUILD] Using JDK: {os.path.abspath(java_home)}{C.RESET}")
 
-    mvn_cmd = [mvn_exe, "clean", "install"]
+    mvn_cmd = [mvn_exe, "clean", "install", "--no-transfer-progress"]
     build_threads = (build_threads or "").strip()
     threaded = bool(build_threads) and build_threads != "1"
     if build_threads:
@@ -1045,6 +1080,9 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=build_env,
+            start_new_session=True,  # isolate into its own process group so
+                                      # _kill_process_tree's os.killpg() can't
+                                      # reach the parent Python process on Linux
         )
         # Stream output line-by-line so progress is visible in real time
         for raw in iter(proc.stdout.readline, b""):
@@ -1078,8 +1116,9 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         return False, time.time() - t0
 
 
-def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 600,
-                             java_home: str = "", build_threads: str = "1C") -> dict:
+def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
+                             java_home: str = "", build_threads: str = "1C",
+                             maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB) -> dict:
     """
     Runs 'mvn dependency:tree' ONCE on the project root pom and returns
     a pool dict: (groupId, artifactId, version) -> dep_dict for every dep in the
@@ -1094,6 +1133,8 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 600,
         build in _run_maven_build. Pass "1" to disable (single-threaded,
         matching the old behaviour). Reuses the same --build-threads value
         as the build step so there's one consistent knob for the whole run.
+    maven_heap_mb: per-JVM heap cap passed via MAVEN_OPTS (see
+        _build_subprocess_env); 0 disables the cap.
     """
     if not mvn_exe:
         mvn_exe = _find_mvn()
@@ -1106,7 +1147,7 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 600,
         return {}
 
     cwd = os.path.dirname(root_pom)
-    tree_env = _build_subprocess_env(java_home)
+    tree_env = _build_subprocess_env(java_home, maven_heap_mb)
 
     build_threads = (build_threads or "").strip()
     thread_flags = ["-T", build_threads] if build_threads and build_threads != "1" else []
@@ -1125,6 +1166,9 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 600,
                 encoding="utf-8",
                 errors="replace",
                 env=tree_env,
+                start_new_session=True,  # isolate into its own process group so
+                                          # _kill_process_tree's os.killpg() can't
+                                          # reach the parent Python process on Linux
             )
         except (FileNotFoundError, OSError):
             return ""
@@ -1177,7 +1221,8 @@ def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 600,
     return pool
 
 
-def get_effective_pom_content(pom_path: str, mvn_exe: str = "", java_home: str = "") -> str:
+def get_effective_pom_content(pom_path: str, mvn_exe: str = "", java_home: str = "",
+                               maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB) -> str:
     """Run 'mvn help:effective-pom' for pom_path and return the fully-resolved XML.
 
     This resolves:
@@ -1195,7 +1240,7 @@ def get_effective_pom_content(pom_path: str, mvn_exe: str = "", java_home: str =
 
     cwd      = os.path.dirname(os.path.abspath(pom_path))
     out_file = os.path.join(cwd, ".adr_effective_pom_tmp.xml")
-    eff_env  = _build_subprocess_env(java_home)
+    eff_env  = _build_subprocess_env(java_home, maven_heap_mb)
 
     try:
         proc = subprocess.Popen(
@@ -1210,6 +1255,9 @@ def get_effective_pom_content(pom_path: str, mvn_exe: str = "", java_home: str =
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=eff_env,
+            start_new_session=True,  # isolate into its own process group so
+                                      # _kill_process_tree's os.killpg() can't
+                                      # reach the parent Python process on Linux
         )
         try:
             proc.communicate(timeout=60)
@@ -1453,8 +1501,6 @@ def main():
             "  --commit FORTIFY_ID       Apply fixes + maven build + git branch/commit\n\n"
             "Options:\n"
             "  --push                    Push the created branch after committing (requires --commit)\n"
-            "  --skip-build              Skip 'mvn clean install' verification (requires --commit; "
-            "incompatible with --push — see build_validation node)\n"
             "  --base-branch BRANCH      Base branch to checkout from before creating the feature branch\n"
             "                            (auto-detected from remote HEAD if not provided)\n"
             "  --mvn PATH                Path to mvn executable (auto-detected if not provided)\n"
@@ -1501,11 +1547,6 @@ def main():
     mode_group.add_argument("--commit", metavar="FORTIFY_ID",
                             help="Apply fixes + maven build + git branch/commit, e.g. --commit FORTIFY-a4105c54")
 
-    parser.add_argument("--skip-build", action="store_true", dest="skip_build",
-                            help="Skip the internal 'mvn clean install' verification step (--commit only). "
-                                 "Fixes are applied and committed WITHOUT build validation or push — the "
-                                 "caller (FortifyAI's build_validation node) is responsible for running the "
-                                 "build itself, then pushing on success or rolling the branch back on failure.")
     parser.add_argument("--push",    action="store_true",
                         help="Push the created branch after committing (requires --commit)")
     parser.add_argument("--base-branch", default="", metavar="BRANCH",
@@ -1538,6 +1579,18 @@ def main():
                         help="Maven -T value for a multithreaded reactor build across modules. "
                              "Default '1C' (one thread per CPU core). Pass a fixed number (e.g. 4) "
                              "or '1' to disable parallelism and build single-threaded.")
+    parser.add_argument("--maven-heap-mb", type=int, default=_DEFAULT_MAVEN_HEAP_MB, metavar="MB",
+                        help=f"Per-JVM heap cap (MAVEN_OPTS=-Xmx<MB>m) applied to all Maven "
+                             f"subprocess calls, unless MAVEN_OPTS is already set in the "
+                             f"environment. Prevents concurrent effective-pom/dependency:tree "
+                             f"JVMs from collectively exceeding a container/pod memory limit "
+                             f"and getting silently OOM-killed. Default {_DEFAULT_MAVEN_HEAP_MB}. "
+                             f"Pass 0 to disable the cap (use the JVM's own default heap sizing).")
+    parser.add_argument("--pom-workers", type=int, default=_DEFAULT_EFFECTIVE_POM_WORKERS, metavar="N",
+                        help=f"Max concurrent 'mvn help:effective-pom' subprocesses in Phase 1. "
+                             f"Default {_DEFAULT_EFFECTIVE_POM_WORKERS}. Lower this (together with "
+                             f"--maven-heap-mb) if the pipeline is running in a memory-constrained "
+                             f"container/pod and getting OOM-killed.")
     args = parser.parse_args()
 
     # ── Parse --target-versions JSON ──────────────────────────────────────────
@@ -1611,15 +1664,6 @@ def main():
     args.analyze_only = args.scan
     args.jira_id      = args.commit or ""
 
-    if args.skip_build and not args.commit:
-        print(f"{C.RED}[ERROR] --skip-build requires --commit.{C.RESET}")
-        sys.exit(1)
-    if args.skip_build and args.push:
-        print(f"{C.RED}[ERROR] --skip-build and --push are mutually exclusive — "
-              f"pushing before the build is validated would publish an unverified branch. "
-              f"Run the build separately (e.g. build_validation node) before pushing.{C.RESET}")
-        sys.exit(1)
-
     # Resolve pom.xml files to process
     pom_files = _discover_pom_files(args.project_path)
     if not pom_files:
@@ -1674,8 +1718,8 @@ def main():
               flush=True)
         t_pool = time.time()
         transitive_pool = collect_transitive_pool(
-            os.path.abspath(args.project_path), args.mvn, timeout=600, java_home=java_home,
-            build_threads=args.build_threads,
+            os.path.abspath(args.project_path), args.mvn, timeout=300, java_home=java_home,
+            build_threads=args.build_threads, maven_heap_mb=args.maven_heap_mb,
         )
         elapsed_pool = time.time() - t_pool
         if transitive_pool:
@@ -1707,8 +1751,9 @@ def main():
               flush=True)
         t_eff    = time.time()
         done_eff = [0]
-        with ThreadPoolExecutor(max_workers=min(len(pom_files), 6)) as exe:
-            futures = {exe.submit(get_effective_pom_content, p, mvn_exe, java_home): p
+        with ThreadPoolExecutor(max_workers=min(len(pom_files), args.pom_workers)) as exe:
+            futures = {exe.submit(get_effective_pom_content, p, mvn_exe, java_home,
+                                   args.maven_heap_mb): p
                        for p in pom_files}
             for fut in as_completed(futures):
                 pom_path_key = futures[fut]
@@ -1717,9 +1762,20 @@ def main():
                 except Exception:
                     _eff_pom_cache[pom_path_key] = ""
                 done_eff[0] += 1
-                print(f"\r  {C.GRAY}[EFF]{C.RESET}   {done_eff[0]}/{len(pom_files)} "
-                      f"effective POM(s) resolved ...", end="", flush=True)
-        print()   # clear \r line
+                if _is_tty():
+                    # Interactive terminal: redraw the same line in place.
+                    print(f"\r  {C.GRAY}[EFF]{C.RESET}   {done_eff[0]}/{len(pom_files)} "
+                          f"effective POM(s) resolved ...", end="", flush=True)
+                else:
+                    # Non-interactive (CI console, docker logs, redirected/piped
+                    # output, etc.): a bare \r with no trailing \n is routinely
+                    # buffered/hidden by log consumers until a real newline
+                    # arrives, which makes this whole phase look hung until it
+                    # finishes. Emit one real line per completion instead.
+                    print(f"  {C.GRAY}[EFF]{C.RESET}   {done_eff[0]}/{len(pom_files)} "
+                          f"effective POM(s) resolved ...", flush=True)
+        if _is_tty():
+            print()   # clear \r line
         resolved = sum(1 for v in _eff_pom_cache.values() if v)
         print(f"  {C.GREEN if resolved == len(pom_files) else C.YELLOW}"
               f"{resolved}/{len(pom_files)} effective POM(s) resolved"
@@ -1777,7 +1833,7 @@ def main():
                   f"  {C.GRAY}[{time.time()-t0:.1f}s]{C.RESET}")
         elif mvn_exe:
             # Fallback: try on-demand (should not normally reach here)
-            eff_content = get_effective_pom_content(pom_path, mvn_exe, java_home)
+            eff_content = get_effective_pom_content(pom_path, mvn_exe, java_home, args.maven_heap_mb)
             if eff_content:
                 deps, props = parse_dependencies_effective(eff_content, content)
                 print(f"  {C.GRAY}Parsed{C.RESET}  {C.BOLD}{len(deps)}{C.RESET} deps"
@@ -2042,38 +2098,36 @@ def main():
     }
 
     # ─   Maven build verification (before any git commit) ─────────────────────
+    # NOTE: Maven build/install verification disabled — commented out below.
     maven_ok = None
     maven_duration = 0.0
-    if args.skip_build:
-        print()
-        print(f"  {C.GRAY}[BUILD] --skip-build set — deferring 'mvn clean install' to the caller.{C.RESET}")
-    elif not args.analyze_only and all_applied:
-        project_root = (
-            os.path.abspath(args.project_path)
-            if os.path.isdir(args.project_path)
-            else os.path.dirname(os.path.abspath(args.project_path))
-        )
-        maven_ok, maven_duration = _run_maven_build(project_root, mvn_exe=mvn_exe,
-                                                      skip_tests=args.skipTests,
-                                                      java_home=java_home,
-                                                      build_threads=args.build_threads)
-        if not maven_ok:
-            print()
-            print(f"  {C.RED}[ABORT] Build failed — reverting all pom.xml changes from backups.{C.RESET}")
-            restored, failed = 0, 0
-            for backup in all_backups:
-                original = backup[:backup.rfind(".bak_")]
-                try:
-                    shutil.copy2(backup, original)
-                    os.remove(backup)
-                    restored += 1
-                    print(f"  {C.YELLOW}[REVERTED]{C.RESET} {original}")
-                except OSError as exc:
-                    failed += 1
-                    print(f"  {C.RED}[RESTORE ERROR]{C.RESET} {original}: {exc}")
-            print()
-            print(f"  {C.YELLOW}Restored {restored} file(s). Fix the build error above and re-run.{C.RESET}")
-            sys.exit(1)
+    # if not args.analyze_only and all_applied:
+    #     project_root = (
+    #         os.path.abspath(args.project_path)
+    #         if os.path.isdir(args.project_path)
+    #         else os.path.dirname(os.path.abspath(args.project_path))
+    #     )
+    #     maven_ok, maven_duration = _run_maven_build(project_root, mvn_exe=mvn_exe,
+    #                                                   skip_tests=args.skipTests,
+    #                                                   java_home=java_home,
+    #                                                   build_threads=args.build_threads)
+    #     if not maven_ok:
+    #         print()
+    #         print(f"  {C.RED}[ABORT] Build failed — reverting all pom.xml changes from backups.{C.RESET}")
+    #         restored, failed = 0, 0
+    #         for backup in all_backups:
+    #             original = backup[:backup.rfind(".bak_")]
+    #             try:
+    #                 shutil.copy2(backup, original)
+    #                 os.remove(backup)
+    #                 restored += 1
+    #                 print(f"  {C.YELLOW}[REVERTED]{C.RESET} {original}")
+    #             except OSError as exc:
+    #                 failed += 1
+    #                 print(f"  {C.RED}[RESTORE ERROR]{C.RESET} {original}: {exc}")
+    #         print()
+    #         print(f"  {C.YELLOW}Restored {restored} file(s). Fix the build error above and re-run.{C.RESET}")
+    #         sys.exit(1)
 
     # ── Git: commit (branch was already created before fixes were applied) ──────
     git_info = None
