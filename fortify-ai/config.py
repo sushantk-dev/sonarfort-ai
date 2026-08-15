@@ -84,11 +84,21 @@ class FortifyAIConfig(BaseSettings):
     )
     java_home: str = Field(
         default="",
+        validation_alias="FORTIFYAI_JAVA_HOME",
         description=(
-            "Explicit JAVA_HOME override for the local mvn build. Always wins "
-            "over required_jdk/FORTIFYAI_JDK_REGISTRY when set — leave empty to "
-            "let build_validation resolve JAVA_HOME from the project's detected "
-            "required JDK instead (see build_validation._resolve_java_home)."
+            "Explicit JAVA_HOME override for the local mvn build. Bound to "
+            "FORTIFYAI_JAVA_HOME (NOT the bare JAVA_HOME env var) on purpose — "
+            "this pod's/shell's ambient JAVA_HOME is commonly already set for "
+            "other tooling (this build_validation's own subprocess env, git, "
+            "other Java tools on PATH, etc.) and Pydantic BaseSettings would "
+            "otherwise silently bind a same-named field to it, making this "
+            "'explicit override' actually always-on and permanently shadowing "
+            "required_jdk/FORTIFYAI_JDK_REGISTRY (explicit always wins per "
+            "build_validation._resolve_java_home's priority order) regardless "
+            "of what JDK the project was detected to need. Set FORTIFYAI_JAVA_HOME "
+            "only when you want to force one specific JDK for every build "
+            "regardless of required_jdk; leave it unset to let the registry "
+            "lookup do its job."
         ),
     )
     skip_tests: bool = Field(
