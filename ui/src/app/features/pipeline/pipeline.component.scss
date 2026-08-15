@@ -892,6 +892,11 @@
     font-weight: 500;
     color: var(--text-muted);
     white-space: nowrap;
+
+    &--required {
+      color: var(--status-danger, #dc2626);
+      font-weight: 600;
+    }
   }
 
   .run-form__grid { margin-bottom: 0; }
@@ -932,6 +937,133 @@
     border-color: var(--brand);
     color: var(--brand);
   }
+}
+
+// ── Build toggle — deliberately louder than the standard flag-toggle "on"
+// state: this one changes pipeline behavior (adds real minutes) rather than
+// just filtering a scan, so it gets its own primary-blue treatment plus an
+// icon and an explicit "ON" badge instead of blending in with the other pills.
+.flag-toggle--build {
+  &:hover { border-color: rgba(91,95,199,.6); color: rgb(91,95,199); }
+
+  .flag-toggle__icon { flex-shrink: 0; opacity: 0.7; }
+
+  &.flag-toggle--on {
+    background: rgba(91,95,199,.12);
+    border-color: rgb(91,95,199);
+    border-width: 1.5px;
+    color: rgb(91,95,199);
+    font-weight: 700;
+    box-shadow: 0 0 0 3px rgba(91,95,199,.14);
+
+    .flag-toggle__icon { opacity: 1; }
+  }
+
+  .flag-toggle__state {
+    font-size: 9.5px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgb(91,95,199);
+    color: #fff;
+  }
+}
+
+// ── Invalid Max Upgrades input (build on + value below the floor) ─────────
+.run-form__input--invalid {
+  border-color: var(--status-danger, #dc2626) !important;
+  box-shadow: 0 0 0 2px rgba(220,38,38,.10);
+}
+
+.run-form__field-error {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--status-danger, #dc2626);
+  margin-top: 2px;
+}
+
+.label-opt--required {
+  color: rgb(91,95,199);
+  font-weight: 400;   // stay same weight as the base .label-opt — bolding here was
+                       // enough extra width to wrap the label onto a 2nd line in
+                       // the narrow "sm" field, which threw off row alignment
+}
+
+// Required-field marker (*) — deliberately its own class, not label-opt--required
+// (that one marks a value CONSTRAINT, e.g. "≤5"; this marks the field itself as
+// mandatory). Single glyph, so bold/larger is safe here without risking the wrap
+// bug the constraint badges had.
+.label-opt--asterisk {
+  color: var(--status-danger, #dc2626);
+  font-weight: 700;
+  font-size: 12px;
+}
+
+// Guards the Max Upgrades label specifically — the field is narrow ("sm"), and its
+// width is set by a shared/global stylesheet outside this component, so this is a
+// belt-and-braces fix on top of shortening the text: it should never wrap regardless.
+.run-form__label--nowrap {
+  white-space: nowrap;
+}
+
+.run-form__hint--build {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+// ── Estimated runtime pill — fixed heuristic, sits next to Start.
+// Neutral gray normally; switches to the same warning tone as the build
+// banner once Run Maven Build is on, since that's when the estimate jumps.
+.est-runtime {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+
+  svg { flex-shrink: 0; opacity: 0.75; }
+
+  &--build {
+    color: var(--status-warning, #b45309);
+  }
+
+  &__spinner {
+    width: 9px;
+    height: 9px;
+    border: 1.5px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    opacity: 0.75;
+    flex-shrink: 0;
+    animation: spin 0.7s linear infinite;
+  }
+
+  &__modules {
+    font-weight: 400;
+    opacity: 0.8;
+  }
+}
+
+.build-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 9px 12px;
+  background: rgba(180,83,9,.08);
+  border: 1px solid rgba(180,83,9,.25);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--status-warning, #b45309);
+  animation: slide-down 0.18s ease;  // matches .run-form / .input-panel — smooths the
+                                      // reflow of everything below it instead of an abrupt jump
+
+  svg { flex-shrink: 0; }
 }
 
 // ── Error banner ──────────────────────────────────────────────────────────
@@ -1460,6 +1592,12 @@
   &--fortify {
     color: #0F6E56;
   }
+}
+
+// Always pin Start to the right of .run-form__flags, regardless of which
+// optional elements (hint text, runtime estimate) are visible beside it.
+.run-form__submit--fortify {
+  margin-left: auto;
 }
 
 // ── Fortify run form accent ───────────────────────────────────────────────

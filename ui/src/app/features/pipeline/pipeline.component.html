@@ -205,32 +205,55 @@
       <!-- LIVE: release_id + repo + max_upgrades -->
       <ng-container *ngIf="fortifyMode() === 'live'">
         <div class="run-form__field run-form__field--sm">
-          <label>Release ID</label>
-          <input class="run-form__input" type="number" [value]="fortifyReleaseId()"
+          <label class="run-form__label--nowrap">Release ID <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="releaseIdError()"
+                 type="number" [value]="fortifyReleaseId()"
                  (input)="fortifyReleaseId.set($any($event.target).value)"
                  placeholder="e.g. 1723380">
+          <span class="run-form__field-error" *ngIf="releaseIdError()">Required</span>
         </div>
         <div class="run-form__field">
-          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
-          <input class="run-form__input" [value]="fortifyGithubRepo()"
-                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+          <label class="run-form__label--nowrap">GitHub Repo
+            <span class="label-opt label-opt--asterisk" title="Required">*</span>
+            <span class="label-opt">auto-clone</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="githubRepoError()"
+                 [value]="fortifyGithubRepo()"
+                 (input)="onFortifyGithubRepoInput($any($event.target).value)"
                  placeholder="acme/backend">
+          <span class="run-form__field-error" *ngIf="githubRepoError()">Required</span>
         </div>
         <div class="run-form__field run-form__field--sm">
-          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
-          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
-                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
-                 min="0" placeholder="0">
+          <label class="run-form__label--nowrap">Max Upgrades
+            <span class="label-opt" *ngIf="!fortifyRunBuild()">0=all · ≤{{ MAX_MAX_UPGRADES_GENERAL }}</span>
+            <span class="label-opt label-opt--required" *ngIf="fortifyRunBuild()">≤{{ MAX_MAX_UPGRADES_WHEN_BUILD }}</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="maxUpgradesInvalid()"
+                 type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="onFortifyMaxUpgradesInput($any($event.target).value)"
+                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="0">
+          <span class="run-form__field-error" *ngIf="maxUpgradesInvalid()">
+            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }}
+          </span>
         </div>
       </ng-container>
 
       <!-- OFFLINE: report_path + release_id + repo + max_upgrades -->
       <ng-container *ngIf="fortifyMode() === 'offline'">
         <div class="run-form__field run-form__field--wide">
-          <label>Report Path <span class="label-opt">.json</span></label>
-          <input class="run-form__input" [value]="fortifyReportPath()"
+          <label class="run-form__label--nowrap">Report Path
+            <span class="label-opt label-opt--asterisk" title="Required">*</span>
+            <span class="label-opt">.json</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="reportPathError()"
+                 [value]="fortifyReportPath()"
                  (input)="fortifyReportPath.set($any($event.target).value)"
                  placeholder="/tmp/report.json">
+          <span class="run-form__field-error" *ngIf="reportPathError()">Required</span>
         </div>
         <div class="run-form__field run-form__field--sm">
           <label>Release ID <span class="label-opt">optional</span></label>
@@ -239,38 +262,69 @@
                  placeholder="0">
         </div>
         <div class="run-form__field">
-          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
-          <input class="run-form__input" [value]="fortifyGithubRepo()"
-                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+          <label class="run-form__label--nowrap">GitHub Repo
+            <span class="label-opt label-opt--asterisk" title="Required">*</span>
+            <span class="label-opt">auto-clone</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="githubRepoError()"
+                 [value]="fortifyGithubRepo()"
+                 (input)="onFortifyGithubRepoInput($any($event.target).value)"
                  placeholder="acme/backend">
+          <span class="run-form__field-error" *ngIf="githubRepoError()">Required</span>
         </div>
         <div class="run-form__field run-form__field--sm">
-          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
-          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
-                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
-                 min="0" placeholder="0">
+          <label class="run-form__label--nowrap">Max Upgrades
+            <span class="label-opt" *ngIf="!fortifyRunBuild()">0=all · ≤{{ MAX_MAX_UPGRADES_GENERAL }}</span>
+            <span class="label-opt label-opt--required" *ngIf="fortifyRunBuild()">≤{{ MAX_MAX_UPGRADES_WHEN_BUILD }}</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="maxUpgradesInvalid()"
+                 type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="onFortifyMaxUpgradesInput($any($event.target).value)"
+                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="0">
+          <span class="run-form__field-error" *ngIf="maxUpgradesInvalid()">
+            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }}
+          </span>
         </div>
       </ng-container>
 
       <!-- APP-NAME: app_name + repo + max_upgrades -->
       <ng-container *ngIf="fortifyMode() === 'app-name'">
         <div class="run-form__field run-form__field--wide">
-          <label>App Name</label>
-          <input class="run-form__input" [value]="fortifyAppName()"
+          <label class="run-form__label--nowrap">App Name <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="appNameError()"
+                 [value]="fortifyAppName()"
                  (input)="fortifyAppName.set($any($event.target).value)"
                  placeholder="1038_US_MyApp_USIS">
+          <span class="run-form__field-error" *ngIf="appNameError()">Required</span>
         </div>
         <div class="run-form__field">
-          <label>GitHub Repo <span class="label-opt">owner/repo — auto-clone</span></label>
-          <input class="run-form__input" [value]="fortifyGithubRepo()"
-                 (input)="fortifyGithubRepo.set($any($event.target).value)"
+          <label class="run-form__label--nowrap">GitHub Repo
+            <span class="label-opt label-opt--asterisk" title="Required">*</span>
+            <span class="label-opt">auto-clone</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="githubRepoError()"
+                 [value]="fortifyGithubRepo()"
+                 (input)="onFortifyGithubRepoInput($any($event.target).value)"
                  placeholder="acme/backend">
+          <span class="run-form__field-error" *ngIf="githubRepoError()">Required</span>
         </div>
         <div class="run-form__field run-form__field--sm">
-          <label>Max Upgrades <span class="label-opt">0 = all</span></label>
-          <input class="run-form__input" type="number" [value]="fortifyMaxUpgrades()"
-                 (input)="fortifyMaxUpgrades.set(+$any($event.target).value)"
-                 min="0" placeholder="0">
+          <label class="run-form__label--nowrap">Max Upgrades
+            <span class="label-opt" *ngIf="!fortifyRunBuild()">0=all · ≤{{ MAX_MAX_UPGRADES_GENERAL }}</span>
+            <span class="label-opt label-opt--required" *ngIf="fortifyRunBuild()">≤{{ MAX_MAX_UPGRADES_WHEN_BUILD }}</span>
+          </label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="maxUpgradesInvalid()"
+                 type="number" [value]="fortifyMaxUpgrades()"
+                 (input)="onFortifyMaxUpgradesInput($any($event.target).value)"
+                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="0">
+          <span class="run-form__field-error" *ngIf="maxUpgradesInvalid()">
+            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }}
+          </span>
         </div>
       </ng-container>
 
@@ -287,41 +341,87 @@
           </svg>
           Credentials for this run
         </div>
-        <span class="creds-panel__badge">Optional — uses server defaults if blank</span>
+        <span class="creds-panel__badge creds-panel__badge--required">Required for this run</span>
       </div>
 
       <div class="run-form__grid">
         <div class="run-form__field">
-          <label>GitHub Token</label>
-          <input class="run-form__input" type="password" autocomplete="off" [value]="fortifyGithubToken()"
+          <label class="run-form__label--nowrap">GitHub Token <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="githubTokenError()"
+                 type="password" autocomplete="off" [value]="fortifyGithubToken()"
                  (input)="fortifyGithubToken.set($any($event.target).value)"
                  placeholder="ghp_••••••••••••••••">
-          <span class="run-form__hint">PAT used for clone + PR on this run</span>
+          <span class="run-form__hint" *ngIf="!githubTokenError()">PAT used for clone + PR on this run</span>
+          <span class="run-form__field-error" *ngIf="githubTokenError()">Required</span>
         </div>
         <div class="run-form__field">
-          <label>Fortify Username</label>
-          <input class="run-form__input" [value]="fortifyUsername()"
+          <label class="run-form__label--nowrap">Fortify Username <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="usernameError()"
+                 [value]="fortifyUsername()"
                  (input)="fortifyUsername.set($any($event.target).value)"
                  placeholder="john.doe">
-          <span class="run-form__hint">"equifax\" prefix added automatically</span>
+          <span class="run-form__hint" *ngIf="!usernameError()">"equifax\" prefix added automatically</span>
+          <span class="run-form__field-error" *ngIf="usernameError()">Required</span>
         </div>
         <div class="run-form__field">
-          <label>Fortify Password</label>
-          <input class="run-form__input" type="password" autocomplete="off" [value]="fortifyPassword()"
+          <label class="run-form__label--nowrap">Fortify Password <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
+          <input class="run-form__input"
+                 [class.run-form__input--invalid]="passwordError()"
+                 type="password" autocomplete="off" [value]="fortifyPassword()"
                  (input)="fortifyPassword.set($any($event.target).value)"
                  placeholder="••••••••">
-          <span class="run-form__hint">&nbsp;</span>
+          <span class="run-form__hint" *ngIf="!passwordError()">&nbsp;</span>
+          <span class="run-form__field-error" *ngIf="passwordError()">Required</span>
         </div>
       </div>
     </div>
 
     <div class="run-form__flags">
+      <label class="flag-toggle flag-toggle--build" [class.flag-toggle--on]="fortifyRunBuild()">
+        <input type="checkbox" [checked]="fortifyRunBuild()"
+               (change)="toggleFortifyRunBuild($any($event.target).checked)">
+        <svg width="12" height="12" viewBox="0 0 14 14" fill="none" class="flag-toggle__icon">
+          <path d="M9.3 2.2a2.6 2.6 0 0 0-3.4 3.1L2 9.2l1.8 1.8 3.9-3.9a2.6 2.6 0 0 0 3.1-3.4l-1.7 1.7-1.4-1.4 1.6-1.8Z"
+                stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+        </svg>
+        Run Maven Build
+        <span class="flag-toggle__state" *ngIf="fortifyRunBuild()">ON</span>
+      </label>
+      <span class="run-form__hint run-form__hint--build" *ngIf="fortifyRunBuild()">
+        Max Upgrades is limited to {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }} while this is on.
+      </span>
+      <span class="est-runtime" *ngIf="estimatedRuntimeLabel() as est" [class.est-runtime--build]="fortifyRunBuild()">
+        <span class="est-runtime__spinner" *ngIf="buildEstimateLoading()"></span>
+        <svg width="11" height="11" viewBox="0 0 14 14" fill="none" *ngIf="!buildEstimateLoading()">
+          <circle cx="7" cy="7" r="5.8" stroke="currentColor" stroke-width="1.2"/>
+          <path d="M7 4V7L9.2 8.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Est. {{ est }}
+        <span class="est-runtime__modules" *ngIf="estimatedModuleCount() as n">({{ n }} module{{ n === 1 ? '' : 's' }})</span>
+      </span>
       <button class="run-form__submit run-form__submit--fortify"
-              (click)="startFortifyRun()" [disabled]="state.submitting() === 'start'">
+              (click)="startFortifyRun()" [disabled]="state.submitting() === 'start' || maxUpgradesInvalid()">
         <span *ngIf="state.submitting() !== 'start'">▶ Start</span>
         <span *ngIf="state.submitting() === 'start'" class="spinner"></span>
       </button>
 
+    </div>
+
+    <!-- Build-time warning — Maven build validation runs per fixed dependency,
+         so it adds real minutes to the run; make that cost visible up front. -->
+    <div class="build-warning" *ngIf="fortifyRunBuild()">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+        <path d="M7 1.5L13 12H1L7 1.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+        <path d="M7 5.5V8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+        <circle cx="7" cy="10" r=".6" fill="currentColor"/>
+      </svg>
+      Running the Maven build will make this pipeline take significantly longer — it builds
+      the project after every fix instead of only committing version bumps.
+      <ng-container *ngIf="estimatedRuntimeLabel() as est">
+        Estimated <strong>{{ est }}</strong> for {{ fortifyMaxUpgrades() }} upgrade{{ fortifyMaxUpgrades() === 1 ? '' : 's' }}<ng-container *ngIf="estimatedModuleCount() as n"> (based on {{ n }} module{{ n === 1 ? '' : 's' }})</ng-container>.
+      </ng-container>
     </div>
   </div>
 

@@ -89,8 +89,94 @@ export class PipelineComponent {
   fortifyAppName     = signal('');
   fortifyGithubRepo  = signal('');       // owner/repo — clones repo so no local PROJECT_PATH needed
   fortifyReportPath  = signal('');       // offline mode: path to JSON report
-  fortifyMaxUpgrades = signal(0);        // 0 = no limit
+  fortifyMaxUpgrades = signal(1);        
   showFortifyForm    = signal(false);
+
+  // ── Fortify form validation ─────────────────────────────────────────────────
+  // Every visible field is mandatory for its mode (GitHub Repo always; Release ID
+  // for Live; Report Path for Offline; App Name for App Name). Errors only render
+  // once the user has actually tried to submit — see fortifyFormSubmitted — so an
+  // empty field isn't flagged red before they've had a chance to fill it in.
+  fortifyFormSubmitted = signal(false);
+
+  private fortifyReleaseIdMissing = computed(() =>
+    this.fortifyFormSubmitted() && this.fortifyMode() === 'live' && !this.fortifyReleaseId().trim()
+  );
+  private fortifyReportPathMissing = computed(() =>
+    this.fortifyFormSubmitted() && this.fortifyMode() === 'offline' && !this.fortifyReportPath().trim()
+  );
+  private fortifyAppNameMissing = computed(() =>
+    this.fortifyFormSubmitted() && this.fortifyMode() === 'app-name' && !this.fortifyAppName().trim()
+  );
+  private fortifyGithubRepoMissing = computed(() =>
+    this.fortifyFormSubmitted() && !this.fortifyGithubRepo().trim()
+  );
+  private fortifyGithubTokenMissing = computed(() =>
+    this.fortifyFormSubmitted() && !this.fortifyGithubToken().trim()
+  );
+  private fortifyUsernameMissing = computed(() =>
+    this.fortifyFormSubmitted() && !this.fortifyUsername().trim()
+  );
+  private fortifyPasswordMissing = computed(() =>
+    this.fortifyFormSubmitted() && !this.fortifyPassword().trim()
+  );
+
+  /** Field-error getters for the template — true only after a submit attempt. */
+  releaseIdError    = computed(() => this.fortifyReleaseIdMissing());
+  reportPathError   = computed(() => this.fortifyReportPathMissing());
+  appNameError      = computed(() => this.fortifyAppNameMissing());
+  githubRepoError   = computed(() => this.fortifyGithubRepoMissing());
+  githubTokenError  = computed(() => this.fortifyGithubTokenMissing());
+  usernameError     = computed(() => this.fortifyUsernameMissing());
+  passwordError      = computed(() => this.fortifyPasswordMissing());
+
+  /** True once every mandatory field for the active mode is filled in. */
+  fortifyFormValid = computed(() => {
+    if (!this.fortifyGithubRepo().trim())    return false;
+    if (!this.fortifyGithubToken().trim())   return false;
+    if (!this.fortifyUsername().trim())      return false;
+    if (!this.fortifyPassword().trim())      return false;
+    switch (this.fortifyMode()) {
+      case 'live':     return !!this.fortifyReleaseId().trim();
+      case 'offline':  return !!this.fortifyReportPath().trim();
+      case 'app-name': return !!this.fortifyAppName().trim();
+      default:         return true;
+    }
+  });
+
+  // ── Run Maven build validation (Stage 6b) ──────────────────────────────────
+  // Off by default — build validation costs real CI time per dependency, so
+  // it's opt-in. Once enabled, an unlimited run (max_upgrades = 0) would mean
+  // "build after every single dependency, however many there are", which is
+  // rarely what anyone wants — so enabling this bounds max_upgrades to a
+  // small, fixed batch (1–5).
+  fortifyRunBuild = signal(false);
+  readonly MIN_MAX_UPGRADES_WHEN_BUILD = 1;   // hard floor once build is on — shown in the UI
+  readonly MAX_MAX_UPGRADES_WHEN_BUILD = 5;   // hard ceiling once build is on — shown in the UI
+
+  // General ceiling — applies regardless of Run Maven Build. 0 still means "all" (no
+  // cap on the API side), but any explicit positive value the user types is capped
+  // at 20; a single run committing more than that is treated as a config mistake
+  // rather than an intentional batch.
+  readonly MAX_MAX_UPGRADES_GENERAL = 20;
+
+  /** Smallest legal Max Upgrades value — 1 once build validation is on, else 0 (unlimited allowed). */
+  maxUpgradesMin = computed(() => this.fortifyRunBuild() ? this.MIN_MAX_UPGRADES_WHEN_BUILD : 0);
+
+  /** Largest legal Max Upgrades value — 5 once build validation is on, else the general 20-upgrade ceiling. */
+  maxUpgradesMax = computed(() =>
+    this.fortifyRunBuild() ? this.MAX_MAX_UPGRADES_WHEN_BUILD : this.MAX_MAX_UPGRADES_GENERAL
+  );
+
+  /** True when the current Max Upgrades value violates whichever range currently applies — blocks submit. */
+  maxUpgradesInvalid = computed(() => {
+    const n = this.fortifyMaxUpgrades();
+    if (this.fortifyRunBuild()) {
+      return n < this.MIN_MAX_UPGRADES_WHEN_BUILD || n > this.MAX_MAX_UPGRADES_WHEN_BUILD;
+    }
+    // Off: 0 ("all") is always fine; any explicit value must stay within the general ceiling.
+    return n > this.MAX_MAX_UPGRADES_GENERAL;
+  });
 
   // ── Per-run credentials — never persisted, cleared after each submit ──────
   // Each Fortify run can use a different GitHub PAT / Fortify account, so
@@ -98,6 +184,144 @@ export class PipelineComponent {
   fortifyGithubToken = signal('');       // GitHub PAT used for clone + PR for THIS run
   fortifyUsername    = signal('');       // Fortify OAuth username, WITHOUT the "equifax\" prefix
   fortifyPassword     = signal('');       // Fortify OAuth password for THIS run
+
+  /** Toggle Run Maven Build. Enabling it snaps Max Upgrades into the 1–5 range,
+   *  since builds are only meant to run against a small, bounded batch of deps. */
+  toggleFortifyRunBuild(on: boolean) {
+    this.fortifyRunBuild.set(on);
+    if (on) {
+      const current = this.fortifyMaxUpgrades();
+      if (current < this.MIN_MAX_UPGRADES_WHEN_BUILD || current > this.MAX_MAX_UPGRADES_WHEN_BUILD) {
+        this.fortifyMaxUpgrades.set(this.MAX_MAX_UPGRADES_WHEN_BUILD);
+      }
+    }
+    this._scheduleBuildEstimate();
+  }
+
+  /** Max Upgrades input handler — clamps to the range that currently applies:
+   *  1–5 while Run Maven Build is on, else 0 ("all") or up to the general 20 ceiling. */
+  onFortifyMaxUpgradesInput(raw: string) {
+    let n = Math.trunc(+raw) || 0;
+    if (this.fortifyRunBuild()) {
+      n = Math.min(this.MAX_MAX_UPGRADES_WHEN_BUILD, Math.max(this.MIN_MAX_UPGRADES_WHEN_BUILD, n));
+    } else if (n > this.MAX_MAX_UPGRADES_GENERAL) {
+      n = this.MAX_MAX_UPGRADES_GENERAL;
+    }
+    this.fortifyMaxUpgrades.set(n);
+    this._scheduleBuildEstimate();
+  }
+
+  /** GitHub Repo input handler — updates the field and, when build is on, re-estimates
+   *  build time against the newly-typed repo (debounced so we don't clone on every keystroke). */
+  onFortifyGithubRepoInput(raw: string) {
+    this.fortifyGithubRepo.set(raw);
+    this._scheduleBuildEstimate();
+  }
+
+  // ── Estimated run time ──────────────────────────────────────────────────────
+  // Two layers: a local fixed heuristic that renders instantly (no round-trip),
+  // and a project-size-aware estimate fetched from the backend
+  // (POST /pipeline/estimate-build-time), which counts actual Maven modules
+  // in the target repo instead of guessing. The server estimate — once it
+  // arrives for the CURRENT form state — takes over the display; the local
+  // heuristic is only shown while that request is in flight or unavailable
+  // (e.g. no repo entered yet, or the call failed).
+  private readonly EST_BASE_OVERHEAD_SEC   = 45;   // clone + auth + warm-up, once per run
+  private readonly EST_PER_DEP_SEC         = 20;   // triage..writeback per dependency (no build)
+  private readonly EST_BUILD_PER_DEP_SEC   = 150;  // extra mvn clean install per dependency (build on, local fallback only)
+
+  /** Local fallback point estimate in seconds, or null when it can't be estimated (build off + unlimited). */
+  private fallbackRuntimeSeconds = computed<number | null>(() => {
+    const n = this.fortifyMaxUpgrades();
+    if (!this.fortifyRunBuild() && n <= 0) return null;   // "all" with no build — count unknown
+    const deps    = Math.max(n, this.MIN_MAX_UPGRADES_WHEN_BUILD);
+    const perDep  = this.EST_PER_DEP_SEC + (this.fortifyRunBuild() ? this.EST_BUILD_PER_DEP_SEC : 0);
+    return this.EST_BASE_OVERHEAD_SEC + deps * perDep;
+  });
+
+  /** Server-measured estimate for Run Maven Build, keyed to the inputs it was computed from. */
+  private buildEstimateResult = signal<{
+    repo: string; maxUpgrades: number; moduleCount: number; lowSec: number; highSec: number;
+  } | null>(null);
+  buildEstimateLoading = signal(false);
+  private buildEstimateDebounce: ReturnType<typeof setTimeout> | null = null;
+
+  /** True once a server estimate has been fetched for exactly the current repo + max upgrades. */
+  private buildEstimateFresh = computed(() => {
+    const r = this.buildEstimateResult();
+    return !!r && r.repo === this.fortifyGithubRepo().trim() && r.maxUpgrades === this.fortifyMaxUpgrades();
+  });
+
+  /** Human-readable "~X–Y min" estimate — server-measured when fresh, else the local fallback. */
+  estimatedRuntimeLabel = computed<string | null>(() => {
+    if (this.fortifyRunBuild() && this.buildEstimateFresh()) {
+      const r = this.buildEstimateResult()!;
+      const lo = this._fmtMinutes(r.lowSec);
+      const hi = this._fmtMinutes(r.highSec);
+      return lo === hi ? `~${lo} min` : `~${lo}–${hi} min`;
+    }
+    const secs = this.fallbackRuntimeSeconds();
+    if (secs == null) return null;
+    const lo = this._fmtMinutes(secs * 0.75);
+    const hi = this._fmtMinutes(secs * 1.3);
+    return lo === hi ? `~${lo} min` : `~${lo}–${hi} min`;
+  });
+
+  /** Module count from the last server estimate, shown as "(N modules)" — only while fresh. */
+  estimatedModuleCount = computed<number | null>(() =>
+    this.fortifyRunBuild() && this.buildEstimateFresh() ? this.buildEstimateResult()!.moduleCount : null
+  );
+
+  private _fmtMinutes(seconds: number): number {
+    return Math.max(1, Math.round(seconds / 60));
+  }
+
+  /** Debounced trigger for the server-side estimate — called whenever an input it depends on changes. */
+  private _scheduleBuildEstimate() {
+    if (this.buildEstimateDebounce) clearTimeout(this.buildEstimateDebounce);
+    if (!this.fortifyRunBuild()) return;   // only relevant once build is on
+
+    const repo = this.fortifyGithubRepo().trim();
+    const maxUpgrades = this.fortifyMaxUpgrades();
+    this.buildEstimateDebounce = setTimeout(() => this._fetchBuildEstimate(repo, maxUpgrades), 500);
+  }
+
+  private _fetchBuildEstimate(repo: string, maxUpgrades: number) {
+    const baseUrl = this.apiCfg.fortifyBaseUrl();
+    const config: Record<string, unknown> = {
+      ...(this.fortifyGithubToken().trim() ? { github_token: this.fortifyGithubToken().trim() } : {}),
+    };
+    this.buildEstimateLoading.set(true);
+    fetch(`${baseUrl}/pipeline/estimate-build-time`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        ...(repo ? { repo } : {}),
+        max_upgrades: Math.max(1, maxUpgrades),
+        config,
+      }),
+    })
+    .then(r => r.json())
+    .then(resp => {
+      // Stale response guard — only apply if the inputs haven't changed since this call started.
+      if (repo !== this.fortifyGithubRepo().trim() || maxUpgrades !== this.fortifyMaxUpgrades()) return;
+      const data = resp?.data ?? resp;
+      if (resp?.ok !== false && data?.module_count != null) {
+        this.buildEstimateResult.set({
+          repo, maxUpgrades,
+          moduleCount: data.module_count,
+          lowSec:      data.estimated_seconds_low,
+          highSec:     data.estimated_seconds_high,
+        });
+      }
+      // On failure, leave buildEstimateResult as-is — estimatedRuntimeLabel() falls back
+      // to the local heuristic automatically since buildEstimateFresh() won't match.
+    })
+    .catch(() => { /* silent — local fallback estimate covers this */ })
+    .finally(() => this.buildEstimateLoading.set(false));
+  }
+
+
 
   private readonly FORTIFY_DOMAIN_PREFIX = 'equifax\\';
 
@@ -211,6 +435,26 @@ export class PipelineComponent {
 
   // ── Fortify start — builds request body per mode and calls correct endpoint ─
   startFortifyRun() {
+    this.fortifyFormSubmitted.set(true);
+
+    if (!this.fortifyFormValid()) {
+      this.state.error.set('Please fill in all required fields before starting a run.');
+      return;
+    }
+
+    // Guard: don't submit a run with Max Upgrades outside whichever range
+    // currently applies — surface it as an error instead of silently
+    // clamping, since a silent rewrite here could kick off a different
+    // batch size than the one the user typed.
+    if (this.maxUpgradesInvalid()) {
+      this.state.error.set(
+        this.fortifyRunBuild()
+          ? `Max Upgrades must be between ${this.MIN_MAX_UPGRADES_WHEN_BUILD} and ${this.MAX_MAX_UPGRADES_WHEN_BUILD} when Run Maven Build is enabled.`
+          : `Max Upgrades can't exceed ${this.MAX_MAX_UPGRADES_GENERAL} (use 0 for all).`
+      );
+      return;
+    }
+
     this.showFortifyForm.set(false);
 
     const mode     = this.fortifyMode();
@@ -218,19 +462,28 @@ export class PipelineComponent {
     // Uses fortifyBaseUrl — routes to separate Fortify port if configured
     const baseUrl  = this.apiCfg.fortifyBaseUrl();
 
-    // Per-run credential overrides — only sent when the user actually filled
-    // them in, so an empty field falls back to the server's env-configured
-    // defaults instead of clobbering them with an empty string.
+    // Per-run credential overrides — now mandatory (validated above), so these
+    // are always present by the time we get here; no more falling back to
+    // server-configured defaults for a blank field.
     const credConfig: Record<string, unknown> = {
-      ...(this.fortifyGithubToken().trim() ? { github_token: this.fortifyGithubToken().trim() } : {}),
-      ...(this.fortifyUsername().trim()    ? { fortify_username: this._domainQualify(this.fortifyUsername()) } : {}),
-      ...(this.fortifyPassword().trim()    ? { fortify_password: this.fortifyPassword() } : {}),
+      github_token:     this.fortifyGithubToken().trim(),
+      fortify_username: this._domainQualify(this.fortifyUsername()),
+      fortify_password: this.fortifyPassword(),
     };
 
+    // The guard above already ensured Max Upgrades is within whichever range
+    // currently applies — 1–5 with build on, or 0/≤20 with it off.
+    const runBuild = this.fortifyRunBuild();
+    const maxUpgrades = runBuild
+      ? Math.min(this.MAX_MAX_UPGRADES_WHEN_BUILD,
+          Math.max(this.MIN_MAX_UPGRADES_WHEN_BUILD, this.fortifyMaxUpgrades()))
+      : Math.min(this.MAX_MAX_UPGRADES_GENERAL, this.fortifyMaxUpgrades() || 0);
+
     let body: Record<string, unknown> = {
-      max_upgrades: this.fortifyMaxUpgrades() || 0,
-      ...(this.fortifyGithubRepo() ? { repo: this.fortifyGithubRepo() } : {}),
-      config: credConfig,
+      max_upgrades: maxUpgrades,
+      run_build:    runBuild,
+      repo:         this.fortifyGithubRepo().trim(),
+      config:       credConfig,
     };
 
     // Don't linger with plaintext credentials in memory / the DOM any longer
@@ -273,6 +526,7 @@ export class PipelineComponent {
       const pipeline_id = resp?.data?.pipeline_id ?? resp?.pipeline_id;
       if (pipeline_id) {
         this.state.trackFortifyRun(pipeline_id, mode, body);
+        this._resetFortifyForm();
       } else {
         this.state.error.set(`Fortify API: no pipeline_id in response — ${JSON.stringify(resp)}`);
       }
@@ -281,6 +535,29 @@ export class PipelineComponent {
       this.state.submitting.set(null);
       this.state.error.set(`Fortify API error: ${err.message}`);
     });
+  }
+
+  /** Clears every Fortify run-form field back to its default after a run starts
+   *  successfully — the next run starts from a clean slate rather than reusing
+   *  stale values. Only called on success; a failed submit keeps what was typed
+   *  so the user can fix and resubmit without retyping everything. */
+  private _resetFortifyForm() {
+    this.fortifyReleaseId.set('');
+    this.fortifyAppName.set('');
+    this.fortifyGithubRepo.set('');
+    this.fortifyReportPath.set('');
+    this.fortifyMaxUpgrades.set(0);
+    this.fortifyRunBuild.set(false);
+    this.fortifyGithubToken.set('');
+    this.fortifyUsername.set('');
+    this.fortifyPassword.set('');       // already cleared above, but reset again for clarity
+    this.fortifyFormSubmitted.set(false);
+    this.buildEstimateResult.set(null);
+    this.buildEstimateLoading.set(false);
+    if (this.buildEstimateDebounce) {
+      clearTimeout(this.buildEstimateDebounce);
+      this.buildEstimateDebounce = null;
+    }
   }
 
   cancelRun() { this.state.cancelRun(); }

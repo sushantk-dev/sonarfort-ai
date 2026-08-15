@@ -96,6 +96,7 @@ import subprocess
 from datetime import datetime
 from xml.etree import ElementTree as ET
 from functools import lru_cache
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -1072,7 +1073,17 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
 
     t0 = time.time()
     proc = None
-    output_lines = []
+    # Bounded tail buffer — previously this was an unbounded list that
+    # accumulated EVERY line of Maven's output for the whole build (up to
+    # the 600s timeout) but was never actually used for anything: it was
+    # never returned, logged, or referenced again after being built. For a
+    # verbose/long multi-module build that's real, unbounded memory held
+    # for no functional purpose. Replaced with a small fixed-size deque
+    # that only keeps the most recent lines — enough to print a quick
+    # failure summary below (new — the fix reason used to require scrolling
+    # back through everything already streamed via print() above) without
+    # re-buffering the full output a second time.
+    tail_lines: deque[str] = deque(maxlen=200)
     try:
         proc = subprocess.Popen(
             mvn_cmd,
@@ -1087,12 +1098,17 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         # Stream output line-by-line so progress is visible in real time
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode(errors="replace").rstrip()
-            output_lines.append(line)
+            tail_lines.append(line)
             print(f"  {C.GRAY}{line}{C.RESET}", flush=True)
         proc.wait(timeout=600)
         duration = time.time() - t0
         if proc.returncode != 0:
             print(f"  {C.RED}[BUILD] Build FAILED (exit {proc.returncode}){C.RESET}")
+            if tail_lines:
+                print(f"  {C.RED}[BUILD] Last {len(tail_lines)} line(s) of output "
+                      f"(quick reference — full output already printed above):{C.RESET}")
+                for line in tail_lines:
+                    print(f"  {C.RED}  {line}{C.RESET}")
             if threaded:
                 # Parallel reactor builds can fail spuriously against plugins that
                 # aren't thread-safe (shared mutable state, non-reentrant file I/O,

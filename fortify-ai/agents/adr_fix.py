@@ -295,9 +295,10 @@ def invoke_adr(
     target_versions: dict | None = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     required_jdk: Optional[str] = None,
+    push: bool = False,
 ) -> tuple[bool, str, str]:
     """
-    Run adr_fortify.py --commit <commit_id> --push --target-versions <json>.
+    Run adr_fortify.py --commit <commit_id> [--push] --target-versions <json>.
 
     target_versions: {
         "group_id:artifact_id": {
@@ -313,6 +314,17 @@ def invoke_adr(
         FORTIFYAI_JDK_REGISTRY env var to select the right JAVA_HOME for
         this build. None/empty means adr_fortify.py inherits whatever JDK
         is already on PATH — identical to the pre-existing behaviour.
+
+    push: forwarded to adr_fortify.py as --push. adr_fortify.py's --commit
+        mode never runs a Maven build itself (that block is disabled — see
+        adr_fortify.py's git commit section), so this only controls whether
+        the branch is pushed to origin immediately after committing.
+        - push=True  (Run Maven Build is OFF): the branch is pushed here,
+          right after commit, since there's no later stage that will push it.
+        - push=False (Run Maven Build is ON, the default pipeline shape):
+          the branch is committed locally only — build_validation_node owns
+          running 'mvn clean install' and, on success, pushing the branch
+          (or on failure, rolling it back). See build_validation.py.
 
     cancel_check: optional zero-arg callable returning True once the job has
         been flagged for cancellation (e.g. ``lambda: store.is_cancel_requested(pid)``).
@@ -331,12 +343,10 @@ def invoke_adr(
         clean rollback.
 
     Returns (success: bool, stdout: str, stderr: str).
-    success=True means exit code 0 (pom.xml edited + committed locally).
-    NOTE: as of the Maven-build split, this no longer means the build passed
-    or that anything was pushed — --skip-build is always passed, so ADR
-    commits straight after applying fixes. build_validation_node owns
-    running 'mvn clean install' and, on success, pushing the branch (or on
-    failure, rolling it back). See build_validation.py.
+    success=True means exit code 0 — pom.xml edited + committed locally, and,
+    if push=True, pushed to origin too (adr_fortify.py exits non-zero if the
+    push itself fails, so a failed push correctly surfaces as success=False
+    here rather than being silently swallowed).
 
     Raises:
         PipelineCancelledError: if cancel_check() reports cancellation while
@@ -347,9 +357,11 @@ def invoke_adr(
         sys.executable, adr_path,
         project_path,
         "--commit", commit_id,
-        "--skip-build",
     ]
+    if push:
+        cmd.append("--push")
     if target_versions:
+
         cmd += ["--target-versions", _json.dumps(target_versions)]
     if required_jdk:
         cmd += ["--required-jdk", str(required_jdk)]
@@ -463,6 +475,7 @@ def run_adr_fix(
     release_id: int = 0,
     cancel_check: Optional[Callable[[], bool]] = None,
     required_jdk: Optional[str] = None,
+    push: bool = False,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
@@ -470,13 +483,17 @@ def run_adr_fix(
     Steps:
       1. Build branch name: feature/fortify-fix-{releaseId}-{randId}
       2. Log the doing-when preamble
-      3. Invoke adr.py --commit --push
+      3. Invoke adr.py --commit [--push]
       4. Parse stdout for branch/commit/pdf/build_time
       5. Abort with success=False if ADR made 0 fixes (dep not found in poms)
       6. Log done-when result lines
       7. Return AdrResult
 
     required_jdk: forwarded to invoke_adr() — see its docstring.
+
+    push: forwarded to invoke_adr() — see its docstring. Pass True when Run
+        Maven Build is OFF (nothing else will push this branch), False when
+        it's ON (build_validation_node pushes after a successful build).
 
     cancel_check: forwarded to invoke_adr() — see its docstring. If the job is
         cancelled while this group's build is running, PipelineCancelledError
@@ -516,7 +533,7 @@ def run_adr_fix(
 
     success, stdout, stderr = invoke_adr(
         adr_path, project_path, branch_name, target_versions=target_versions,
-        cancel_check=cancel_check, required_jdk=required_jdk,
+        cancel_check=cancel_check, required_jdk=required_jdk, push=push,
     )
 
     if success:
@@ -548,7 +565,7 @@ def run_adr_fix(
         commit = parsed_out["commit_hash"] or "unknown"
         pdf = parsed_out["pdf_path"]
 
-        logger.info(f"[ADR Fix] ✅ Committed (build not yet verified)")
+        logger.info(f"[ADR Fix] ✅ Committed" + (" and pushed" if push else " (build not yet verified)"))
         logger.info(f"[ADR Fix] ✅ Branch: {branch}" + (f" (from {base_branch})" if base_branch else ""))
         logger.info(f"[ADR Fix] ✅ Commit: {commit}")
         if pdf:
@@ -565,11 +582,13 @@ def run_adr_fix(
         )
 
     else:
-        # ADR exited non-zero. Since --skip-build means ADR never runs Maven,
-        # this is a commit-step failure (git error, unexpected exception,
-        # backup-restore failure) — not a build failure.
+        # ADR exited non-zero. adr_fortify.py's --commit mode never runs Maven
+        # itself (that block is disabled), so this is either a commit-step
+        # failure (git error, unexpected exception, backup-restore failure)
+        # or — when push=True — a failed 'git push' (adr_fortify.py exits 1
+        # on push failure too, so both surface here the same way).
         error_reason = _extract_maven_error(stdout, stderr)
-        logger.error(f"[ADR Fix] ❌ Commit step failed — see error below")
+        logger.error(f"[ADR Fix] ❌ {'Commit/push' if push else 'Commit'} step failed — see error below")
         logger.debug(f"[ADR Fix] Error:\n{error_reason[:500]}")
 
         return AdrResult(

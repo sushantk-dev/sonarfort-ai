@@ -74,6 +74,7 @@ Execution Modes:
     POST /api/config               — update process environment variables only
     GET  /config/validate          — validate current config (from environment)
     GET  /releases                 — list releases for an app name
+    POST /pipeline/estimate-build-time — project-size-aware Maven build time estimate
 
 Run:
     uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
@@ -392,6 +393,16 @@ class LivePipelineRequest(BaseModel):
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
     )
+    run_build: bool = Field(
+        default=False,
+        description=(
+            "Run the Maven build (Stage 6b — 'mvn clean install') after each dependency "
+            "is committed, pushing on success or rolling the branch back on failure. "
+            "Off by default: adr-fix commits are pushed as-is with no build verification, "
+            "which is faster but means PRs may contain unbuilt/broken code. Mirrors the "
+            "'Run Maven Build' toggle in the UI."
+        ),
+    )
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
 
@@ -411,6 +422,16 @@ class AppNamePipelineRequest(BaseModel):
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
     )
+    run_build: bool = Field(
+        default=False,
+        description=(
+            "Run the Maven build (Stage 6b — 'mvn clean install') after each dependency "
+            "is committed, pushing on success or rolling the branch back on failure. "
+            "Off by default: adr-fix commits are pushed as-is with no build verification, "
+            "which is faster but means PRs may contain unbuilt/broken code. Mirrors the "
+            "'Run Maven Build' toggle in the UI."
+        ),
+    )
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
 
@@ -428,6 +449,16 @@ class AppIdPipelineRequest(BaseModel):
         default=0,
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
+    )
+    run_build: bool = Field(
+        default=False,
+        description=(
+            "Run the Maven build (Stage 6b — 'mvn clean install') after each dependency "
+            "is committed, pushing on success or rolling the branch back on failure. "
+            "Off by default: adr-fix commits are pushed as-is with no build verification, "
+            "which is faster but means PRs may contain unbuilt/broken code. Mirrors the "
+            "'Run Maven Build' toggle in the UI."
+        ),
     )
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
@@ -447,6 +478,16 @@ class OfflinePipelineRequest(BaseModel):
         default=0,
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
+    )
+    run_build: bool = Field(
+        default=False,
+        description=(
+            "Run the Maven build (Stage 6b — 'mvn clean install') after each dependency "
+            "is committed, pushing on success or rolling the branch back on failure. "
+            "Off by default: adr-fix commits are pushed as-is with no build verification, "
+            "which is faster but means PRs may contain unbuilt/broken code. Mirrors the "
+            "'Run Maven Build' toggle in the UI."
+        ),
     )
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
@@ -469,6 +510,41 @@ class DryRunRequest(BaseModel):
         default=0,
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
+    )
+    run_build: bool = Field(
+        default=False,
+        description=(
+            "Run the Maven build (Stage 6b — 'mvn clean install') after each dependency "
+            "is committed, pushing on success or rolling the branch back on failure. "
+            "Off by default: adr-fix commits are pushed as-is with no build verification, "
+            "which is faster but means PRs may contain unbuilt/broken code. Mirrors the "
+            "'Run Maven Build' toggle in the UI."
+        ),
+    )
+    config: ConfigOverrides = Field(default_factory=ConfigOverrides)
+
+
+class BuildTimeEstimateRequest(BaseModel):
+    """
+    Input for **POST /pipeline/estimate-build-time** — a project-size-aware
+    estimate of how long 'Run Maven Build' will add to a pipeline run, used
+    by the UI to show a number before the user commits to starting one.
+    """
+    repo: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub repository in 'owner/repo' format. Triggers a throwaway shallow clone "
+            "purely to count Maven modules — nothing is built or persisted. "
+            "Omit to inspect the local PROJECT_PATH from config/env instead."
+        ),
+    )
+    max_upgrades: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Number of dependencies expected to be built in this run — each one gets "
+            "its own full 'mvn clean install', so the estimate scales linearly with this."
+        ),
     )
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
@@ -532,10 +608,11 @@ class AdrFixRequest(BaseModel):
 class BuildValidationRequest(BaseModel):
     adr_results: list[dict] = Field(..., description="Results from /stages/adr-fix (commit-only — build not yet run)")
     project_path: str = Field(..., description="Absolute path to Maven project root")
-    github_token: str = Field(default="", description="GitHub token with actions:write + contents:write; defaults to cfg.github_token if empty")
-    github_repo: str = Field(default="", description="owner/repo; defaults to cfg.github_repo if empty")
-    workflow_file: str = Field(default="runMavenSharedWorkflow.yml", description="Workflow file under .github/workflows/ to dispatch — must declare 'on: workflow_dispatch'")
-    workflow_inputs: Optional[dict] = Field(default=None, description="Passed through to the workflow_dispatch call as-is — only include keys the workflow declares under on.workflow_dispatch.inputs")
+    mvn_exe: str = Field(default="", description="Path to mvn executable — auto-detected from PATH if empty")
+    skip_tests: bool = Field(default=False, description="Skip Maven tests during build verification (-DskipTests)")
+    java_home: str = Field(default="", description="JAVA_HOME override for this build only — empty inherits whatever JDK is already on PATH")
+    build_threads: str = Field(default="1C", description="Maven -T value for a multithreaded reactor build, e.g. '1C' (one thread/core), '4', or '1' (single-threaded)")
+    maven_heap_mb: Optional[int] = Field(default=None, ge=0, description="MAVEN_OPTS -Xmx cap in MB for this build's mvn subprocess; omit/null to use adr_fortify.py's own default heap cap (512MB unless overridden there); 0 disables the cap entirely")
 
 
 class AiCodeFixRequest(BaseModel):
@@ -580,6 +657,16 @@ class PartialPipelineRequest(BaseModel):
         default=0,
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
+    )
+    run_build: bool = Field(
+        default=False,
+        description=(
+            "Run the Maven build (Stage 6b — 'mvn clean install') after each dependency "
+            "is committed, pushing on success or rolling the branch back on failure. "
+            "Off by default: adr-fix commits are pushed as-is with no build verification, "
+            "which is faster but means PRs may contain unbuilt/broken code. Mirrors the "
+            "'Run Maven Build' toggle in the UI."
+        ),
     )
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
@@ -772,6 +859,7 @@ def _run_full_pipeline(
     dry_run: bool = False,
     pipeline_id: str | None = None,
     max_upgrades: int = 0,
+    run_build: bool = False,
     resume_checkpoint: dict | None = None,
 ) -> dict:
     """
@@ -794,6 +882,12 @@ def _run_full_pipeline(
     resume_stage actually execute. pr-agent additionally guards against
     duplicate PRs via branch-name lookup (see pr_agent._find_existing_pr) in
     case a checkpoint boundary is ever re-crossed.
+
+    *run_build* controls whether Stage 6b (build-validation) actually runs
+    'mvn clean install'. Off by default — when False, adr-fix's committed
+    branches are pushed as-is (no build, no rollback-on-failure) instead of
+    running the Maven build agent, which is faster but means PRs may contain
+    unbuilt/broken code. Mirrors the 'Run Maven Build' toggle in the UI.
     """
     if pipeline_id:
         token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
@@ -1039,6 +1133,10 @@ def _run_full_pipeline(
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,
+                        # Push right after commit when the build stage is being skipped
+                        # (nothing else will push this branch); otherwise leave it local
+                        # so build-validation can push-on-success / roll back on failure.
+                        push=not run_build,
                     )
                     adr_results.append({"artifact_id": artifact_id, "result": result})
         except PipelineCancelledError:
@@ -1053,8 +1151,17 @@ def _run_full_pipeline(
 
     # Stage 6b — build validation (side-effecting: runs mvn, then pushes on
     # success or rolls the branch back on failure. Never re-run once checkpointed.)
+    #
+    # When run_build is False, adr-fix (above) already pushed each committed
+    # branch itself (push=not run_build), so there is nothing left for this
+    # stage to do — skip it outright rather than calling validate_one() at
+    # all. adr_results is left exactly as adr-fix produced it: build_time_seconds
+    # stays None throughout, and "success" already reflects commit+push together.
     log_warmup_status(maven_warmup_thread)
-    if _already_done("build-validation"):
+    if not run_build:
+        _stage_skip("build-validation")
+        _checkpoint("pr-agent", adr_results=adr_results)
+    elif _already_done("build-validation"):
         adr_results = acc["adr_results"]  # overwritten below with the merged/build-validated version
     else:
         _check_cancelled(pipeline_id)
@@ -1073,8 +1180,7 @@ def _run_full_pipeline(
                     continue
                 bv_result = validate_one(
                     artifact_id, adr_result, str(project_path),
-                    github_token=cfg.github_token, github_repo=cfg.github_repo,
-                    workflow_file=cfg.build_workflow_file, cancel_check=cancel_check,
+                    cancel_check=cancel_check,
                 )
                 merged_results.append({"artifact_id": artifact_id, "result": {
                     **adr_result,
@@ -1536,6 +1642,86 @@ def resolve_app_name(
         return err(str(exc), exc)
 
 
+@app.post("/pipeline/estimate-build-time", tags=["Utility"])
+async def estimate_build_time(req: BuildTimeEstimateRequest):
+    """
+    Project-size-aware estimate of how long **Run Maven Build** will add to a
+    pipeline run — used by the UI to show a number before the user starts one.
+
+    This is still a heuristic, not a measurement (no historical build-time
+    data is tracked yet), but it scales with the actual project instead of
+    using a flat guess: it counts Maven modules (`pom.xml` files under the
+    project root) and uses that as a proxy for how long a single
+    `mvn clean install` reactor build takes.
+
+    If **repo** is given, this shallow-clones it (depth=1, same as the full
+    pipeline endpoints) purely to count modules, then deletes the clone
+    immediately — nothing is built, committed, or persisted. If **repo** is
+    omitted, the local `PROJECT_PATH` from config/env is inspected instead
+    (no clone).
+
+    Formula:
+        per_module_seconds   = 25s   (compile + package one reactor module)
+        base_overhead_seconds = 45s  (JVM startup, dependency resolution)
+        one_build_seconds    = clamp(base_overhead + modules × per_module, 90, 900)
+        total_seconds         = one_build_seconds × max_upgrades   (each upgrade
+                                 commits to its own branch and gets its own full build)
+
+    The 90s floor keeps a 1-module repo from reading as near-instant; the
+    900s ceiling keeps a very large monorepo from producing an alarming
+    multi-hour number when in practice `-T` (parallel reactor builds) and
+    warm `.m2` caching bring real builds in well under that.
+
+    Returns low/high bounds (±25%/+30%) rather than a single number, since
+    actual time still depends on network, runner load, and which module the
+    changed dependency lives in.
+    """
+    loop = asyncio.get_event_loop()
+    clone_dir: str | None = None
+    try:
+        cfg = _apply_overrides(load_config(), req.config)
+        cfg, clone_dir = await loop.run_in_executor(
+            _EXECUTOR,
+            lambda: _clone_repo_if_needed(cfg, req.repo),
+        )
+
+        project_path = Path(cfg.project_path) if cfg.project_path else None
+        if not project_path or not project_path.exists():
+            return err(
+                "No project to inspect — pass 'repo' (owner/repo) or configure "
+                "PROJECT_PATH so the module count can be measured."
+            )
+
+        module_count = await loop.run_in_executor(
+            _EXECUTOR,
+            lambda: len(list(project_path.rglob("pom.xml"))),
+        )
+        module_count = max(module_count, 1)
+
+        PER_MODULE_SEC     = 25
+        BASE_OVERHEAD_SEC  = 45
+        MIN_BUILD_SEC      = 90
+        MAX_BUILD_SEC      = 900
+
+        one_build_seconds = min(MAX_BUILD_SEC, max(MIN_BUILD_SEC,
+            BASE_OVERHEAD_SEC + module_count * PER_MODULE_SEC))
+        total_seconds = one_build_seconds * req.max_upgrades
+
+        return ok({
+            "module_count":                 module_count,
+            "per_dependency_build_seconds": one_build_seconds,
+            "max_upgrades":                 req.max_upgrades,
+            "estimated_seconds_low":        round(total_seconds * 0.75),
+            "estimated_seconds_high":       round(total_seconds * 1.3),
+        })
+    except Exception as exc:
+        return err(str(exc), exc)
+    finally:
+        if clone_dir:
+            import shutil
+            shutil.rmtree(clone_dir, ignore_errors=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FULL PIPELINE ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1587,12 +1773,14 @@ async def pipeline_live(req: LivePipelineRequest):
                 "repo": req.repo,
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
+                "run_build": req.run_build,
                 "config_overrides": req.config.model_dump(),
             }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
                                            max_upgrades=req.max_upgrades,
+                                           run_build=req.run_build,
                                            pipeline_id=pid),
             )
             if req.repo:
@@ -1653,12 +1841,14 @@ async def pipeline_offline(req: OfflinePipelineRequest):
                 "repo": req.repo,
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
+                "run_build": req.run_build,
                 "config_overrides": req.config.model_dump(),
             }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
                                            max_upgrades=req.max_upgrades,
+                                           run_build=req.run_build,
                                            pipeline_id=pid),
             )
             if req.repo:
@@ -1736,12 +1926,14 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
                 "repo": req.repo,
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
+                "run_build": req.run_build,
                 "config_overrides": req.config.model_dump(),
             }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
                                            max_upgrades=req.max_upgrades,
+                                           run_build=req.run_build,
                                            pipeline_id=pid),
             )
             result["app_id"] = app_id
@@ -1806,12 +1998,14 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
                 "repo": req.repo,
                 "dry_run": False,
                 "max_upgrades": req.max_upgrades,
+                "run_build": req.run_build,
                 "config_overrides": req.config.model_dump(),
             }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
                                            max_upgrades=req.max_upgrades,
+                                           run_build=req.run_build,
                                            pipeline_id=pid),
             )
             result["app_id"] = app_id
@@ -1876,12 +2070,14 @@ async def pipeline_dry_run(req: DryRunRequest):
                 "repo": req.repo,
                 "dry_run": True,
                 "max_upgrades": req.max_upgrades,
+                "run_build": req.run_build,
                 "config_overrides": req.config.model_dump(),
             }))
             result = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda: _run_full_pipeline(cfg, client, raw_vulns, release_id,
                                            dry_run=True, max_upgrades=req.max_upgrades,
+                                           run_build=req.run_build,
                                            pipeline_id=pid),
             )
             if req.repo:
@@ -2249,6 +2445,7 @@ def _start_resume(pipeline_id: str, resume_meta: dict, checkpoint: dict, *, auto
                     cfg, client, raw_vulns, release_id,
                     dry_run=resume_meta.get("dry_run", False),
                     max_upgrades=resume_meta.get("max_upgrades", 0),
+                    run_build=resume_meta.get("run_build", False),
                     pipeline_id=pid,
                     resume_checkpoint=checkpoint,
                 ),
@@ -2606,18 +2803,19 @@ def stage_build_validation(req: BuildValidationRequest):
     **Stage 6b — Build Validation**
 
     Runs immediately after /stages/adr-fix. For each committed group: checks
-    out its branch, pushes it, dispatches a GitHub Actions build
-    (workflow_file, must declare `on: workflow_dispatch`) and waits for it,
-    then leaves the branch pushed on success or rolls it back (checkout
-    base_branch + delete branch, locally and on origin) on failure.
-    Groups where the adr-fix result was already unsuccessful (escalated,
-    dry-run, commit failure, no-op) are passed through unchanged — nothing
-    to build.
+    out its branch, runs `mvn clean install` LOCALLY on this pod (via
+    adr_fortify.py's own _run_maven_build — see agents/build_validation.py's
+    module docstring), then pushes the branch on success or rolls it back
+    (checkout base_branch + delete branch locally — nothing was ever pushed
+    on failure, since push only happens after a successful build) on
+    failure. Groups where the adr-fix result was already unsuccessful
+    (escalated, dry-run, commit failure, no-op) are passed through
+    unchanged — nothing to build.
 
     Input:  adr_results[]     (from /stages/adr-fix)
             project_path      (absolute path to Maven project root)
-            github_token/repo (optional — falls back to cfg.github_token/github_repo)
-            workflow_file     (optional — defaults to cfg.build_workflow_file)
+            mvn_exe/java_home/build_threads/maven_heap_mb/skip_tests
+                               (all optional — see BuildValidationRequest)
     Output: adr_results[] — SAME shape as /stages/adr-fix, with success/branch_name/
             build_time_seconds/error_reason updated to reflect the build+push
             outcome. Pass this (not the raw /stages/adr-fix output) to
@@ -2626,8 +2824,6 @@ def stage_build_validation(req: BuildValidationRequest):
     t0 = time.time()
     try:
         from agents.build_validation import validate_one
-
-        cfg = load_config()
 
         results = []
         for entry in req.adr_results:
@@ -2642,12 +2838,19 @@ def stage_build_validation(req: BuildValidationRequest):
                 }})
                 continue
 
+            bv_kwargs: dict = {
+                "mvn_exe": req.mvn_exe,
+                "skip_tests": req.skip_tests,
+                "java_home": req.java_home,
+                "build_threads": req.build_threads,
+            }
+            # None → let validate_one's own default (adr_fortify.py's
+            # _DEFAULT_MAVEN_HEAP_MB) apply, rather than forcing 0 (no cap).
+            if req.maven_heap_mb is not None:
+                bv_kwargs["maven_heap_mb"] = req.maven_heap_mb
+
             bv_result = validate_one(
-                artifact_id, adr_result, req.project_path,
-                github_token=req.github_token or cfg.github_token,
-                github_repo=req.github_repo or cfg.github_repo,
-                workflow_file=req.workflow_file or cfg.build_workflow_file,
-                workflow_inputs=req.workflow_inputs,
+                artifact_id, adr_result, req.project_path, **bv_kwargs,
             )
             # Merge into the AdrResult shape so downstream /stages/pr-agent and
             # /stages/fortify-writeback (which expect adr_results[]) need no changes.
@@ -2807,6 +3010,7 @@ def _run_until(
     stop_after: StageLabel,
     pipeline_id: str | None = None,
     max_upgrades: int = 0,
+    run_build: bool = False,
 ) -> dict:
     """Run the pipeline and stop (inclusive) at `stop_after`, updating the job store per stage."""
     if pipeline_id:
@@ -2963,6 +3167,7 @@ def _run_until(
                         jira_prefix=cfg.jira_id_prefix,
                         release_id=release_id,
                         cancel_check=cancel_check,
+                        push=not run_build,
                     ),
                 })
     except PipelineCancelledError:
@@ -2977,42 +3182,48 @@ def _run_until(
         return result
 
     # Stage 5b — build validation (runs mvn, then pushes on success or rolls
-    # the branch back on failure)
-    _check_cancelled(pipeline_id)
-    t = _s_start("build-validation")
-    merged_results: list[dict] = []
-    try:
-        for entry in adr_results:
-            _check_cancelled(pipeline_id)  # stop before pushing the next branch
-            artifact_id = entry["artifact_id"]
-            adr_result = entry["result"]
-            if not adr_result.get("success"):
+    # the branch back on failure). Skipped outright when run_build is False —
+    # adr-fix (above) already pushed each committed branch itself in that case.
+    if not run_build:
+        _s_skip("build-validation")
+        if idx == 6:
+            _s_skip("pr-agent")
+            return result
+    else:
+        _check_cancelled(pipeline_id)
+        t = _s_start("build-validation")
+        merged_results: list[dict] = []
+        try:
+            for entry in adr_results:
+                _check_cancelled(pipeline_id)  # stop before pushing the next branch
+                artifact_id = entry["artifact_id"]
+                adr_result = entry["result"]
+                if not adr_result.get("success"):
+                    merged_results.append({"artifact_id": artifact_id, "result": {
+                        **adr_result, "build_time_seconds": None,
+                    }})
+                    continue
+                bv_result = validate_one(
+                    artifact_id, adr_result, str(project_path),
+                    cancel_check=cancel_check,
+                )
                 merged_results.append({"artifact_id": artifact_id, "result": {
-                    **adr_result, "build_time_seconds": None,
+                    **adr_result,
+                    "success": bv_result["success"],
+                    "branch_name": bv_result["branch_name"],
+                    "build_time_seconds": bv_result["build_time_seconds"],
+                    "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
                 }})
-                continue
-            bv_result = validate_one(
-                artifact_id, adr_result, str(project_path),
-                github_token=cfg.github_token, github_repo=cfg.github_repo,
-                workflow_file=cfg.build_workflow_file, cancel_check=cancel_check,
-            )
-            merged_results.append({"artifact_id": artifact_id, "result": {
-                **adr_result,
-                "success": bv_result["success"],
-                "branch_name": bv_result["branch_name"],
-                "build_time_seconds": bv_result["build_time_seconds"],
-                "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
-            }})
-    except PipelineCancelledError:
-        _s_fail("build-validation", t, "Cancelled by user")
-        raise
-    adr_results = merged_results
-    _bv_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-    result["adr_results"] = adr_results
-    _s_done("build-validation", t, {"pushed": _bv_ok, "total": len(adr_results)})
-    if idx == 6:
-        _s_skip("pr-agent")
-        return result
+        except PipelineCancelledError:
+            _s_fail("build-validation", t, "Cancelled by user")
+            raise
+        adr_results = merged_results
+        _bv_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+        result["adr_results"] = adr_results
+        _s_done("build-validation", t, {"pushed": _bv_ok, "total": len(adr_results)})
+        if idx == 6:
+            _s_skip("pr-agent")
+            return result
 
     # Stage 6 — pr agent
     _check_cancelled(pipeline_id)  # stop before opening PRs
@@ -3063,7 +3274,8 @@ def _make_partial_endpoint(stop_after: StageLabel):
                     _EXECUTOR,
                     lambda: _run_until(cfg, client, raw_vulns, release_id,
                                        stop_after, pipeline_id=pid,
-                                       max_upgrades=req.max_upgrades),
+                                       max_upgrades=req.max_upgrades,
+                                       run_build=req.run_build),
                 )
                 if req.repo:
                     result["repo"] = req.repo
