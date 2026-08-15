@@ -48,14 +48,15 @@ Responsibility:
   SELECTION section rather than imported — see build_validation_node's
   docstring.
 
-  Known limitation vs. the old remote path: _run_maven_build() streams
-  Maven's output straight to this process's stdout/logs (for live
-  visibility) but does not capture and return it as a string, so
-  error_reason on a build failure here is a short summary, not an
-  extracted Maven error snippet — the actual failure text is only in the
-  pipeline pod's own console/log output, not in the BuildValidationResult
-  itself. If you want that back, _run_maven_build would need to also
-  capture and return its output text (currently prints only).
+  Maven error capture: _run_maven_build() (adr_fortify.py) streams Maven's
+  output straight to this process's stdout/logs (for live visibility) AND
+  returns the last ~200 lines of it on failure. validate_one distills that
+  into a short excerpt — Maven's own '[ERROR]' lines when present, e.g.
+  "Could not resolve dependency: org.apache.beam:...:jar:1.83.0" — and
+  uses it as BuildValidationResult.error_reason (see
+  _extract_maven_error_excerpt below), so a build failure's actual cause
+  reaches downstream consumers (escalation reports, the PR body, the
+  frontend) instead of a generic "build failed" summary.
 
 Console output (done-when):
   [Build Validation] Checking out feature/fortify-fix-1697672-c6266fa8
@@ -140,6 +141,35 @@ def _resolve_java_home(explicit_java_home: str, required_jdk: str) -> str:
             "already on PATH."
         )
     return ""
+
+
+# ── Maven error extraction ──────────────────────────────────────────────────────
+
+def _extract_maven_error_excerpt(error_tail: Optional[str], max_chars: int = 4000) -> Optional[str]:
+    """
+    Distill _run_maven_build's raw output tail (up to its last 200 lines —
+    see adr_fortify.py) into a short, escalation-report-friendly excerpt.
+
+    Prefers Maven's own '[ERROR]' lines when present — that's Maven's own
+    summary of what actually went wrong (e.g. "Could not resolve dependency:
+    org.apache.beam:beam-vendor-grpc-1_69_0:jar:1.83.0 (compile)"), and is
+    far more useful in a report than the surrounding [INFO]/[WARNING] noise
+    or a full reactor summary. Falls back to the raw tail as-is for failures
+    that don't produce '[ERROR]'-prefixed output (e.g. a plugin crash dumping
+    a bare stack trace, or the timeout/exception messages _run_maven_build
+    itself prepends when Maven never even got to print its own [ERROR] block).
+
+    Capped at max_chars (from the END, since the actual failure is always
+    at the tail) so one build failure can't blow up an escalation report,
+    an API response, or a PR/report body.
+    """
+    if not error_tail:
+        return None
+    error_lines = [ln for ln in error_tail.splitlines() if ln.strip().startswith("[ERROR]")]
+    excerpt = "\n".join(error_lines) if error_lines else error_tail
+    if len(excerpt) > max_chars:
+        excerpt = "...(truncated)...\n" + excerpt[-max_chars:]
+    return excerpt
 
 
 # ── lock cleanup ──────────────────────────────────────────────────────────────
@@ -262,7 +292,7 @@ def validate_one(
     logger.info(f"[Build Validation] Checking out {branch_name}")
 
     logger.info("[Build Validation] Running mvn clean install locally...")
-    success, duration = _run_maven_build(
+    success, duration, error_tail = _run_maven_build(
         project_path, mvn_exe=mvn_exe, skip_tests=skip_tests,
         java_home=java_home, build_threads=build_threads,
         maven_heap_mb=maven_heap_mb,
@@ -301,7 +331,10 @@ def validate_one(
         )
 
     # success is False — Maven ran locally and the build itself failed.
+    error_excerpt = _extract_maven_error_excerpt(error_tail)
     logger.error(f"[Build Validation] ❌ Local build failed ({build_time_seconds}s) — rolling back")
+    if error_excerpt:
+        logger.error(f"[Build Validation] Maven error:\n{error_excerpt}")
     _rollback_branch(project_path, branch_name, base_branch)
 
     return BuildValidationResult(
@@ -310,9 +343,10 @@ def validate_one(
         pushed=False,
         build_time_seconds=build_time_seconds,
         error_reason=(
-            f"Local Maven build failed after {build_time_seconds}s — see the pipeline "
-            f"pod's console/log output for the actual Maven error (not captured into "
-            f"this result; see module docstring's 'Known limitation')."
+            error_excerpt
+            if error_excerpt
+            else f"Local Maven build failed after {build_time_seconds}s — no error output "
+                 f"was captured; see the pipeline pod's own console/log output."
         ),
     )
 

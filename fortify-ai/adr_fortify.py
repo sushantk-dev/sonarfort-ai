@@ -1030,8 +1030,16 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
                       java_home: str = "", build_threads: str = "1C",
                       maven_heap_mb: int = _DEFAULT_MAVEN_HEAP_MB) -> tuple:
     """Run 'mvn clean install' in project_root.
-    Returns (success: bool | None, duration: float).
+    Returns (success: bool | None, duration: float, error_tail: str | None).
     None = maven not found (skipped).  False = build failed.  True = success.
+    error_tail is the last ~200 lines of Maven's combined stdout/stderr,
+    joined with newlines, populated whenever success is False (a real
+    build failure, a timeout, or an exception starting/running the
+    subprocess) — None when success is True or None. This is what callers
+    (see build_validation.py's validate_one) should surface as the actual
+    failure reason (e.g. in an escalation report) instead of a generic
+    "build failed" summary — see below for why a bounded tail rather than
+    full output.
     skip_tests: when True adds -DskipTests to the Maven command (tests are skipped).
     java_home: when set, JAVA_HOME/PATH are overridden for this subprocess only
                (see _build_subprocess_env) — empty string means inherit as before.
@@ -1048,7 +1056,7 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         mvn_exe = _find_mvn()
     if not mvn_exe:
         print(f"  {C.YELLOW}[BUILD] Maven not found — skipping build verification.{C.RESET}")
-        return None, 0.0
+        return None, 0.0, None
 
     build_env = _build_subprocess_env(java_home, maven_heap_mb)
     if java_home:
@@ -1104,6 +1112,7 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
         duration = time.time() - t0
         if proc.returncode != 0:
             print(f"  {C.RED}[BUILD] Build FAILED (exit {proc.returncode}){C.RESET}")
+            error_tail = "\n".join(tail_lines) if tail_lines else None
             if tail_lines:
                 print(f"  {C.RED}[BUILD] Last {len(tail_lines)} line(s) of output "
                       f"(quick reference — full output already printed above):{C.RESET}")
@@ -1120,16 +1129,18 @@ def _run_maven_build(project_root: str, mvn_exe: str = "", skip_tests: bool = Fa
                       f"plugin thread-safety issue under -T {build_threads} ...{C.RESET}", flush=True)
                 return _run_maven_build(project_root, mvn_exe=mvn_exe, skip_tests=skip_tests,
                                          java_home=java_home, build_threads="1")
-            return False, duration
-        return True, duration
+            return False, duration, error_tail
+        return True, duration, None
     except subprocess.TimeoutExpired:
         if proc:
             _kill_process_tree(proc.pid)
         print(f"  {C.RED}[BUILD] Timed out after 600s — build killed.{C.RESET}")
-        return False, time.time() - t0
+        error_tail = "\n".join(tail_lines) if tail_lines else None
+        timeout_msg = "Build timed out after 600s and was killed."
+        return False, time.time() - t0, (f"{timeout_msg}\n{error_tail}" if error_tail else timeout_msg)
     except Exception as exc:
         print(f"  {C.RED}[BUILD] Error running maven: {exc}{C.RESET}")
-        return False, time.time() - t0
+        return False, time.time() - t0, f"Error running maven: {exc}"
 
 
 def collect_transitive_pool(project_path: str, mvn_exe: str, timeout: int = 300,
