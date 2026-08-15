@@ -8,6 +8,7 @@ shell, container, or orchestrator running this service.
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from typing import Optional
 
 
 class FortifyAIConfig(BaseSettings):
@@ -66,6 +67,48 @@ class FortifyAIConfig(BaseSettings):
             "Workflow file under .github/workflows/ dispatched by build_validation "
             "to run the Maven build on a GitHub Actions runner (this pipeline no "
             "longer runs mvn locally). Must declare 'on: workflow_dispatch'."
+        ),
+    )
+
+    # ── Local Maven build (build_validation — Iteration 10+) ───────────────────
+    # build_validation.py runs 'mvn clean install' LOCALLY on this pod, and
+    # resolves JAVA_HOME from the project's detected required_jdk via
+    # FORTIFYAI_JDK_REGISTRY when java_home isn't given explicitly — see
+    # agents/build_validation.py's _resolve_java_home. These fields are the
+    # process-wide defaults used by the full/partial pipeline runners
+    # (_run_full_pipeline / _run_until); the standalone /stages/build-validation
+    # endpoint takes the same knobs per-request via BuildValidationRequest.
+    mvn_exe: str = Field(
+        default="",
+        description="Path to the mvn executable. Empty = auto-detect via PATH.",
+    )
+    java_home: str = Field(
+        default="",
+        description=(
+            "Explicit JAVA_HOME override for the local mvn build. Always wins "
+            "over required_jdk/FORTIFYAI_JDK_REGISTRY when set — leave empty to "
+            "let build_validation resolve JAVA_HOME from the project's detected "
+            "required JDK instead (see build_validation._resolve_java_home)."
+        ),
+    )
+    skip_tests: bool = Field(
+        default=False,
+        description="Pass -DskipTests to the local 'mvn clean install' build.",
+    )
+    build_threads: str = Field(
+        default="1C",
+        description=(
+            "Value passed to Maven's -T flag, e.g. '1C' (one thread per CPU "
+            "core), '4', or '1' (single-threaded, disables reactor parallelism)."
+        ),
+    )
+    maven_heap_mb: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Per-JVM MAVEN_OPTS -Xmx cap for local mvn subprocess calls. "
+            "None/omit = use build_validation's own default heap cap "
+            "(currently 512MB); 0 disables the cap entirely."
         ),
     )
 

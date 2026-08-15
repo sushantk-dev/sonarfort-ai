@@ -610,7 +610,8 @@ class BuildValidationRequest(BaseModel):
     project_path: str = Field(..., description="Absolute path to Maven project root")
     mvn_exe: str = Field(default="", description="Path to mvn executable — auto-detected from PATH if empty")
     skip_tests: bool = Field(default=False, description="Skip Maven tests during build verification (-DskipTests)")
-    java_home: str = Field(default="", description="JAVA_HOME override for this build only — empty inherits whatever JDK is already on PATH")
+    required_jdk: str = Field(default="", description="JDK major version this project needs (from /stages/context's output) — looked up in FORTIFYAI_JDK_REGISTRY to pick JAVA_HOME. Ignored if java_home is set explicitly.")
+    java_home: str = Field(default="", description="Explicit JAVA_HOME override for this build only — always wins over required_jdk. Empty lets required_jdk (if given) resolve it, otherwise inherits whatever JDK is already on PATH.")
     build_threads: str = Field(default="1C", description="Maven -T value for a multithreaded reactor build, e.g. '1C' (one thread/core), '4', or '1' (single-threaded)")
     maven_heap_mb: Optional[int] = Field(default=None, ge=0, description="MAVEN_OPTS -Xmx cap in MB for this build's mvn subprocess; omit/null to use adr_fortify.py's own default heap cap (512MB unless overridden there); 0 disables the cap entirely")
 
@@ -899,7 +900,7 @@ def _run_full_pipeline(
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
     from agents.adr_fix import run_adr_fix
-    from agents.build_validation import validate_one
+    from agents.build_validation import validate_one, _resolve_java_home
     from agents.pr_agent import create_prs_for_all_groups
     from agents.fortify_writeback import run_all_reports
     from state import AdrResult
@@ -1166,6 +1167,7 @@ def _run_full_pipeline(
     else:
         _check_cancelled(pipeline_id)
         t = _stage_start("build-validation")
+        java_home = _resolve_java_home(cfg.java_home, required_jdk or "")
         merged_results: list[dict] = []
         try:
             for entry in adr_results:
@@ -1180,6 +1182,9 @@ def _run_full_pipeline(
                     continue
                 bv_result = validate_one(
                     artifact_id, adr_result, str(project_path),
+                    mvn_exe=cfg.mvn_exe, skip_tests=cfg.skip_tests,
+                    java_home=java_home, build_threads=cfg.build_threads,
+                    **({"maven_heap_mb": cfg.maven_heap_mb} if cfg.maven_heap_mb is not None else {}),
                     cancel_check=cancel_check,
                 )
                 merged_results.append({"artifact_id": artifact_id, "result": {
@@ -2814,6 +2819,8 @@ def stage_build_validation(req: BuildValidationRequest):
 
     Input:  adr_results[]     (from /stages/adr-fix)
             project_path      (absolute path to Maven project root)
+            required_jdk      (optional — from /stages/context's output; used to
+                                resolve JAVA_HOME via FORTIFYAI_JDK_REGISTRY)
             mvn_exe/java_home/build_threads/maven_heap_mb/skip_tests
                                (all optional — see BuildValidationRequest)
     Output: adr_results[] — SAME shape as /stages/adr-fix, with success/branch_name/
@@ -2823,7 +2830,7 @@ def stage_build_validation(req: BuildValidationRequest):
     """
     t0 = time.time()
     try:
-        from agents.build_validation import validate_one
+        from agents.build_validation import validate_one, _resolve_java_home
 
         results = []
         for entry in req.adr_results:
@@ -2841,7 +2848,7 @@ def stage_build_validation(req: BuildValidationRequest):
             bv_kwargs: dict = {
                 "mvn_exe": req.mvn_exe,
                 "skip_tests": req.skip_tests,
-                "java_home": req.java_home,
+                "java_home": _resolve_java_home(req.java_home, req.required_jdk),
                 "build_threads": req.build_threads,
             }
             # None → let validate_one's own default (adr_fortify.py's
@@ -3019,11 +3026,11 @@ def _run_until(
     from pathlib import Path
     from agents.triage import group_by_dependency, apply_max_upgrades
     from agents.version_resolver import resolve_all_groups
-    from agents.context import locate_all_groups
+    from agents.context import locate_all_groups, detect_required_jdk
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
     from agents.adr_fix import run_adr_fix
-    from agents.build_validation import validate_one
+    from agents.build_validation import validate_one, _resolve_java_home
     from agents.pr_agent import create_prs_for_all_groups
     from state import AdrResult
 
@@ -3091,8 +3098,16 @@ def _run_until(
     _check_cancelled(pipeline_id)
     t = _s_start("context")
     context_groups = locate_all_groups(project_path, resolved)
+    required_jdk = detect_required_jdk(project_path)
+    if required_jdk:
+        print(f"[Context] Project requires JDK {required_jdk}")
+    else:
+        print(
+            "[Context] required_jdk is None for this run — build-validation "
+            "will fall back to whatever JDK is already on PATH"
+        )
     result["groups"] = context_groups
-    _s_done("context", t, {"groups_count": len(context_groups)})
+    _s_done("context", t, {"groups_count": len(context_groups), "required_jdk": required_jdk})
     if idx == 2:
         for s in STAGE_ORDER[3:]:
             _s_skip(s)
@@ -3167,6 +3182,7 @@ def _run_until(
                         jira_prefix=cfg.jira_id_prefix,
                         release_id=release_id,
                         cancel_check=cancel_check,
+                        required_jdk=required_jdk,
                         push=not run_build,
                     ),
                 })
@@ -3192,6 +3208,7 @@ def _run_until(
     else:
         _check_cancelled(pipeline_id)
         t = _s_start("build-validation")
+        java_home = _resolve_java_home(cfg.java_home, required_jdk or "")
         merged_results: list[dict] = []
         try:
             for entry in adr_results:
@@ -3205,6 +3222,9 @@ def _run_until(
                     continue
                 bv_result = validate_one(
                     artifact_id, adr_result, str(project_path),
+                    mvn_exe=cfg.mvn_exe, skip_tests=cfg.skip_tests,
+                    java_home=java_home, build_threads=cfg.build_threads,
+                    **({"maven_heap_mb": cfg.maven_heap_mb} if cfg.maven_heap_mb is not None else {}),
                     cancel_check=cancel_check,
                 )
                 merged_results.append({"artifact_id": artifact_id, "result": {
