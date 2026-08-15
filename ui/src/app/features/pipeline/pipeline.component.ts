@@ -89,7 +89,10 @@ export class PipelineComponent {
   fortifyAppName     = signal('');
   fortifyGithubRepo  = signal('');       // owner/repo — clones repo so no local PROJECT_PATH needed
   fortifyReportPath  = signal('');       // offline mode: path to JSON report
-  fortifyMaxUpgrades = signal(1);        
+  fortifyMaxUpgrades = signal(1);        // default 1 — deliberately not 0 ("all"), so a
+                                          // first-time/blank submit can't accidentally kick
+                                          // off an unbounded upgrade batch. 0 remains a valid,
+                                          // explicit choice the user can still type in.
   showFortifyForm    = signal(false);
 
   // ── Fortify form validation ─────────────────────────────────────────────────
@@ -546,7 +549,7 @@ export class PipelineComponent {
     this.fortifyAppName.set('');
     this.fortifyGithubRepo.set('');
     this.fortifyReportPath.set('');
-    this.fortifyMaxUpgrades.set(0);
+    this.fortifyMaxUpgrades.set(1);   // matches the field's own default — see its declaration
     this.fortifyRunBuild.set(false);
     this.fortifyGithubToken.set('');
     this.fortifyUsername.set('');
