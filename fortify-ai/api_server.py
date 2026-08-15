@@ -54,9 +54,31 @@ Execution Modes:
     POST /stages/ai-reasoning      — Stage 5: AI safety verdict
     POST /stages/adr-fix           — Stage 6:  invoke adr.py --commit --skip-build (commit only)
     POST /stages/build-validation  — Stage 6b: mvn clean install → push on success / rollback on failure
-    POST /stages/ai-code-fix       — Stage 7: AI patch for broken call sites
+    POST /stages/ai-code-fix       — Stage 7: AI patch for broken call sites (also invoked
+                                     automatically — see AI CODE FIX BRANCH below; this endpoint
+                                     remains for calling it standalone/out-of-band)
     POST /stages/pr-agent          — Stage 8: create GitHub PR
     POST /stages/fortify-writeback — Stage 9: post outcome comment to SSC
+
+  AI CODE FIX BRANCH (wired into the /pipeline/* full-pipeline runs only —
+  the /stages/* individual-stage and /pipeline/until/* partial-pipeline
+  endpoints call adr-fix/build-validation exactly once each, with no retry)
+    Pre-patch:  after ai-reasoning, any group ai_reasoning routed to
+                next_node="ai_code_fix" (breaking API change + insufficient
+                confidence in adr-fix alone) is patched via ai_code_fix_node
+                BEFORE adr-fix ever runs, mirroring graph.py's
+                ai_reasoning → ai_code_fix → adr_fix edge.
+    Post-patch: when build-validation's 'mvn clean install' fails, each
+                failing group runs failure_analysis_node → (if the retry
+                route applies) ai_code_fix_node → adr-fix re-commit →
+                build-validation again, bounded by cfg.max_retries (default
+                3) per group — mirroring graph.py's build_validation →
+                failure_analysis → route_retry("adr_fix") loop. A group
+                still failing after the retry budget is exhausted, or one
+                failure_analysis routes to "next candidate" (not supported
+                per-group in this REST pipeline yet) or "escalate", is left
+                success=False for pr-agent/fortify-writeback to report as
+                usual — no separate escalate() terminal node here.
 
   PARTIAL PIPELINES (stop at a given stage — async, returns pipeline_id)
     POST /pipeline/until/triage
@@ -901,9 +923,11 @@ def _run_full_pipeline(
     from agents.ai_reasoning import reason_all_groups
     from agents.adr_fix import run_adr_fix
     from agents.build_validation import validate_one, _resolve_java_home
+    from agents.failure_analysis import failure_analysis_node
+    from agents.ai_code_fix import ai_code_fix_node
     from agents.pr_agent import create_prs_for_all_groups
     from agents.fortify_writeback import run_all_reports
-    from state import AdrResult
+    from state import AdrResult, AgentState
 
     def _stage_start(name: str) -> float:
         t = time.time()
@@ -1093,6 +1117,61 @@ def _run_full_pipeline(
             "safe": sum(1 for g in reasoned if g.get("next_node") != "escalate"),
             "escalated": sum(1 for g in reasoned if g.get("next_node") == "escalate"),
         })
+
+        # Stage 5b — pre-patch AI Code Fix (mirrors graph.py's
+        # ai_reasoning_agent → route_ai_reasoning → "ai_code_fix" → adr_fix
+        # edge). ai_reasoning flags a group next_node="ai_code_fix" instead of
+        # "adr_fix" when the API diff shows a breaking change AND the model's
+        # confidence isn't high enough to trust adr-fix alone — the calling
+        # code needs to be patched *before* the dependency bump is committed.
+        # Not tracked as its own job_store stage (see _stage_start docstring
+        # note below) — it runs inside the ai-reasoning window and always
+        # falls through to adr-fix next, same as graph.py's unconditional
+        # ai_code_fix → adr_fix edge.
+        pre_patch_groups = [g for g in reasoned if g.get("next_node") == "ai_code_fix"]
+        if pre_patch_groups and cfg.gcp_project and not dry_run:
+            print(f"[AiCodeFix] Pre-patching {len(pre_patch_groups)} group(s) "
+                  f"flagged by AI Reasoning before adr-fix runs")
+            for group in pre_patch_groups:
+                artifact_id = group.get("parsed", {}).get("artifact_id")
+                state = AgentState(
+                    release_id=release_id, vuln_id=None, cve_list=[],
+                    dependency=group.get("parsed"),
+                    severity=None, owasp_2021=None, sonatype_explanation=None,
+                    primary_location=None, is_suppressed=False, auditor_status=None,
+                    closed_status=False, version_candidates=group.get("version_candidates"),
+                    current_candidate=group.get("current_candidate"),
+                    candidate_index=group.get("candidate_index", 0),
+                    pom_location=group.get("pom_location"),
+                    calling_files=group.get("calling_files", []),
+                    calling_code_snippet=group.get("calling_code_snippet"),
+                    api_diff=group.get("api_diff"),
+                    ai_reasoning=group.get("ai_reasoning"),
+                    adr_result=None, retry_count=0,
+                    last_build_error=None, ai_code_fix_applied=False,
+                    pr_result=None, status="running",
+                    skip_reason=None, escalation_reason=None, audit_trail=[],
+                    _project_path=str(project_path),
+                )
+                updated = ai_code_fix_node(
+                    state, str(project_path), cfg.gcp_project,
+                    cfg.gcp_location or "us-central1",
+                )
+                group["ai_code_fix_applied"] = updated.get("ai_code_fix_applied", False)
+                print(f"[AiCodeFix] {artifact_id}: "
+                      f"{'patch applied' if group['ai_code_fix_applied'] else 'no patch applied'} "
+                      f"— proceeding to adr-fix")
+                # Whether or not a patch was actually applied, fall through to
+                # adr-fix next (route_ai_reasoning's ai_code_fix branch is not
+                # itself a pass/fail gate — build-validation below is what
+                # ultimately catches a bad or missing patch).
+                group["next_node"] = "adr_fix"
+        elif pre_patch_groups:
+            print(f"[AiCodeFix] {len(pre_patch_groups)} group(s) flagged for pre-patch "
+                  f"but skipped (dry_run or GCP not configured) — proceeding to adr-fix as-is")
+            for group in pre_patch_groups:
+                group["next_node"] = "adr_fix"
+
         _checkpoint("adr-fix", reasoned=reasoned)
 
     # Stage 6 — adr fix (side-effecting: commits ONLY — no build, no push.
@@ -1168,6 +1247,22 @@ def _run_full_pipeline(
         _check_cancelled(pipeline_id)
         t = _stage_start("build-validation")
         java_home = _resolve_java_home(cfg.java_home, required_jdk or "")
+        max_retries = cfg.max_retries or 3
+
+        # Indexed by artifact_id so a failed build can pull back the calling
+        # code / API-diff context ai_code_fix needs — see Stage 7 (AI Code
+        # Fix retry loop) below.
+        reasoned_by_id = {g["parsed"]["artifact_id"]: g for g in reasoned}
+
+        def _build_one(artifact_id: str, adr_result: dict) -> dict:
+            return validate_one(
+                artifact_id, adr_result, str(project_path),
+                mvn_exe=cfg.mvn_exe, skip_tests=cfg.skip_tests,
+                java_home=java_home, build_threads=cfg.build_threads,
+                **({"maven_heap_mb": cfg.maven_heap_mb} if cfg.maven_heap_mb is not None else {}),
+                cancel_check=cancel_check,
+            )
+
         merged_results: list[dict] = []
         try:
             for entry in adr_results:
@@ -1180,19 +1275,101 @@ def _run_full_pipeline(
                         **adr_result, "build_time_seconds": None,
                     }})
                     continue
-                bv_result = validate_one(
-                    artifact_id, adr_result, str(project_path),
-                    mvn_exe=cfg.mvn_exe, skip_tests=cfg.skip_tests,
-                    java_home=java_home, build_threads=cfg.build_threads,
-                    **({"maven_heap_mb": cfg.maven_heap_mb} if cfg.maven_heap_mb is not None else {}),
-                    cancel_check=cancel_check,
-                )
+
+                bv_result = _build_one(artifact_id, adr_result)
+
+                # ── Stage 7: AI Code Fix retry loop ─────────────────────────
+                # Mirrors graph.py's build_validation → route_build_result →
+                # failure_analysis → route_retry → (ai_code_fix →) adr_fix →
+                # build_validation cycle, bounded by cfg.max_retries. Only the
+                # "retry" route is handled per-group here; failure_analysis's
+                # "next" route (advance to the next candidate version) would
+                # require re-running version_resolver for a single group,
+                # which this REST pipeline doesn't support yet — that route
+                # is treated the same as "escalate" (see note below).
+                group = reasoned_by_id.get(artifact_id)
+                retries_used = 0
+                while (not bv_result.get("success")) and group is not None and retries_used < max_retries:
+                    _check_cancelled(pipeline_id)
+                    retries_used += 1
+                    print(f"[AiCodeFix] {artifact_id}: build failed "
+                          f"(attempt {retries_used}/{max_retries}) — running failure analysis")
+
+                    fa_state = AgentState(
+                        release_id=release_id, vuln_id=None, cve_list=[],
+                        dependency=group.get("parsed"),
+                        severity=None, owasp_2021=None, sonatype_explanation=None,
+                        primary_location=None, is_suppressed=False, auditor_status=None,
+                        closed_status=False, version_candidates=group.get("version_candidates"),
+                        current_candidate=group.get("current_candidate"),
+                        candidate_index=group.get("candidate_index", 0),
+                        pom_location=group.get("pom_location"),
+                        calling_files=group.get("calling_files", []),
+                        calling_code_snippet=group.get("calling_code_snippet"),
+                        api_diff=group.get("api_diff"),
+                        ai_reasoning=group.get("ai_reasoning"),
+                        adr_result=adr_result, retry_count=retries_used - 1,
+                        last_build_error=bv_result.get("error_reason"),
+                        ai_code_fix_applied=False,
+                        pr_result=None, status="running",
+                        skip_reason=None, escalation_reason=None, audit_trail=[],
+                        _project_path=str(project_path),
+                    )
+                    fa_state = failure_analysis_node(fa_state, str(project_path), max_retries)
+                    route = fa_state.get("_retry_route", "escalate")
+
+                    if route != "retry" or not cfg.gcp_project:
+                        reason = (
+                            "AI Code Fix retry budget exhausted or no viable next candidate"
+                            if route == "next" else
+                            fa_state.get("escalation_reason") or "Failure analysis routed to escalate"
+                        )
+                        bv_result = {**bv_result, "error_reason":
+                                     f"{bv_result.get('error_reason') or ''} [{reason}]".strip()}
+                        break
+
+                    print(f"[AiCodeFix] {artifact_id}: invoking AI code fix agent")
+                    ai_state = ai_code_fix_node(
+                        fa_state, str(project_path), cfg.gcp_project,
+                        cfg.gcp_location or "us-central1",
+                    )
+                    if ai_state.get("status") == "failed" or not ai_state.get("ai_code_fix_applied"):
+                        bv_result = {**bv_result, "error_reason":
+                                     ai_state.get("skip_reason") or ai_state.get("escalation_reason")
+                                     or "AI code fix failed to produce a patch"}
+                        break
+
+                    # Re-commit (adr-fix) on top of the AI-patched files, then
+                    # build again — same commit-then-build split as the happy
+                    # path above (push happens inside validate_one on success).
+                    retry_adr_result = run_adr_fix(
+                        group, adr_path=cfg.adr_path,
+                        project_path=str(project_path),
+                        jira_prefix=cfg.jira_id_prefix,
+                        release_id=release_id,
+                        cancel_check=cancel_check,
+                        required_jdk=required_jdk,
+                        push=False,
+                    )
+                    if not retry_adr_result.get("success"):
+                        bv_result = {**bv_result, "error_reason":
+                                     retry_adr_result.get("error_reason") or "Re-commit after AI code fix failed"}
+                        break
+                    adr_result = retry_adr_result
+                    bv_result = _build_one(artifact_id, adr_result)
+
+                if retries_used:
+                    print(f"[AiCodeFix] {artifact_id}: "
+                          f"{'build passed after AI code fix' if bv_result.get('success') else 'still failing'} "
+                          f"after {retries_used} retr{'y' if retries_used == 1 else 'ies'}")
+
                 merged_results.append({"artifact_id": artifact_id, "result": {
                     **adr_result,
                     "success": bv_result["success"],
                     "branch_name": bv_result["branch_name"],
                     "build_time_seconds": bv_result["build_time_seconds"],
                     "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+                    "ai_code_fix_retries": retries_used,
                 }})
         except PipelineCancelledError:
             # Mid-build or mid-push termination — see validate_one's docstring;
@@ -1201,7 +1378,11 @@ def _run_full_pipeline(
             raise
         adr_results = merged_results
         _bv_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
-        _stage_done("build-validation", t, {"pushed": _bv_ok, "total": len(adr_results)})
+        _ai_fixed = sum(1 for r in adr_results
+                         if r.get("result", {}).get("success") and r.get("result", {}).get("ai_code_fix_retries"))
+        _stage_done("build-validation", t, {
+            "pushed": _bv_ok, "total": len(adr_results), "fixed_by_ai_code_fix": _ai_fixed,
+        })
         _checkpoint("pr-agent", adr_results=adr_results)
 
     # Stage 7 — pr agent (side-effecting: opens PRs — idempotent via branch-name lookup)
