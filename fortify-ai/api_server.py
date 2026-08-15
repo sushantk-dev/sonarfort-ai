@@ -1152,6 +1152,14 @@ def _run_full_pipeline(
                     pr_result=None, status="running",
                     skip_reason=None, escalation_reason=None, audit_trail=[],
                     _project_path=str(project_path),
+                    # ai_code_fix_node reads its group data from
+                    # _reasoned_groups/_diff_groups, NOT from the
+                    # dependency/api_diff/etc. fields above — without this the
+                    # node sees an empty group list and no-ops (logs "No
+                    # groups in state — skipping" and returns
+                    # ai_code_fix_applied=False without ever calling the LLM).
+                    # Single-element list scopes the patch to this group only.
+                    _reasoned_groups=[group],
                 )
                 updated = ai_code_fix_node(
                     state, str(project_path), cfg.gcp_project,
@@ -1314,6 +1322,13 @@ def _run_full_pipeline(
                         pr_result=None, status="running",
                         skip_reason=None, escalation_reason=None, audit_trail=[],
                         _project_path=str(project_path),
+                        # failure_analysis_node AND ai_code_fix_node both read
+                        # their group list from _reasoned_groups/_diff_groups
+                        # (not the dependency/api_diff fields above) — without
+                        # this, decide_retry_route's `if not groups: return
+                        # "escalate"` fires immediately on every failure,
+                        # before the retry budget is even consulted.
+                        _reasoned_groups=[group],
                     )
                     fa_state = failure_analysis_node(fa_state, str(project_path), max_retries)
                     route = fa_state.get("_retry_route", "escalate")
@@ -3098,6 +3113,11 @@ def stage_ai_code_fix(req: AiCodeFixRequest):
                 _project_path=req.project_path,
                 _gcp_project=req.gcp_project,
                 _gcp_location=req.gcp_location,
+                # ai_code_fix_node reads its group data from _reasoned_groups
+                # (or _diff_groups), not from the individual fields above —
+                # without this it sees an empty group list and no-ops. See
+                # ai_code_fix_node's docstring ("Reads: state[_reasoned_groups]").
+                _reasoned_groups=[group],
             )
             updated_state = ai_code_fix_node(
                 state, req.project_path, req.gcp_project, req.gcp_location
