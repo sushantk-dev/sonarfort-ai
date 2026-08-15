@@ -38,6 +38,14 @@ Responsibility:
   JDK selection and the MAVEN_OPTS heap cap are applied to that local
   subprocess.
 
+  JDK selection: build_validation_node resolves java_home the same way
+  adr_fortify.py's own CLI does (via its _resolve_java_home helper) — an
+  explicit java_home always wins; otherwise state["required_jdk"] (set
+  earlier in the graph by context_node's detect_required_jdk(), see
+  context.py) is looked up in the FORTIFYAI_JDK_REGISTRY env var; if
+  neither resolves anything, this subprocess just inherits whatever JDK
+  is already on this pod's PATH — see build_validation_node's docstring.
+
   Known limitation vs. the old remote path: _run_maven_build() streams
   Maven's output straight to this process's stdout/logs (for live
   visibility) but does not capture and return it as a string, so
@@ -66,9 +74,11 @@ from loguru import logger
 from state import AgentState, BuildValidationResult, PipelineCancelledError
 
 try:  # flat layout (adr_fortify.py at repo root, next to state.py)
-    from adr_fortify import _run_maven_build, _DEFAULT_MAVEN_HEAP_MB
+    from adr_fortify import _run_maven_build, _resolve_java_home, _DEFAULT_MAVEN_HEAP_MB
 except ImportError:  # package layout
-    from agents.adr_fortify import _run_maven_build, _DEFAULT_MAVEN_HEAP_MB  # type: ignore
+    from agents.adr_fortify import (  # type: ignore
+        _run_maven_build, _resolve_java_home, _DEFAULT_MAVEN_HEAP_MB,
+    )
 
 
 # ── lock cleanup ──────────────────────────────────────────────────────────────
@@ -265,6 +275,9 @@ def build_validation_node(
 
     Reads:  state["_adr_results"]          list of {"artifact_id", "result": AdrResult}
             state["_cancel_check"]         optional zero-arg callable
+            state["required_jdk"]          set by context_node's detect_required_jdk()
+                                            (see context.py) — used to resolve java_home
+                                            below when java_home isn't given explicitly
     Writes: state["_build_validation_results"]  list of {"artifact_id", "result": BuildValidationResult}
             state["build_validation_result"]     result of the first group (for routing)
             state["last_build_error"]            overwritten with this node's error, if any
@@ -273,10 +286,32 @@ def build_validation_node(
     mvn_exe / java_home / build_threads / maven_heap_mb: forwarded to
     _run_maven_build for every group — see validate_one's docstring.
 
+    java_home resolution: if the caller didn't pass an explicit java_home,
+    this node looks up state["required_jdk"] (the JDK version context_node
+    detected for this project — see context.py's detect_required_jdk()) in
+    FORTIFYAI_JDK_REGISTRY via adr_fortify._resolve_java_home, the same
+    registry-lookup logic adr_fortify.py's own --java-home/--required-jdk
+    CLI handling uses. This keeps the JDK actually used to build in sync
+    with the JDK the project was detected to require, instead of always
+    falling back to whatever JDK happens to be on this pod's PATH.
+    Priority, per _resolve_java_home:
+      1. explicit java_home (passed in) — always wins.
+      2. required_jdk looked up in FORTIFYAI_JDK_REGISTRY.
+      3. "" — inherit whatever JDK is already on PATH/JAVA_HOME.
+
     Raises: PipelineCancelledError if cancel_check() reports cancellation.
     """
     adr_results: list[dict] = state.get("_adr_results", [])  # type: ignore[attr-defined]
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
+    required_jdk = state.get("required_jdk") or ""  # type: ignore[attr-defined] — None if context_node couldn't detect one
+
+    resolved_java_home = _resolve_java_home(java_home, required_jdk)
+    if resolved_java_home and resolved_java_home != java_home:
+        logger.info(
+            f"[Build Validation] Project requires JDK {required_jdk} — using "
+            f"JAVA_HOME from FORTIFYAI_JDK_REGISTRY: {resolved_java_home}"
+        )
+    java_home = resolved_java_home
 
     if not adr_results:
         logger.warning("[Build Validation] No ADR results in state — skipping")
