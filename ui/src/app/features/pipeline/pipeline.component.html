@@ -227,16 +227,16 @@
         </div>
         <div class="run-form__field run-form__field--sm">
           <label class="run-form__label--nowrap">Max Upgrades
-            <span class="label-opt" *ngIf="!fortifyRunBuild()">0=all · ≤{{ MAX_MAX_UPGRADES_GENERAL }}</span>
+            <span class="label-opt" *ngIf="!fortifyRunBuild()">1–{{ MAX_MAX_UPGRADES_GENERAL }}</span>
             <span class="label-opt label-opt--required" *ngIf="fortifyRunBuild()">≤{{ MAX_MAX_UPGRADES_WHEN_BUILD }}</span>
           </label>
           <input class="run-form__input"
                  [class.run-form__input--invalid]="maxUpgradesInvalid()"
                  type="number" [value]="fortifyMaxUpgrades()"
                  (input)="onFortifyMaxUpgradesInput($any($event.target).value)"
-                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="0">
+                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="1">
           <span class="run-form__field-error" *ngIf="maxUpgradesInvalid()">
-            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }}
+            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ maxUpgradesMax() }}
           </span>
         </div>
       </ng-container>
@@ -275,16 +275,16 @@
         </div>
         <div class="run-form__field run-form__field--sm">
           <label class="run-form__label--nowrap">Max Upgrades
-            <span class="label-opt" *ngIf="!fortifyRunBuild()">0=all · ≤{{ MAX_MAX_UPGRADES_GENERAL }}</span>
+            <span class="label-opt" *ngIf="!fortifyRunBuild()">1–{{ MAX_MAX_UPGRADES_GENERAL }}</span>
             <span class="label-opt label-opt--required" *ngIf="fortifyRunBuild()">≤{{ MAX_MAX_UPGRADES_WHEN_BUILD }}</span>
           </label>
           <input class="run-form__input"
                  [class.run-form__input--invalid]="maxUpgradesInvalid()"
                  type="number" [value]="fortifyMaxUpgrades()"
                  (input)="onFortifyMaxUpgradesInput($any($event.target).value)"
-                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="0">
+                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="1">
           <span class="run-form__field-error" *ngIf="maxUpgradesInvalid()">
-            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }}
+            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ maxUpgradesMax() }}
           </span>
         </div>
       </ng-container>
@@ -314,16 +314,16 @@
         </div>
         <div class="run-form__field run-form__field--sm">
           <label class="run-form__label--nowrap">Max Upgrades
-            <span class="label-opt" *ngIf="!fortifyRunBuild()">0=all · ≤{{ MAX_MAX_UPGRADES_GENERAL }}</span>
+            <span class="label-opt" *ngIf="!fortifyRunBuild()">1–{{ MAX_MAX_UPGRADES_GENERAL }}</span>
             <span class="label-opt label-opt--required" *ngIf="fortifyRunBuild()">≤{{ MAX_MAX_UPGRADES_WHEN_BUILD }}</span>
           </label>
           <input class="run-form__input"
                  [class.run-form__input--invalid]="maxUpgradesInvalid()"
                  type="number" [value]="fortifyMaxUpgrades()"
                  (input)="onFortifyMaxUpgradesInput($any($event.target).value)"
-                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="0">
+                 [attr.min]="maxUpgradesMin()" [attr.max]="maxUpgradesMax()" placeholder="1">
           <span class="run-form__field-error" *ngIf="maxUpgradesInvalid()">
-            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ MAX_MAX_UPGRADES_WHEN_BUILD }}
+            Must be {{ MIN_MAX_UPGRADES_WHEN_BUILD }}–{{ maxUpgradesMax() }}
           </span>
         </div>
       </ng-container>

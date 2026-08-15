@@ -89,10 +89,8 @@ export class PipelineComponent {
   fortifyAppName     = signal('');
   fortifyGithubRepo  = signal('');       // owner/repo — clones repo so no local PROJECT_PATH needed
   fortifyReportPath  = signal('');       // offline mode: path to JSON report
-  fortifyMaxUpgrades = signal(1);        // default 1 — deliberately not 0 ("all"), so a
-                                          // first-time/blank submit can't accidentally kick
-                                          // off an unbounded upgrade batch. 0 remains a valid,
-                                          // explicit choice the user can still type in.
+  fortifyMaxUpgrades = signal(1);        // min is always 1 — there is no "0 = all" anymore;
+                                          // every run commits to an explicit, bounded batch.
   showFortifyForm    = signal(false);
 
   // ── Fortify form validation ─────────────────────────────────────────────────
@@ -149,22 +147,21 @@ export class PipelineComponent {
 
   // ── Run Maven build validation (Stage 6b) ──────────────────────────────────
   // Off by default — build validation costs real CI time per dependency, so
-  // it's opt-in. Once enabled, an unlimited run (max_upgrades = 0) would mean
-  // "build after every single dependency, however many there are", which is
-  // rarely what anyone wants — so enabling this bounds max_upgrades to a
-  // small, fixed batch (1–5).
+  // it's opt-in. Once enabled, this bounds max_upgrades to a small, fixed
+  // batch (1–5).
   fortifyRunBuild = signal(false);
   readonly MIN_MAX_UPGRADES_WHEN_BUILD = 1;   // hard floor once build is on — shown in the UI
   readonly MAX_MAX_UPGRADES_WHEN_BUILD = 5;   // hard ceiling once build is on — shown in the UI
 
-  // General ceiling — applies regardless of Run Maven Build. 0 still means "all" (no
-  // cap on the API side), but any explicit positive value the user types is capped
-  // at 20; a single run committing more than that is treated as a config mistake
-  // rather than an intentional batch.
+  // General ceiling — applies regardless of Run Maven Build. Max Upgrades is
+  // always at least 1 (there's no "0 = all" anymore — every run commits to an
+  // explicit, bounded batch), capped at 20 when build is off; a single run
+  // committing more than that is treated as a config mistake rather than an
+  // intentional batch.
   readonly MAX_MAX_UPGRADES_GENERAL = 20;
 
-  /** Smallest legal Max Upgrades value — 1 once build validation is on, else 0 (unlimited allowed). */
-  maxUpgradesMin = computed(() => this.fortifyRunBuild() ? this.MIN_MAX_UPGRADES_WHEN_BUILD : 0);
+  /** Smallest legal Max Upgrades value — always 1, build on or off. */
+  maxUpgradesMin = computed(() => this.MIN_MAX_UPGRADES_WHEN_BUILD);
 
   /** Largest legal Max Upgrades value — 5 once build validation is on, else the general 20-upgrade ceiling. */
   maxUpgradesMax = computed(() =>
@@ -174,11 +171,8 @@ export class PipelineComponent {
   /** True when the current Max Upgrades value violates whichever range currently applies — blocks submit. */
   maxUpgradesInvalid = computed(() => {
     const n = this.fortifyMaxUpgrades();
-    if (this.fortifyRunBuild()) {
-      return n < this.MIN_MAX_UPGRADES_WHEN_BUILD || n > this.MAX_MAX_UPGRADES_WHEN_BUILD;
-    }
-    // Off: 0 ("all") is always fine; any explicit value must stay within the general ceiling.
-    return n > this.MAX_MAX_UPGRADES_GENERAL;
+    if (n < this.MIN_MAX_UPGRADES_WHEN_BUILD) return true;
+    return n > this.maxUpgradesMax();
   });
 
   // ── Per-run credentials — never persisted, cleared after each submit ──────
@@ -201,15 +195,11 @@ export class PipelineComponent {
     this._scheduleBuildEstimate();
   }
 
-  /** Max Upgrades input handler — clamps to the range that currently applies:
-   *  1–5 while Run Maven Build is on, else 0 ("all") or up to the general 20 ceiling. */
+  /** Max Upgrades input handler — always clamps to at least 1, and up to whichever
+   *  ceiling currently applies: 5 while Run Maven Build is on, else the general 20 cap. */
   onFortifyMaxUpgradesInput(raw: string) {
     let n = Math.trunc(+raw) || 0;
-    if (this.fortifyRunBuild()) {
-      n = Math.min(this.MAX_MAX_UPGRADES_WHEN_BUILD, Math.max(this.MIN_MAX_UPGRADES_WHEN_BUILD, n));
-    } else if (n > this.MAX_MAX_UPGRADES_GENERAL) {
-      n = this.MAX_MAX_UPGRADES_GENERAL;
-    }
+    n = Math.max(this.MIN_MAX_UPGRADES_WHEN_BUILD, Math.min(this.maxUpgradesMax(), n));
     this.fortifyMaxUpgrades.set(n);
     this._scheduleBuildEstimate();
   }
@@ -233,11 +223,9 @@ export class PipelineComponent {
   private readonly EST_PER_DEP_SEC         = 20;   // triage..writeback per dependency (no build)
   private readonly EST_BUILD_PER_DEP_SEC   = 150;  // extra mvn clean install per dependency (build on, local fallback only)
 
-  /** Local fallback point estimate in seconds, or null when it can't be estimated (build off + unlimited). */
+  /** Local fallback point estimate in seconds — always computable now that Max Upgrades is never 0. */
   private fallbackRuntimeSeconds = computed<number | null>(() => {
-    const n = this.fortifyMaxUpgrades();
-    if (!this.fortifyRunBuild() && n <= 0) return null;   // "all" with no build — count unknown
-    const deps    = Math.max(n, this.MIN_MAX_UPGRADES_WHEN_BUILD);
+    const deps    = Math.max(this.fortifyMaxUpgrades(), this.MIN_MAX_UPGRADES_WHEN_BUILD);
     const perDep  = this.EST_PER_DEP_SEC + (this.fortifyRunBuild() ? this.EST_BUILD_PER_DEP_SEC : 0);
     return this.EST_BASE_OVERHEAD_SEC + deps * perDep;
   });
@@ -451,9 +439,8 @@ export class PipelineComponent {
     // batch size than the one the user typed.
     if (this.maxUpgradesInvalid()) {
       this.state.error.set(
-        this.fortifyRunBuild()
-          ? `Max Upgrades must be between ${this.MIN_MAX_UPGRADES_WHEN_BUILD} and ${this.MAX_MAX_UPGRADES_WHEN_BUILD} when Run Maven Build is enabled.`
-          : `Max Upgrades can't exceed ${this.MAX_MAX_UPGRADES_GENERAL} (use 0 for all).`
+        `Max Upgrades must be between ${this.MIN_MAX_UPGRADES_WHEN_BUILD} and ${this.maxUpgradesMax()}` +
+        (this.fortifyRunBuild() ? ' when Run Maven Build is enabled.' : '.')
       );
       return;
     }
@@ -475,12 +462,12 @@ export class PipelineComponent {
     };
 
     // The guard above already ensured Max Upgrades is within whichever range
-    // currently applies — 1–5 with build on, or 0/≤20 with it off.
+    // currently applies — 1–5 with build on, or 1–20 with it off.
     const runBuild = this.fortifyRunBuild();
-    const maxUpgrades = runBuild
-      ? Math.min(this.MAX_MAX_UPGRADES_WHEN_BUILD,
-          Math.max(this.MIN_MAX_UPGRADES_WHEN_BUILD, this.fortifyMaxUpgrades()))
-      : Math.min(this.MAX_MAX_UPGRADES_GENERAL, this.fortifyMaxUpgrades() || 0);
+    const maxUpgrades = Math.max(
+      this.MIN_MAX_UPGRADES_WHEN_BUILD,
+      Math.min(this.maxUpgradesMax(), this.fortifyMaxUpgrades()),
+    );
 
     let body: Record<string, unknown> = {
       max_upgrades: maxUpgrades,
