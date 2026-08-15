@@ -12,10 +12,11 @@ Responsibility:
        Maven runner adr_fortify.py's own --fix/--commit modes use.
        Imported directly rather than reimplemented here, so there's
        exactly one Maven-invocation implementation in this codebase to
-       keep in sync (heap sizing, timeout, JDK selection, the
-       single-threaded retry-on-failure fallback for parallel reactor
-       builds — all of that lives in adr_fortify.py; this module just
-       calls it).
+       keep in sync (heap sizing, timeout, the single-threaded
+       retry-on-failure fallback for parallel reactor builds — all of
+       that lives in adr_fortify.py; this module just calls it). JDK
+       *selection* (which JAVA_HOME to point that subprocess at) is
+       handled locally in this module instead — see below.
     3. On success → push the branch to origin now. A branch is only ever
        pushed once its build has already succeeded locally — unlike the
        previous remote-dispatch design, nothing unbuilt/broken ever
@@ -33,18 +34,19 @@ Responsibility:
   to do, Iteration 9): running mvn directly on this pod removes the extra
   network round-trip, workflow-file coupling, and remote-runner queue
   time — at the cost of needing this pod's own JDK/Maven/proxy/Nexus
-  settings to be correctly configured. See adr_fortify.py's
-  --java-home/--required-jdk handling and _build_subprocess_env for how
-  JDK selection and the MAVEN_OPTS heap cap are applied to that local
-  subprocess.
+  settings to be correctly configured. See _build_subprocess_env in
+  adr_fortify.py for how the MAVEN_OPTS heap cap is applied to that local
+  subprocess; JDK selection is handled in this module (see below).
 
   JDK selection: build_validation_node resolves java_home the same way
-  adr_fortify.py's own CLI does (via its _resolve_java_home helper) — an
-  explicit java_home always wins; otherwise state["required_jdk"] (set
-  earlier in the graph by context_node's detect_required_jdk(), see
-  context.py) is looked up in the FORTIFYAI_JDK_REGISTRY env var; if
-  neither resolves anything, this subprocess just inherits whatever JDK
-  is already on this pod's PATH — see build_validation_node's docstring.
+  adr_fortify.py's own CLI does — priority is explicit java_home, then
+  state["required_jdk"] (set earlier in the graph by context_node's
+  detect_required_jdk(), see context.py) looked up in the
+  FORTIFYAI_JDK_REGISTRY env var, then "" (inherit whatever JDK is
+  already on this pod's PATH). The registry lookup (_load_jdk_registry /
+  _resolve_java_home, below) is copied from adr_fortify.py's own JDK
+  SELECTION section rather than imported — see build_validation_node's
+  docstring.
 
   Known limitation vs. the old remote path: _run_maven_build() streams
   Maven's output straight to this process's stdout/logs (for live
@@ -66,6 +68,7 @@ Console output (done-when):
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 from typing import Callable, Optional
 
@@ -74,11 +77,69 @@ from loguru import logger
 from state import AgentState, BuildValidationResult, PipelineCancelledError
 
 try:  # flat layout (adr_fortify.py at repo root, next to state.py)
-    from adr_fortify import _run_maven_build, _resolve_java_home, _DEFAULT_MAVEN_HEAP_MB
+    from adr_fortify import _run_maven_build, _DEFAULT_MAVEN_HEAP_MB
 except ImportError:  # package layout
-    from agents.adr_fortify import (  # type: ignore
-        _run_maven_build, _resolve_java_home, _DEFAULT_MAVEN_HEAP_MB,
+    from agents.adr_fortify import _run_maven_build, _DEFAULT_MAVEN_HEAP_MB  # type: ignore
+
+
+# ── JDK selection ──────────────────────────────────────────────────────────────
+# Copied from adr_fortify.py's own JDK SELECTION section (_load_jdk_registry /
+# _resolve_java_home) rather than imported, so build_validation.py doesn't
+# depend on adr_fortify.py's private (underscore-prefixed) helpers staying
+# stable across iterations — this is the one other place in the pipeline that
+# spawns its own `mvn` subprocess (see validate_one → _run_maven_build) and so
+# needs the exact same JDK-resolution behavior adr_fortify.py's CLI has.
+# Logging is adapted to this module's loguru logger instead of adr_fortify.py's
+# print()/C color codes; the resolution logic itself is unchanged.
+
+def _load_jdk_registry() -> dict:
+    """
+    Load a {major_version: java_home_path} map from the FORTIFYAI_JDK_REGISTRY
+    env var (a JSON object), e.g.:
+        FORTIFYAI_JDK_REGISTRY='{"8":"/opt/jdks/jdk8","17":"/opt/jdks/jdk17"}'
+    Returns {} if the env var is unset or not valid JSON — callers treat that
+    as "no registry available" and fall back to whatever JDK is on PATH.
+    """
+    raw = os.environ.get("FORTIFYAI_JDK_REGISTRY", "").strip()
+    if not raw:
+        return {}
+    try:
+        registry = json.loads(raw)
+        if isinstance(registry, dict):
+            return {str(k): str(v) for k, v in registry.items()}
+    except (ValueError, TypeError):
+        pass
+    logger.warning(
+        "[Build Validation] FORTIFYAI_JDK_REGISTRY is set but not valid JSON — ignoring."
     )
+    return {}
+
+
+def _resolve_java_home(explicit_java_home: str, required_jdk: str) -> str:
+    """
+    Decide which JAVA_HOME to use for this run's local `mvn clean install`.
+
+    Priority:
+      1. explicit_java_home, if given — always wins.
+      2. required_jdk looked up in FORTIFYAI_JDK_REGISTRY.
+      3. "" — inherit whatever JDK is already on PATH/JAVA_HOME. This is the
+         original behaviour and is what happens when neither is available,
+         so existing callers of build_validation_node are unaffected.
+    """
+    if explicit_java_home:
+        return explicit_java_home
+
+    if required_jdk:
+        registry = _load_jdk_registry()
+        match = registry.get(str(required_jdk))
+        if match:
+            return match
+        logger.warning(
+            f"[Build Validation] Project requires JDK {required_jdk} but no "
+            "matching entry found in FORTIFYAI_JDK_REGISTRY — using the JDK "
+            "already on PATH."
+        )
+    return ""
 
 
 # ── lock cleanup ──────────────────────────────────────────────────────────────
@@ -289,11 +350,11 @@ def build_validation_node(
     java_home resolution: if the caller didn't pass an explicit java_home,
     this node looks up state["required_jdk"] (the JDK version context_node
     detected for this project — see context.py's detect_required_jdk()) in
-    FORTIFYAI_JDK_REGISTRY via adr_fortify._resolve_java_home, the same
-    registry-lookup logic adr_fortify.py's own --java-home/--required-jdk
-    CLI handling uses. This keeps the JDK actually used to build in sync
-    with the JDK the project was detected to require, instead of always
-    falling back to whatever JDK happens to be on this pod's PATH.
+    FORTIFYAI_JDK_REGISTRY via this module's own _resolve_java_home (copied
+    from adr_fortify.py's JDK SELECTION section — see module docstring).
+    This keeps the JDK actually used to build in sync with the JDK the
+    project was detected to require, instead of always falling back to
+    whatever JDK happens to be on this pod's PATH.
     Priority, per _resolve_java_home:
       1. explicit java_home (passed in) — always wins.
       2. required_jdk looked up in FORTIFYAI_JDK_REGISTRY.
