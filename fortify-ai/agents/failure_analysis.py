@@ -350,24 +350,62 @@ def failure_analysis_node(state: AgentState, project_path: str, max_retries: int
     state["_failure_context"] = failure_context   # type: ignore[typeddict-unknown-key]
     state["_retry_route"] = route                  # type: ignore[typeddict-unknown-key]
 
-    if is_jdk_mismatch and route == "escalate":
-        required = state.get("required_jdk")        # type: ignore[attr-defined]
-        if jdk_version:
-            reason = (
-                f"Build failed due to a JDK/toolchain version mismatch (build "
-                f"environment reported version {jdk_version}"
-                + (f", project pom.xml requires JDK {required}" if required else "")
-                + "). This cannot be fixed by patching source code — install/"
-                "select a matching JDK for this project and re-run."
-            )
+    if route == "escalate":
+        required = state.get("required_jdk")                       # type: ignore[attr-defined]
+        ai_fix_reason = state.get("ai_code_fix_failure_reason")     # type: ignore[attr-defined]
+
+        if is_jdk_mismatch:
+            if jdk_version:
+                reason = (
+                    f"Build failed due to a JDK/toolchain version mismatch (build "
+                    f"environment reported version {jdk_version}"
+                    + (f", project pom.xml requires JDK {required}" if required else "")
+                    + "). This cannot be fixed by patching source code — install/"
+                    "select a matching JDK for this project and re-run."
+                )
+            else:
+                reason = (
+                    "Build failed due to a JDK/toolchain version mismatch"
+                    + (f" — project pom.xml requires JDK {required}" if required else "")
+                    + ". This cannot be fixed by patching source code — install/"
+                    "select a matching JDK for this project and re-run."
+                )
         else:
+            # Code-level compile failure — describe the concrete cause (which
+            # file/line/symbol broke the build) and, since AI Code Fix is the
+            # agent responsible for resolving that, why it wasn't able to.
+            if sites:
+                cause_parts = []
+                for s in sites[:5]:
+                    loc = (
+                        f"{Path(s.file_path).name}:{s.line_number}"
+                        if s.line_number else Path(s.file_path).name
+                    )
+                    cause_parts.append(f"{loc} — {s.error_message}")
+                cause = "Build failed to compile at: " + "; ".join(cause_parts)
+            elif error_log.strip():
+                cause = (
+                    "Build failed with a Maven error that could not be matched "
+                    f"to a specific file/line: {error_log.strip()[:300]}"
+                )
+            else:
+                cause = "Build failed with no captured Maven error output."
+
             reason = (
-                "Build failed due to a JDK/toolchain version mismatch"
-                + (f" — project pom.xml requires JDK {required}" if required else "")
-                + ". This cannot be fixed by patching source code — install/"
-                "select a matching JDK for this project and re-run."
+                f"{cause} After {attempt_num} attempt(s) across "
+                f"{candidate_index + 1} candidate version(s), AI Code Fix could "
+                "not produce a working patch"
+                + (f" ({ai_fix_reason})." if ai_fix_reason else ".")
             )
+
         state["escalation_reason"] = reason          # type: ignore[typeddict-item]
+        # Also stamp the reason onto the group dict itself (mirroring how
+        # version_resolver.py sets group["escalate_reason"]) — callers that
+        # process one group dict across several stages by reference (e.g.
+        # api_server.py's REST retry loop) read it back from there rather
+        # than threading state["escalation_reason"] through every call.
+        for group in groups:
+            group["escalate_reason"] = reason
 
     state["audit_trail"].append({
         "node": "failure_analysis",

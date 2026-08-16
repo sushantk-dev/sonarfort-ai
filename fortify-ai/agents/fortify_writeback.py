@@ -189,6 +189,7 @@ def _escalation_report(
     gcp_location: str = "us-central1",
     is_jdk_mismatch: bool = False,
     required_jdk: Optional[str] = None,
+    ai_code_fix_reason: Optional[str] = None,
 ) -> str:
     """
     Build the full escalation report text for one dependency group.
@@ -210,6 +211,10 @@ def _escalation_report(
         or group.get("escalate_reason")
         or "Automated fix was not possible"
     )
+    # ai_code_fix_reason may arrive as an explicit param (graph.py's single
+    # state-per-run flow) or live on the group dict itself (api_server.py's
+    # REST flow mutates the same group object across stages) — either works.
+    effective_ai_code_fix_reason = ai_code_fix_reason or group.get("ai_code_fix_reason")
 
     # Gather retry attempts from adr_results if available
     adr = next(
@@ -260,10 +265,23 @@ def _escalation_report(
         if required_jdk:
             lines += [f"Project requires JDK: {required_jdk}"]
 
+    # AI Code Fix is only relevant for code-level failures — a JDK mismatch
+    # is an environment problem and AI Code Fix is skipped for it entirely
+    # (already covered by the "Detected Cause" section above), so only show
+    # this section for the code-patch-attempted path.
+    if effective_ai_code_fix_reason and not is_jdk_mismatch:
+        lines += [
+            "",
+            "── AI Code Fix ─────────────────────────────────────────",
+            "FortifyAI attempted to generate and apply an AI source patch to "
+            "fix the build, but could not produce a working fix:",
+            effective_ai_code_fix_reason,
+        ]
+
     if build_error:
         lines += [
             "",
-            "── Last Build Error ───────────────────────────────────",
+            "── Cause of Build Failure ──────────────────────────────",
             build_error[:2000],
         ]
 
@@ -358,6 +376,7 @@ def write_escalation_report(
     pipeline_id: str | None = None,
     is_jdk_mismatch: bool = False,
     required_jdk: Optional[str] = None,
+    ai_code_fix_reason: Optional[str] = None,
 ) -> Optional[str]:
     """
     Write the escalation report.
@@ -395,6 +414,7 @@ def write_escalation_report(
     text        = _escalation_report(
         group, escalation_reason, adr_results, gcp_project, gcp_location,
         is_jdk_mismatch=is_jdk_mismatch, required_jdk=required_jdk,
+        ai_code_fix_reason=ai_code_fix_reason,
     )
 
     # Fields the /escalations list endpoint needs — stashed as blob metadata
@@ -413,6 +433,7 @@ def write_escalation_report(
         "reason":      reason[:1500],  # metadata values have a size limit
         "tried":       ",".join(candidates),
         "severity":    str(group.get("severity", "Unknown")),
+        "ai_code_fix_reason": (ai_code_fix_reason or group.get("ai_code_fix_reason") or "")[:1500],
     }
 
     # ── GCS mode (sole path when a bucket is configured) ─────────────────────
@@ -489,6 +510,7 @@ def run_all_reports(
     pipeline_id: str | None = None,
     is_jdk_mismatch: bool = False,
     required_jdk: Optional[str] = None,
+    ai_code_fix_reason: Optional[str] = None,
 ) -> dict:
     """
     For each group:
@@ -533,6 +555,11 @@ def run_all_reports(
                 group, reason, adr_results, output_dir, gcp_project, gcp_location,
                 pipeline_id=pipeline_id,
                 is_jdk_mismatch=is_jdk_mismatch, required_jdk=required_jdk,
+                # Explicit param (single-state pipeline run) OR per-group
+                # field (REST flow, set directly on the group dict) — either
+                # way write_escalation_report/_escalation_report fall back
+                # to group.get("ai_code_fix_reason") if this is None.
+                ai_code_fix_reason=ai_code_fix_reason,
             )
             if path:
                 total_escalated += 1
@@ -572,6 +599,8 @@ def fortify_writeback_node(
             state["_adr_results"]
             state["_all_pr_results"]
             state["escalation_reason"]
+            state["ai_code_fix_failure_reason"]  (optional — surfaced as its
+                                                    own report section)
             state["_gcp_project"]      (optional — enables LLM next steps)
             state["_gcp_location"]     (optional)
     Writes: state["status"]            → "fixed" or "escalated"
@@ -588,6 +617,7 @@ def fortify_writeback_node(
     escalation_reason       = state.get("escalation_reason")
     is_jdk_mismatch         = bool(state.get("is_jdk_mismatch"))   # type: ignore[attr-defined]
     required_jdk            = state.get("required_jdk")            # type: ignore[attr-defined]
+    ai_code_fix_reason      = state.get("ai_code_fix_failure_reason")  # type: ignore[attr-defined]
 
     # Pick up GCP config from state if not injected as arg directly.
     # graph.py stores these on state the same way it does for ai_reasoning_node.
@@ -609,6 +639,7 @@ def fortify_writeback_node(
         gcp_location=effective_gcp_location,
         is_jdk_mismatch=is_jdk_mismatch,
         required_jdk=required_jdk,
+        ai_code_fix_reason=ai_code_fix_reason,
     )
 
     if summary["total_fixed"] > 0:

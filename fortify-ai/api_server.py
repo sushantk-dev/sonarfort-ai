@@ -1149,6 +1149,7 @@ def _run_full_pipeline(
                     ai_reasoning=group.get("ai_reasoning"),
                     adr_result=None, retry_count=0,
                     last_build_error=None, ai_code_fix_applied=False,
+                    ai_code_fix_failure_reason=None,
                     pr_result=None, status="running",
                     skip_reason=None, escalation_reason=None, audit_trail=[],
                     _project_path=str(project_path),
@@ -1319,6 +1320,7 @@ def _run_full_pipeline(
                         adr_result=adr_result, retry_count=retries_used - 1,
                         last_build_error=bv_result.get("error_reason"),
                         ai_code_fix_applied=False,
+                        ai_code_fix_failure_reason=None,
                         pr_result=None, status="running",
                         skip_reason=None, escalation_reason=None, audit_trail=[],
                         _project_path=str(project_path),
@@ -1341,6 +1343,12 @@ def _run_full_pipeline(
                         )
                         bv_result = {**bv_result, "error_reason":
                                      f"{bv_result.get('error_reason') or ''} [{reason}]".strip()}
+                        # failure_analysis_node already stamps this onto the
+                        # group dict too (see agents/failure_analysis.py), but
+                        # set it explicitly here as well so the "next" case
+                        # (which failure_analysis doesn't cover) also reaches
+                        # the escalation report via group.get("escalate_reason").
+                        group["escalate_reason"] = reason
                         break
 
                     print(f"[AiCodeFix] {artifact_id}: invoking AI code fix agent")
@@ -1349,9 +1357,28 @@ def _run_full_pipeline(
                         cfg.gcp_location or "us-central1",
                     )
                     if ai_state.get("status") == "failed" or not ai_state.get("ai_code_fix_applied"):
+                        # ai_code_fix_failure_reason is the specific reason
+                        # (LLM error, no patches, patch text mismatch, etc.)
+                        # — prefer it over the older generic fallbacks so the
+                        # escalation report says exactly what went wrong
+                        # instead of just "AI code fix failed to produce a
+                        # patch".
+                        reason = (
+                            ai_state.get("ai_code_fix_failure_reason")
+                            or ai_state.get("skip_reason")
+                            or ai_state.get("escalation_reason")
+                            or "AI Code Fix could not produce a working patch"
+                        )
                         bv_result = {**bv_result, "error_reason":
-                                     ai_state.get("skip_reason") or ai_state.get("escalation_reason")
-                                     or "AI code fix failed to produce a patch"}
+                                     f"{bv_result.get('error_reason') or ''} [{reason}]".strip()}
+                        group["escalate_reason"] = reason
+                        # ai_code_fix_node (via generate_and_apply_fix) already
+                        # sets group["ai_code_fix_reason"] as a side effect
+                        # since `group` here is the same dict object passed in
+                        # via fa_state's _reasoned_groups=[group] — this just
+                        # guards the rare case where it fell through to
+                        # "failed"/skip_reason before generate_and_apply_fix ran.
+                        group.setdefault("ai_code_fix_reason", reason)
                         break
 
                     # Re-commit (adr-fix) on top of the AI-patched files, then
@@ -3108,6 +3135,7 @@ def stage_ai_code_fix(req: AiCodeFixRequest):
                 adr_result=None, retry_count=0,
                 last_build_error=group.get("last_build_error"),
                 ai_code_fix_applied=False,
+                ai_code_fix_failure_reason=None,
                 pr_result=None, status="running",
                 skip_reason=None, escalation_reason=None, audit_trail=[],
                 _project_path=req.project_path,
@@ -3125,6 +3153,7 @@ def stage_ai_code_fix(req: AiCodeFixRequest):
             results.append({
                 "artifact_id": group.get("parsed", {}).get("artifact_id"),
                 "ai_code_fix_applied": updated_state.get("ai_code_fix_applied"),
+                "ai_code_fix_failure_reason": updated_state.get("ai_code_fix_failure_reason"),
                 "status": updated_state.get("status"),
             })
 

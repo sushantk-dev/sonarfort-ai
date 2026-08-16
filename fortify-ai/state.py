@@ -151,6 +151,13 @@ class AgentState(TypedDict):
     retry_count: int                       # incremented on each ADR failure
     last_build_error: Optional[str]        # Maven error log from last failed run
     ai_code_fix_applied: bool              # True once pre/post-patch fix has been tried
+    ai_code_fix_failure_reason: Optional[str]  # why AI Code Fix could not produce/apply a
+                                            # working patch on the most recent attempt
+                                            # (LLM unavailable, LLM call failed, no patches
+                                            # returned, patch text didn't match, etc.) —
+                                            # surfaced in the escalation report so a human
+                                            # knows exactly what the agent tried and why it
+                                            # gave up, instead of just a console warning
 
     # ── JDK / toolchain mismatch detection ────────────────────────────────────
     required_jdk: Optional[str]            # detected from pom.xml (maven.compiler.release

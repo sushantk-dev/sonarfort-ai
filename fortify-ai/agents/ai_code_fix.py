@@ -96,8 +96,15 @@ Generate the minimal patch to fix the compilation error. JSON only.
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
-def _call_llm(prompt_vars: dict, llm) -> Optional[dict]:
-    """Call the LLM and return parsed JSON, or None on failure."""
+def _call_llm(prompt_vars: dict, llm) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Call the LLM and return (parsed JSON, failure_reason).
+
+    failure_reason is None on success, otherwise a short human-readable
+    string explaining why no usable patch JSON came back — this is
+    surfaced all the way through to the escalation report, so it should
+    stay specific enough to be useful to a developer reading it later.
+    """
     import json as _json
 
     user_prompt = _USER_PROMPT_TEMPLATE.format(**prompt_vars)
@@ -125,29 +132,38 @@ def _call_llm(prompt_vars: dict, llm) -> Optional[dict]:
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start == -1:
-            return None
-        return _json.loads(raw[start:end])
+            reason = "LLM response contained no JSON object"
+            logger.warning(f"[AI Code Fix] {reason}")
+            return None, reason
+
+        try:
+            return _json.loads(raw[start:end]), None
+        except _json.JSONDecodeError as exc:
+            reason = f"LLM response was not valid JSON ({exc})"
+            logger.warning(f"[AI Code Fix] {reason}")
+            return None, reason
 
     except Exception as exc:
-        logger.warning(f"[AI Code Fix] LLM call failed: {exc}")
-        return None
+        reason = f"LLM call failed: {exc}"
+        logger.warning(f"[AI Code Fix] {reason}")
+        return None, reason
 
 
 # ── Patch application ─────────────────────────────────────────────────────────
 
-def _apply_patch(project_path: Path, patch: dict) -> bool:
+def _apply_patch(project_path: Path, patch: dict) -> tuple[bool, Optional[str]]:
     """
     Apply one line-level patch using exact string replacement.
 
     patch = {"file": "...", "line": 42, "old": "...", "new": "..."}
-    Returns True on success.
+    Returns (success, failure_reason). failure_reason is None on success.
     """
     rel_file = patch.get("file", "")
     old_text = patch.get("old", "")
     new_text = patch.get("new", "")
 
     if not rel_file or not old_text:
-        return False
+        return False, "patch was missing a file path or 'old' text"
 
     # Locate the file
     candidates = [
@@ -161,21 +177,24 @@ def _apply_patch(project_path: Path, patch: dict) -> bool:
             break
 
     if target is None:
+        reason = f"{rel_file}: file not found in project"
         logger.warning(f"[AI Code Fix] File not found: {rel_file}")
-        return False
+        return False, reason
 
     try:
         content = target.read_text(encoding="utf-8")
     except OSError as exc:
+        reason = f"{target.name}: could not read file ({exc})"
         logger.warning(f"[AI Code Fix] Cannot read {target}: {exc}")
-        return False
+        return False, reason
 
     if old_text not in content:
+        reason = f"{target.name}: patch text did not match the file verbatim"
         logger.warning(
             f"[AI Code Fix] 'old' text not found verbatim in {target.name} — "
             "patch cannot be applied"
         )
-        return False
+        return False, reason
 
     # Apply replacement (first occurrence only — safer than global)
     new_content = content.replace(old_text, new_text, 1)
@@ -187,21 +206,30 @@ def _apply_patch(project_path: Path, patch: dict) -> bool:
     try:
         target.write_text(new_content, encoding="utf-8")
         logger.info(f"[AI Code Fix] ✅ Patch applied to {target.name}")
-        return True
+        return True, None
     except OSError as exc:
         # Restore backup
         backup.write_text(content, encoding="utf-8")
+        reason = f"{target.name}: could not write file ({exc})"
         logger.error(f"[AI Code Fix] Failed to write {target}: {exc}")
-        return False
+        return False, reason
 
 
-def apply_all_patches(project_path: Path, patches: list[dict]) -> int:
-    """Apply all patches; return count of successful applications."""
+def apply_all_patches(project_path: Path, patches: list[dict]) -> tuple[int, list[str]]:
+    """
+    Apply all patches.
+    Returns (count of successful applications, list of failure reasons for
+    the patches that could not be applied).
+    """
     success_count = 0
+    failure_reasons: list[str] = []
     for patch in patches:
-        if _apply_patch(project_path, patch):
+        applied, reason = _apply_patch(project_path, patch)
+        if applied:
             success_count += 1
-    return success_count
+        elif reason:
+            failure_reasons.append(reason)
+    return success_count, failure_reasons
 
 
 # ── Heuristic fallback ────────────────────────────────────────────────────────
@@ -231,10 +259,19 @@ def generate_and_apply_fix(
     failure_sites: list[dict],
     project_path: Path,
     llm,
-) -> bool:
+) -> tuple[bool, Optional[str]]:
     """
     Generate a code fix via LLM and apply it to the project files.
-    Returns True if at least one patch was successfully applied.
+
+    Returns (applied, failure_reason):
+      - applied=True, failure_reason=None            → at least one patch applied
+      - applied=False, failure_reason="<explanation>" → nothing applied, and why
+
+    As a side effect, also stashes the outcome on ``group["ai_code_fix_reason"]``
+    (cleared on success) — several callers (the REST pipeline in
+    api_server.py in particular) pass the same group dict through multiple
+    stages by reference, and read it back there rather than threading a
+    return value through every intermediate call.
     """
     parsed = group["parsed"]
     artifact_id = parsed["artifact_id"]
@@ -255,8 +292,11 @@ def generate_and_apply_fix(
     )
 
     # No LLM → heuristic (empty)
+    llm_call_reason: Optional[str] = None
+    explanation: Optional[str] = None
     if llm is None:
         patches = _heuristic_patch(failure_sites, api_diff)
+        llm_call_reason = "no LLM configured — cannot generate a source patch"
     else:
         prompt_vars = {
             "group_id": parsed["group_id"],
@@ -267,19 +307,39 @@ def generate_and_apply_fix(
             "build_error": build_error,
             "failure_context": failure_context[:3000],
         }
-        result = _call_llm(prompt_vars, llm)
+        result, llm_call_reason = _call_llm(prompt_vars, llm)
         patches = result.get("patches", []) if result else []
+        explanation = result.get("explanation") if result else None
 
-        if result and result.get("explanation"):
-            logger.info(f"[AI Code Fix] LLM: {result['explanation'][:200]}")
+        if explanation:
+            logger.info(f"[AI Code Fix] LLM: {explanation[:200]}")
 
     if not patches:
-        logger.warning("[AI Code Fix] No patches generated — ADR will retry as-is")
-        return False
+        if llm_call_reason:
+            reason = llm_call_reason
+        elif explanation:
+            reason = f"LLM returned no patches — {explanation}"
+        else:
+            reason = "LLM returned no patches and gave no explanation"
+        logger.warning(f"[AI Code Fix] No patches generated — {reason}")
+        group["ai_code_fix_reason"] = reason
+        return False, reason
 
-    applied = apply_all_patches(project_path, patches)
+    applied, apply_failure_reasons = apply_all_patches(project_path, patches)
     logger.info(f"[AI Code Fix] {applied}/{len(patches)} patch(es) applied")
-    return applied > 0
+
+    if applied > 0:
+        group["ai_code_fix_reason"] = None
+        return True, None
+
+    reason = (
+        f"LLM proposed {len(patches)} patch(es) but none could be applied — "
+        + "; ".join(apply_failure_reasons)
+    ) if apply_failure_reasons else (
+        f"LLM proposed {len(patches)} patch(es) but none could be applied"
+    )
+    group["ai_code_fix_reason"] = reason
+    return False, reason
 
 
 # ── LangGraph node ────────────────────────────────────────────────────────────
@@ -324,6 +384,10 @@ def ai_code_fix_node(
             "not a code error. No source patch can fix this."
         )
         state["ai_code_fix_applied"] = False
+        state["ai_code_fix_failure_reason"] = (  # type: ignore[typeddict-unknown-key]
+            "Skipped — the build failure was a JDK/toolchain mismatch, not a "
+            "code-level error, so no source patch could apply here"
+        )
         state["audit_trail"].append({
             "node": "ai_code_fix",
             "status": "skipped",
@@ -340,19 +404,32 @@ def ai_code_fix_node(
 
     proj = Path(project_path)
     any_applied = False
+    failure_reasons: list[str] = []
 
     for group in groups:
-        applied = generate_and_apply_fix(
+        artifact_id = group["parsed"]["artifact_id"]
+        applied, reason = generate_and_apply_fix(
             group, failure_context, failure_sites, proj, llm
         )
         if applied:
             any_applied = True
+        elif reason:
+            failure_reasons.append(f"{artifact_id}: {reason}")
 
     state["ai_code_fix_applied"] = any_applied
+    combined_reason = "; ".join(failure_reasons) if failure_reasons else None
+    if combined_reason:
+        # Only overwrite state on failure — a later successful attempt should
+        # not be masked by a stale reason from an earlier retry.
+        state["ai_code_fix_failure_reason"] = combined_reason  # type: ignore[typeddict-unknown-key]
+    elif any_applied:
+        state["ai_code_fix_failure_reason"] = None  # type: ignore[typeddict-unknown-key]
+
     state["audit_trail"].append({
         "node": "ai_code_fix",
         "status": "ok" if any_applied else "no_patch",
         "patches_applied": any_applied,
+        "failure_reason": combined_reason,
     })
 
     return state
