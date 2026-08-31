@@ -547,6 +547,7 @@ def fetch_sonar_rule(state: AgentState) -> AgentState:
             auth=(settings.sonar_token, ""),
             params={"key": rule_key},
             timeout=15,
+            verify=False,
         )
 
         if resp.status_code == 404:

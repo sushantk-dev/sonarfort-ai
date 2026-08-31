@@ -23,6 +23,10 @@ import sys
 
 from loguru import logger
 
+import config as _config  # noqa: F401 — import for its side effect: applies the
+                           # global TLS-verification patch (see config.py) before
+                           # any HTTP/GCS/git client anywhere below can be used.
+
 # Configure loguru: structured one-line format
 logger.remove()
 logger.add(

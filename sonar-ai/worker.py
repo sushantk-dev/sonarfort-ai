@@ -51,6 +51,10 @@ from google.api_core import exceptions as _gexc
 from google.cloud import storage as _gcs_lib
 from loguru import logger
 
+import config as _config  # noqa: F401 — import for its side effect: applies the
+                           # global TLS-verification patch (see config.py) before
+                           # any GCS/HTTP/git client below ever makes a real request.
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 _gcs = _gcs_lib.Client(project=os.environ.get("GCP_PROJECT"))

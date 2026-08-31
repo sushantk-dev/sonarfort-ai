@@ -57,6 +57,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
 
+import config as _config  # noqa: F401 — import for its side effect: applies the
+                           # global TLS-verification patch (see config.py) before
+                           # any GCS/HTTP/git client below ever makes a real request.
 import worker as _worker  # in-process pipeline worker — started on startup below
 
 app = FastAPI(title="SonarAI API", version="2.1.0")

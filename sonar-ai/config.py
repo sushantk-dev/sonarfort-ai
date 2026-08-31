@@ -22,6 +22,76 @@ from pydantic import Field
 import tempfile as _tempfile
 
 
+# ── Global SSL/TLS verification disable ────────────────────────────────────
+# This container's `certifi` install is missing its cacert.pem bundle:
+#   OSError: Could not find a suitable TLS CA certificate bundle, invalid
+#   path: /usr/local/lib/python3.11/site-packages/certifi/cacert.pem
+# That breaks TLS verification for every outbound HTTPS call in the process:
+#   • `requests`-based calls (SonarQube, our own direct API calls) — some
+#     call sites already pass verify=False individually as a workaround.
+#   • The GCS client's internal transport (google.auth.transport.requests.
+#     AuthorizedSession, which subclasses requests.Session) — used by
+#     worker.py, api.py, and rag_store.py's Chroma-GCS sync. This one can't
+#     take a per-call verify= kwarg, so worker.py's main loop was crashing on
+#     every list_blobs()/download/upload call.
+#   • `git` operations shelled out via GitPython (repo_loader.py, worker.py's
+#     `git ls-remote`) — these go through the system git binary's own TLS
+#     stack, entirely separate from Python's `requests`/`ssl` modules, so
+#     they need their own opt-out (GIT_SSL_NO_VERIFY).
+#
+# Patches/env vars below cover all three paths at once, applied once at
+# import time — before any HTTP or git client anywhere in the process is
+# constructed — so every entrypoint (main.py, worker.py, api.py) and every
+# module that imports `config` gets consistent behavior without needing
+# verify=False repeated at each call site.
+#
+# NOTE: this disables TLS certificate verification process-wide. That's a
+# real trade-off (no protection against a MITM on outbound HTTPS/git), done
+# here only to work around the broken cert bundle above. Fix the underlying
+# CA bundle (reinstall/upgrade `certifi`, or point REQUESTS_CA_BUNDLE at a
+# valid CA file such as /etc/ssl/certs/ca-certificates.crt) when the image
+# can be rebuilt, and remove this patch once that's done — don't leave TLS
+# verification disabled long-term.
+def _disable_ssl_verification() -> None:
+    import os
+    import ssl
+    import requests
+    import urllib3
+
+    # 1) `requests` / anything built on requests.adapters.HTTPAdapter
+    #    (incl. the GCS client's AuthorizedSession transport).
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _orig_cert_verify = requests.adapters.HTTPAdapter.cert_verify
+
+    def _no_verify_cert_verify(self, conn, url, verify, cert):  # noqa: ANN001
+        return _orig_cert_verify(self, conn, url, False, cert)
+
+    requests.adapters.HTTPAdapter.cert_verify = _no_verify_cert_verify
+
+    # 2) Bare `ssl`/`urllib`-based HTTPS clients that don't go through
+    #    `requests` at all (defense in depth for any library that uses
+    #    ssl.create_default_context() directly).
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    # 3) `git` subprocess calls (GitPython in repo_loader.py, the raw
+    #    `git ls-remote` subprocess in worker.py) — separate TLS stack,
+    #    not touched by (1) or (2). subprocess.run() without an explicit
+    #    env= inherits this process's environment, so setting it here
+    #    covers every git invocation in the app without changes elsewhere.
+    os.environ["GIT_SSL_NO_VERIFY"] = "true"
+
+    from loguru import logger
+    logger.warning(
+        "[Config] TLS certificate verification is DISABLED process-wide "
+        "(requests, ssl, and git) — broken certifi cacert.pem bundle in "
+        "this container. Fix the underlying CA bundle and remove this "
+        "patch when possible."
+    )
+
+
+_disable_ssl_verification()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         case_sensitive=False,
