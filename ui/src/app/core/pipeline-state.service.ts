@@ -50,6 +50,13 @@ export interface RunRequest {
   no_rag:     boolean;
   dry_run:    boolean;
   severities: string;
+  /** Maven `mvn compile` + `mvn test` in the Validator step. Off by default — opt-in per run. */
+  run_build:  boolean;
+  /** Per-run credential overrides — optional, blank falls back to server config.
+   *  Sent to the backend on the initial POST only; stripped before the request
+   *  is kept in client-side state/history, see PipelineStateService.startRun(). */
+  github_token?: string;
+  sonar_token?:  string;
 }
 
 export interface FortifyRunRequest {
@@ -739,10 +746,13 @@ export class PipelineStateService {
     this.running.set(true);
     this.error.set(null);
 
+    // Send the full request (incl. any per-run token overrides) to the backend,
+    // but only ever keep the sanitized version in client-side state — it's what
+    // gets shown in the UI and written to localStorage history.
     this.api.startRun(req).subscribe({
       next: ({ run_id }) => {
         this.submitting.set(null);
-        this._pollRun(run_id, req);
+        this._pollRun(run_id, this._sanitizeRunRequest(req));
       },
       error: (err: any) => {
         this.submitting.set(null);
@@ -751,6 +761,12 @@ export class PipelineStateService {
         this.running.set(false);
       },
     });
+  }
+
+  /** Strips per-run credentials — never persisted to component state or localStorage. */
+  private _sanitizeRunRequest(req: RunRequest): RunRequest {
+    const { github_token, sonar_token, ...rest } = req;
+    return rest as RunRequest;
   }
 
   private _pollRun(runId: string, req: RunRequest) {

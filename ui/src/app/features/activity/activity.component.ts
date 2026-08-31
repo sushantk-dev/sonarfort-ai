@@ -8,6 +8,7 @@ import { OutcomeLabelPipe } from '../../shared/outcome-label.pipe';
 
 type StatusFilter = 'all' | 'running' | 'done' | 'error' | 'cancelled';
 type OutputItem = { type: 'pr'; url: string } | { type: 'escalation'; file: string };
+type SourceKey = 'fortify' | 'sonar';
 
 /** Max output chips (PRs + escalation reports combined) shown per row before collapsing behind "+N more". */
 const MAX_VISIBLE_OUTPUTS = 3;
@@ -21,6 +22,13 @@ const MAX_VISIBLE_OUTPUTS = 3;
 })
 export class ActivityComponent {
   state = inject(PipelineStateService);
+
+  // ── Source tab (Fortify | Sonar) ────────────────────────────────────────
+  // Everything below (filter/search/table) is unchanged Fortify behavior —
+  // switching the tab just re-scopes which runs allRuns() draws from.
+  // Defaults to 'fortify' so nothing about the existing view changes unless
+  // the user explicitly switches tabs.
+  activeSource = signal<SourceKey>('fortify');
 
   filter  = signal<StatusFilter>('all');
   search  = signal('');
@@ -37,14 +45,27 @@ export class ActivityComponent {
   // chip instead of the capped preview — keyed by run id.
   private _expandedOutputs = new Set<string>();
 
-  // All Fortify runs, from every user — PipelineStateService.runs already
-  // merges GET /pipeline/runs (shared, GCS-backed job store) on a 20s poll,
-  // on top of whatever this browser is actively driving/has in history.
-  allRuns = computed<UiRun[]>(() =>
-    this.state.runs()
-      .filter(r => r.source === 'fortify')
-      .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
-  );
+  // Runs for whichever source tab is active, from every user —
+  // PipelineStateService.runs already merges GET /pipeline/runs (shared,
+  // GCS-backed job store) on a 20s poll, on top of whatever this browser is
+  // actively driving/has in history.
+  allRuns = computed<UiRun[]>(() => {
+    const src = this.activeSource();
+    return this.state.runs()
+      .filter(r => src === 'sonar'
+        ? (r.source === 'sonar' || !r.source)   // legacy runs without `source` = Sonar
+        : r.source === 'fortify')
+      .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+  });
+
+  /** Per-tab counts, independent of the active tab — drives the badge on each source-tab button. */
+  sourceCounts = computed(() => {
+    const rs = this.state.runs();
+    return {
+      fortify: rs.filter(r => r.source === 'fortify').length,
+      sonar:   rs.filter(r => r.source === 'sonar' || !r.source).length,
+    };
+  });
 
   counts = computed(() => {
     const rs = this.allRuns();
@@ -83,7 +104,13 @@ export class ActivityComponent {
     // (PR links, escalation files) for any completed/failed row that only
     // has the lightweight list-endpoint data so far — capped so opening
     // this page never fires an unbounded burst of requests.
+    //
+    // Fortify-only: hydrateRunDetail() calls the Fortify server's
+    // /pipeline/status/{id}. Sonar's GET /api/pipeline/runs already returns
+    // full result data per row (see PipelineStateService._backendRunToUiRun),
+    // so there's nothing to backfill when the Sonar tab is active.
     effect(() => {
+      if (this.activeSource() !== 'fortify') return;
       const rows = this.filteredRuns();
       let requested = 0;
       for (const r of rows) {
@@ -98,15 +125,25 @@ export class ActivityComponent {
     });
   }
 
+  /** Switch the active source tab. Filter/search reset so a "Failed" filter
+   *  from one tab doesn't silently carry over and hide everything on the other. */
+  switchSource(src: SourceKey) {
+    this.activeSource.set(src);
+    this.filter.set('all');
+    this.search.set('');
+  }
+
   setFilter(f: StatusFilter) { this.filter.set(f); }
 
   refresh() {
-    // Re-fetch the shared run list itself...
+    // Re-fetch the shared run list itself (covers both sources)...
     this.state.refreshRuns();
 
     // ...and re-hydrate everything currently visible, ignoring the
     // "already requested" cache — a manual refresh should always hit
-    // the network for row detail too.
+    // the network for row detail too. Only meaningful on the Fortify tab —
+    // see the hydrate effect above for why Sonar doesn't need this.
+    if (this.activeSource() !== 'fortify') return;
     this._hydrated.clear();
     for (const r of this.filteredRuns()) {
       if (r.status === 'done' || r.status === 'error') this.state.hydrateRunDetail(r.id);

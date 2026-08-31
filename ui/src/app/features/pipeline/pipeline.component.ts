@@ -84,6 +84,19 @@ export class PipelineComponent {
   dryRun       = signal(false);
   showForm     = signal(false);
 
+  // ── Sonar run: Maven build validation (Validator step) ────────────────────
+  // Off by default — a real `mvn compile` + `mvn test` costs real CI time per
+  // issue, so it's opt-in per run rather than a static server setting.
+  runBuild     = signal(false);
+
+  // ── Sonar run: per-run credential overrides ────────────────────────────────
+  // Optional — blank falls back to the server-configured GITHUB_TOKEN /
+  // SONAR_TOKEN. Never persisted: sent on the initial POST only, then cleared
+  // from the form and stripped before the request enters client-side state
+  // (see PipelineStateService.startRun → _sanitizeRunRequest).
+  githubToken  = signal('');
+  sonarToken   = signal('');
+
   // ── Fortify run form signals ──────────────────────────────────────────────
   fortifyReleaseId   = signal('');
   fortifyAppName     = signal('');
@@ -412,6 +425,10 @@ export class PipelineComponent {
   // ── Sonar start ───────────────────────────────────────────────────────────
   startRun() {
     this.showForm.set(false);
+
+    const githubToken = this.githubToken().trim();
+    const sonarToken  = this.sonarToken().trim();
+
     this.state.startRun({
       repo_url:   this.repoUrl(),
       commit_sha: this.commitSha(),
@@ -421,7 +438,15 @@ export class PipelineComponent {
       no_rag:     this.noRag(),
       dry_run:    this.dryRun(),
       severities: this._severitiesString(),
+      run_build:  this.runBuild(),
+      ...(githubToken ? { github_token: githubToken } : {}),
+      ...(sonarToken  ? { sonar_token:  sonarToken  } : {}),
     });
+
+    // Don't linger with plaintext credentials in memory / the DOM any longer
+    // than needed — they're already captured in the request just sent.
+    this.githubToken.set('');
+    this.sonarToken.set('');
   }
 
   // ── Fortify start — builds request body per mode and calls correct endpoint ─
@@ -569,6 +594,9 @@ export class PipelineComponent {
     this.rescan.set(req.rescan);
     this.noRag.set(req.no_rag);
     this.dryRun.set(req.dry_run);
+    this.runBuild.set(req.run_build ?? false);
+    // Credentials are never kept in history (see _sanitizeRunRequest) — the
+    // user re-enters them if this restarted run needs an override again.
     if (req.severities) {
       const saved = new Set(req.severities.split(',').map(s => s.trim().toUpperCase()));
       this.selectedSevs.set(saved);
@@ -591,10 +619,11 @@ export class PipelineComponent {
   // ── Helpers ───────────────────────────────────────────────────────────────
   flagsOf(req: RunRequest): { label: string; on: boolean }[] {
     return [
-      { label: 'Parallel', on: req.parallel },
-      { label: 'Rescan',   on: req.rescan   },
-      { label: 'No RAG',   on: req.no_rag   },
-      { label: 'Dry Run',  on: req.dry_run  },
+      { label: 'Parallel',     on: req.parallel    },
+      { label: 'Rescan',       on: req.rescan      },
+      { label: 'No RAG',       on: req.no_rag      },
+      { label: 'Dry Run',      on: req.dry_run     },
+      { label: 'Maven Build',  on: !!req.run_build },
     ];
   }
 
