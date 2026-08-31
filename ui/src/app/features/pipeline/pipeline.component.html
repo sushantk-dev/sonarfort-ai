@@ -91,7 +91,7 @@
                [value]="repoUrl()"
                (input)="repoUrl.set($any($event.target).value)"
                placeholder="https://github.com/owner/repo.git">
-        <span class="run-form__hint" *ngIf="!sonarRepoUrlError()">HTTPS clone URL (or git@host:owner/repo.git)</span>
+        <span class="run-form__hint" *ngIf="!sonarRepoUrlError()">HTTPS clone URL (or git&#64;host:owner/repo.git)</span>
         <span class="run-form__field-error" *ngIf="sonarRepoUrlError()">
           {{ repoUrl().trim() ? 'Enter a valid HTTPS or SSH clone URL' : 'Required' }}
         </span>
