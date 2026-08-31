@@ -90,12 +90,55 @@ export class PipelineComponent {
   runBuild     = signal(false);
 
   // ── Sonar run: per-run credential overrides ────────────────────────────────
-  // Optional — blank falls back to the server-configured GITHUB_TOKEN /
-  // SONAR_TOKEN. Never persisted: sent on the initial POST only, then cleared
-  // from the form and stripped before the request enters client-side state
-  // (see PipelineStateService.startRun → _sanitizeRunRequest).
+  // Now mandatory (see sonarFormValid) — never persisted: sent on the initial
+  // POST only, then cleared from the form and stripped before the request
+  // enters client-side state (see PipelineStateService.startRun → _sanitizeRunRequest).
   githubToken  = signal('');
   sonarToken   = signal('');
+
+  // ── Sonar form validation ────────────────────────────────────────────────
+  // Repo URL, GitHub Token, and Sonar Token are all mandatory. Errors only
+  // render once the user has actually tried to submit — see sonarFormSubmitted
+  // — so an empty field isn't flagged red before they've had a chance to fill
+  // it in. Mirrors the Fortify form's validation pattern above.
+  sonarFormSubmitted = signal(false);
+
+  private sonarRepoUrlMissing = computed(() =>
+    this.sonarFormSubmitted() && !this.repoUrl().trim()
+  );
+  private sonarRepoUrlInvalid = computed(() =>
+    this.sonarFormSubmitted() && !!this.repoUrl().trim() && !this._isValidRepoUrl(this.repoUrl())
+  );
+  private sonarGithubTokenMissing = computed(() =>
+    this.sonarFormSubmitted() && !this.githubToken().trim()
+  );
+  private sonarTokenMissing = computed(() =>
+    this.sonarFormSubmitted() && !this.sonarToken().trim()
+  );
+
+  /** Field-error getters for the template — true only after a submit attempt. */
+  sonarRepoUrlError    = computed(() => this.sonarRepoUrlMissing() || this.sonarRepoUrlInvalid());
+  sonarGithubTokenError = computed(() => this.sonarGithubTokenMissing());
+  sonarTokenError       = computed(() => this.sonarTokenMissing());
+
+  /** True once every mandatory Sonar field is filled in and the repo URL looks like a real clone URL. */
+  sonarFormValid = computed(() => {
+    if (!this.repoUrl().trim())        return false;
+    if (!this._isValidRepoUrl(this.repoUrl())) return false;
+    if (!this.githubToken().trim())    return false;
+    if (!this.sonarToken().trim())     return false;
+    return true;
+  });
+
+  /** Accepts an HTTPS clone URL (github.com/owner/repo[.git], self-hosted, etc.)
+   *  or an SSH `git@host:owner/repo.git` URL. Rejects blank/whitespace-only input. */
+  private _isValidRepoUrl(raw: string): boolean {
+    const url = raw.trim();
+    if (!url || /\s/.test(url)) return false;
+    const httpsPattern = /^https?:\/\/[^\s/]+\/[^\s]+$/i;
+    const sshPattern    = /^git@[^\s:]+:[^\s]+\.git$/i;
+    return httpsPattern.test(url) || sshPattern.test(url);
+  }
 
   // ── Fortify run form signals ──────────────────────────────────────────────
   fortifyReleaseId   = signal('');
@@ -424,13 +467,20 @@ export class PipelineComponent {
 
   // ── Sonar start ───────────────────────────────────────────────────────────
   startRun() {
+    this.sonarFormSubmitted.set(true);
+
+    if (!this.sonarFormValid()) {
+      this.state.error.set('Please fill in all required fields before starting a run.');
+      return;
+    }
+
     this.showForm.set(false);
 
     const githubToken = this.githubToken().trim();
     const sonarToken  = this.sonarToken().trim();
 
     this.state.startRun({
-      repo_url:   this.repoUrl(),
+      repo_url:   this.repoUrl().trim(),
       commit_sha: this.commitSha(),
       max_issues: this.maxIssues(),
       parallel:   this.parallel(),
@@ -439,14 +489,15 @@ export class PipelineComponent {
       dry_run:    this.dryRun(),
       severities: this._severitiesString(),
       run_build:  this.runBuild(),
-      ...(githubToken ? { github_token: githubToken } : {}),
-      ...(sonarToken  ? { sonar_token:  sonarToken  } : {}),
+      github_token: githubToken,
+      sonar_token:  sonarToken,
     });
 
     // Don't linger with plaintext credentials in memory / the DOM any longer
     // than needed — they're already captured in the request just sent.
     this.githubToken.set('');
     this.sonarToken.set('');
+    this.sonarFormSubmitted.set(false);
   }
 
   // ── Fortify start — builds request body per mode and calls correct endpoint ─
@@ -586,6 +637,10 @@ export class PipelineComponent {
   }
 
   // ── Restart ───────────────────────────────────────────────────────────────
+  // Credentials are mandatory and are never kept in history/localStorage (see
+  // _sanitizeRunRequest), so a "restart" can't silently resubmit the old
+  // request — it prefills the form and opens it so the user re-enters
+  // GitHub/Sonar tokens, then submits through the normal validated startRun().
   restartRun(req: RunRequest) {
     this.repoUrl.set(req.repo_url);
     this.commitSha.set(req.commit_sha);
@@ -595,13 +650,14 @@ export class PipelineComponent {
     this.noRag.set(req.no_rag);
     this.dryRun.set(req.dry_run);
     this.runBuild.set(req.run_build ?? false);
-    // Credentials are never kept in history (see _sanitizeRunRequest) — the
-    // user re-enters them if this restarted run needs an override again.
+    this.githubToken.set('');
+    this.sonarToken.set('');
+    this.sonarFormSubmitted.set(false);
     if (req.severities) {
       const saved = new Set(req.severities.split(',').map(s => s.trim().toUpperCase()));
       this.selectedSevs.set(saved);
     }
-    this.state.startRun(req);
+    this.showForm.set(true);
   }
 
   allPending(run: UiRun): boolean {

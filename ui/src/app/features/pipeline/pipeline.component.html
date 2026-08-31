@@ -85,10 +85,16 @@
     </div>
     <div class="run-form__grid">
       <div class="run-form__field run-form__field--wide">
-        <label>Repository URL</label>
-        <input class="run-form__input" [value]="repoUrl()"
+        <label>Repository URL <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
+        <input class="run-form__input"
+               [class.run-form__input--invalid]="sonarRepoUrlError()"
+               [value]="repoUrl()"
                (input)="repoUrl.set($any($event.target).value)"
                placeholder="https://github.com/owner/repo.git">
+        <span class="run-form__hint" *ngIf="!sonarRepoUrlError()">HTTPS clone URL (or git@host:owner/repo.git)</span>
+        <span class="run-form__field-error" *ngIf="sonarRepoUrlError()">
+          {{ repoUrl().trim() ? 'Enter a valid HTTPS or SSH clone URL' : 'Required' }}
+        </span>
       </div>
       <div class="run-form__field">
         <label>Commit SHA</label>
@@ -131,9 +137,8 @@
         {{ selectedSevs().size === 5 ? 'All severities' : selectedSevs().size + ' selected' }}
       </span>
     </div>
-    <!-- Per-run credential overrides — optional. Blank = fall back to the
-         server-configured GITHUB_TOKEN / SONAR_TOKEN. Never saved to Settings;
-         cleared from the form the moment the run starts (see startRun()). -->
+    <!-- Per-run credentials — GitHub Token / Sonar Token for THIS run only.
+         Never saved to Settings; cleared from the form the moment the run starts. -->
     <div class="creds-panel">
       <div class="creds-panel__header">
         <div class="creds-panel__title">
@@ -143,24 +148,28 @@
           </svg>
           Credentials for this run
         </div>
-        <span class="creds-panel__badge">Optional — uses server default if blank</span>
+        <span class="creds-panel__badge creds-panel__badge--required">Required for this run</span>
       </div>
       <div class="run-form__grid">
         <div class="run-form__field">
-          <label class="run-form__label--nowrap">GitHub Token</label>
+          <label class="run-form__label--nowrap">GitHub Token <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
           <input class="run-form__input"
+                 [class.run-form__input--invalid]="sonarGithubTokenError()"
                  type="password" autocomplete="off" [value]="githubToken()"
                  (input)="githubToken.set($any($event.target).value)"
-                 placeholder="ghp_•••••••••••••••• (optional)">
-          <span class="run-form__hint">Overrides the configured token for this run only</span>
+                 placeholder="ghp_••••••••••••••••">
+          <span class="run-form__hint" *ngIf="!sonarGithubTokenError()">PAT used for clone + PR on this run</span>
+          <span class="run-form__field-error" *ngIf="sonarGithubTokenError()">Required</span>
         </div>
         <div class="run-form__field">
-          <label class="run-form__label--nowrap">Sonar Token</label>
+          <label class="run-form__label--nowrap">Sonar Token <span class="label-opt label-opt--asterisk" title="Required">*</span></label>
           <input class="run-form__input"
+                 [class.run-form__input--invalid]="sonarTokenError()"
                  type="password" autocomplete="off" [value]="sonarToken()"
                  (input)="sonarToken.set($any($event.target).value)"
-                 placeholder="•••••••••••••••• (optional)">
-          <span class="run-form__hint">Overrides the configured token for this run only</span>
+                 placeholder="••••••••••••••••">
+          <span class="run-form__hint" *ngIf="!sonarTokenError()">&nbsp;</span>
+          <span class="run-form__field-error" *ngIf="sonarTokenError()">Required</span>
         </div>
       </div>
     </div>
