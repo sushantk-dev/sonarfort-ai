@@ -24,6 +24,7 @@ export class IssuesComponent {
   
 // Live SonarQube fetch
   sonarComponentKey = '';
+  sonarToken = '';
 
   drawer: SonarIssue | null = null;
   get kb() { return this.drawer ? this.svc.getRuleKb(this.drawer.ruleKey) : null; }
@@ -71,7 +72,7 @@ export class IssuesComponent {
   }
 
   fetchFromSonar() {
-    this.st.fetchFromSonar(this.sonarComponentKey);
+    this.st.fetchFromSonar(this.sonarComponentKey, this.sonarToken);
   }
 
   // Export structured report

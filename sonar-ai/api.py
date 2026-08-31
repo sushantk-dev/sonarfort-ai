@@ -251,6 +251,7 @@ class ConfigUpdateRequest(BaseModel):
 
 class SonarFetchRequest(BaseModel):
     component_keys: str
+    sonar_token:    str          # mandatory — entered in the UI on every fetch, not read from saved config
     severities:     str  = "BLOCKER,CRITICAL,MAJOR,MINOR,INFO"
     resolved:       bool = False
     ps:             int  = 500
@@ -492,11 +493,13 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
     from config import settings as s
 
     overrides      = _cfg_overrides()
-    sonar_token    = _cfg_get("sonar_token", overrides)    or s.sonar_token
+    # sonar_token is mandatory on every fetch request (entered in the UI),
+    # so it takes priority over any saved config/GCS value.
+    sonar_token    = (req.sonar_token or "").strip() or _cfg_get("sonar_token", overrides) or s.sonar_token
     sonar_host_url = _cfg_get("sonar_host_url", overrides) or s.sonar_host_url
 
-    if not sonar_token:
-        raise HTTPException(400, "SONAR_TOKEN is not configured. Add it in Settings.")
+    if not (req.sonar_token or "").strip():
+        raise HTTPException(400, "Sonar token is required to fetch issues.")
     if not sonar_host_url:
         raise HTTPException(400, "SONAR_HOST_URL is not configured. Add it in Settings.")
 
