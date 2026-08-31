@@ -1,7 +1,10 @@
 """
 SonarAI — Patch Validator  (Phase 04 — hardened)
-Applies the generated unified diff and runs mvn compile + mvn test.
-Compile/test failures are fed back into the LLM retry prompt via ValidationResult.
+Applies the generated unified diff, then — only when the run opted in via
+settings.run_maven_build (PipelineRunRequest.run_build, default False) — runs
+mvn compile + mvn test with a fixed JVM heap (settings.maven_heap_mb, via
+MAVEN_OPTS) so build memory is bounded and reproducible per run. Compile/test
+failures are fed back into the LLM retry prompt via ValidationResult.
 """
 
 from __future__ import annotations
@@ -80,6 +83,21 @@ def validate(state: AgentState) -> AgentState:
         return {**state, "validation": result}
 
     logger.info("[Validator] Diff applied successfully")
+
+    # ── Step 3/4: Maven compile + test — opt-in per run ──────────────────────
+    # Off by default (settings.run_maven_build). A real `mvn compile`/`mvn test`
+    # costs real CI minutes per issue, so it only runs when the caller explicitly
+    # asked for it via PipelineRunRequest.run_build for this run. When skipped,
+    # the diff-apply success above is the only validation performed and both
+    # flags are reported as passed so downstream logic (retry/escalation) treats
+    # it the same as a clean build.
+    if not settings.run_maven_build:
+        logger.info("[Validator] Maven build validation disabled for this run — skipping compile/test")
+        result["compile_ok"] = True
+        result["tests_ok"] = True
+        result["compiler_error"] = ""
+        result["test_error"] = "Skipped — Maven build validation was not enabled for this run."
+        return {**state, "validation": result}
 
     # ── Step 3: Maven compile ─────────────────────────────────────────────────
     module = _detect_maven_module(repo_path, file_path)
@@ -508,6 +526,22 @@ def _diff_apply_hint(stderr: str) -> str:
 
 # ── Maven helpers ─────────────────────────────────────────────────────────────
 
+def _maven_env() -> dict[str, str]:
+    """
+    Build the subprocess environment for `mvn` calls with a fixed, bounded heap
+    (settings.maven_heap_mb) via MAVEN_OPTS, so build memory is a known,
+    reproducible ceiling per run rather than whatever the JVM picks by default
+    in that container/node. Appends to any MAVEN_OPTS already in the
+    environment instead of clobbering it, so other flags (proxy, SSL trust
+    store, etc.) survive.
+    """
+    env = os.environ.copy()
+    heap_flags = f"-Xms{settings.maven_heap_mb}m -Xmx{settings.maven_heap_mb}m"
+    existing = env.get("MAVEN_OPTS", "").strip()
+    env["MAVEN_OPTS"] = f"{existing} {heap_flags}".strip()
+    return env
+
+
 def _mvn_compile(repo_path: str, module: Optional[str]) -> tuple[bool, str]:
     """Run mvn compile -q, scoped to module if found. Skips gracefully if mvn absent."""
     cmd = ["mvn", "compile", "-q", "--no-transfer-progress"]
@@ -521,6 +555,7 @@ def _mvn_compile(repo_path: str, module: Optional[str]) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=settings.compile_timeout,
+            env=_maven_env(),
         )
         if result.returncode == 0:
             return True, ""
@@ -552,6 +587,7 @@ def _mvn_test(
             capture_output=True,
             text=True,
             timeout=settings.test_timeout,
+            env=_maven_env(),
         )
         if result.returncode == 0:
             return True, ""

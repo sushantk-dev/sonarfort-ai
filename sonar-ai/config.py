@@ -72,6 +72,25 @@ class Settings(BaseSettings):
     max_critic_retries: int = Field(default=3, description="Max LLM fix retry loops")
     compile_timeout: int = Field(default=120, description="mvn compile timeout seconds")
     test_timeout: int = Field(default=180, description="mvn test timeout seconds")
+    run_maven_build: bool = Field(
+        default=False,
+        description="Run `mvn compile` + `mvn test` in the Validator step. "
+                    "Off by default — building costs real CI time per issue, so it's "
+                    "opt-in per run (PipelineRunRequest.run_build), not a static config "
+                    "value. When False, Validator skips straight to a passed result "
+                    "after the diff applies cleanly.",
+    )
+    maven_heap_mb: int = Field(
+        default=1024,
+        description="Fixed JVM heap size (MB) for `mvn compile` / `mvn test`, applied "
+                    "via MAVEN_OPTS as -Xms<mb>m -Xmx<mb>m. Bounds build memory to a "
+                    "known, reproducible ceiling per run instead of inheriting whatever "
+                    "the container's JVM default heap happens to be (often a fraction "
+                    "of available RAM, which varies by pod/node and can OOM on larger "
+                    "modules). If MAVEN_OPTS is already set in the environment, this is "
+                    "appended rather than replacing it, so other flags (proxy, SSL, "
+                    "etc.) are preserved.",
+    )
     clone_dir: str = Field(
         default_factory=lambda: str(Path(_tempfile.gettempdir()) / "sonar-ai-repos"),
         description="Base dir for cloned repos",

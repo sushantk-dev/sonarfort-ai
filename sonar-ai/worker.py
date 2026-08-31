@@ -1,12 +1,19 @@
 """
 SonarAI — Pipeline Worker  (GCS-only stateless edition)
 ========================================================
-Runs as a separate Kubernetes Deployment. No Redis.
+Runs IN-PROCESS as a background thread inside the API server (api.py)
+— there is no separate Deployment/process for this worker. No Redis.
+
+api.py starts `worker.run_loop(stop_event)` on a daemon thread during
+FastAPI startup, and signals `stop_event` on shutdown so the loop exits
+cleanly. This module exposes no CLI entrypoint of its own; `main()` /
+`run_loop()` are called by api.py, not launched via `python worker.py`.
 
 Job queue = GCS blobs under jobs/pending/. The worker polls that prefix,
 picks the oldest job, and CLAIMS it atomically by deleting the blob with
-an `if_generation_match` precondition — if two workers race, exactly one
-delete succeeds and only that worker runs the job.
+an `if_generation_match` precondition — if two workers race (e.g. two
+API pod replicas, each running this thread), exactly one delete succeeds
+and only that worker runs the job.
 
 Every step event + the final result is written directly into the shared
 GCS run document (runs/{run_id}.json) so any API pod can serve
@@ -15,13 +22,18 @@ GET /api/pipeline/status/{run_id}.
 Escalation .md files produced locally during a run are uploaded to
 GCS (escalations/ prefix) so the API escalation endpoints can list them.
 
-Run:
-    python worker.py
-
 Same env vars as api.py:
     GCS_BUCKET  — GCS bucket name
     GCP_PROJECT — GCP project ID
-    GITHUB_TOKEN, SONAR_TOKEN, VERTEX_MODEL, … (K8s Secret / ConfigMap)
+    GITHUB_TOKEN, SONAR_TOKEN, VERTEX_MODEL, … (K8s Secret / ConfigMap defaults)
+
+Per-run overrides (see PipelineRunRequest in api.py):
+    github_token, sonar_token — optional; override the process default for
+        this run only (repo clone/push, PR creation, live Sonar calls). Left
+        blank → falls back to GITHUB_TOKEN / SONAR_TOKEN above.
+    run_build                 — Maven `mvn compile` + `mvn test` in the
+        Validator step. Defaults to False/off; must be explicitly set true
+        per run (see validator.py / settings.run_maven_build).
 """
 
 from __future__ import annotations
@@ -31,6 +43,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -185,6 +198,62 @@ _STEP_LABELS = ["Ingest", "Load Repo", "RAG Fetch", "Rule Fetch",
                 "Planner", "Generator", "Critic", "Validate", "Deliver"]
 
 
+# ── Per-run credential / build-flag overrides ─────────────────────────────────
+#
+# github_token, sonar_token, and run_build (Maven build validation) are supplied
+# per run in the pipeline request, not from static K8s Secret / ConfigMap env
+# vars alone. github_token/sonar_token fall back to the process-wide config when
+# left blank on the request; run_build always defaults to False when omitted —
+# Maven build validation is opt-in, never on by default. The worker processes
+# one job at a time on this thread, so it's safe to mutate the settings
+# singleton for the duration of a job and restore it in `finally`.
+
+def _apply_run_overrides(req_dict: dict):
+    """
+    Apply this run's github_token / sonar_token / run_build onto the settings
+    singleton (and os.environ, for any code that reads env directly instead of
+    importing settings). Returns a zero-arg callable that restores the prior
+    values — call it in a `finally` block once the run is done.
+    """
+    from config import settings as _cfg
+
+    prev_github_token = _cfg.github_token
+    prev_sonar_token   = _cfg.sonar_token
+    prev_run_build     = _cfg.run_maven_build
+    prev_env = {
+        k: os.environ.get(k) for k in ("GITHUB_TOKEN", "SONAR_TOKEN", "RUN_MAVEN_BUILD")
+    }
+
+    github_token = req_dict.get("github_token") or ""
+    sonar_token  = req_dict.get("sonar_token")  or ""
+    run_build    = bool(req_dict.get("run_build", False))
+
+    if github_token:
+        _cfg.github_token = github_token
+        os.environ["GITHUB_TOKEN"] = github_token
+        logger.info("[Worker] Using per-run GitHub token override for this run")
+    if sonar_token:
+        _cfg.sonar_token = sonar_token
+        os.environ["SONAR_TOKEN"] = sonar_token
+        logger.info("[Worker] Using per-run Sonar token override for this run")
+
+    _cfg.run_maven_build = run_build
+    os.environ["RUN_MAVEN_BUILD"] = "true" if run_build else "false"
+    logger.info(f"[Worker] Maven build validation for this run: {'ON' if run_build else 'off (default)'}")
+
+    def _restore() -> None:
+        _cfg.github_token    = prev_github_token
+        _cfg.sonar_token     = prev_sonar_token
+        _cfg.run_maven_build = prev_run_build
+        for k, v in prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    return _restore
+
+
 # ── Job handler ───────────────────────────────────────────────────────────────
 
 def _run_job(job: dict) -> None:
@@ -205,6 +274,8 @@ def _run_job(job: dict) -> None:
              for lbl in _STEP_LABELS]
     doc.update({"steps": steps, "status": "running"})
     _gcs_write_json(_run_blob(run_id), doc)
+
+    _restore_overrides = _apply_run_overrides(req_dict)
 
     try:
         _sync_config_from_gcs()
@@ -342,25 +413,41 @@ def _run_job(job: dict) -> None:
         _update_run(run_id, {"status": "error", "error": str(exc), "steps": steps})
     finally:
         _last_detail_write.pop(run_id, None)
+        _restore_overrides()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
+#
+# There is intentionally no `if __name__ == "__main__":` entrypoint here.
+# The worker only ever runs as a background thread started by api.py's
+# FastAPI startup event — it must never be launched as its own process.
 
-def main() -> None:
+def run_loop(stop_event: threading.Event) -> None:
+    """
+    Poll jobs/pending/ until `stop_event` is set. Called by api.py on a
+    daemon thread; api.py sets `stop_event` during FastAPI shutdown so this
+    loop exits gracefully instead of being killed mid-job.
+    """
     logger.info(f"[Worker] Polling gs://{os.environ.get('GCS_BUCKET', '(not set)')}/"
-                f"{_GCS_JOBS_PFX} every {_POLL_INTERVAL_S}s")
-    while True:
+                f"{_GCS_JOBS_PFX} every {_POLL_INTERVAL_S}s (in-process thread)")
+    while not stop_event.is_set():
         try:
             job = _claim_next_job()
             if job is None:
-                time.sleep(_POLL_INTERVAL_S)
+                stop_event.wait(_POLL_INTERVAL_S)
                 continue
             logger.info(f"[Worker] Claimed job run_id={job.get('run_id')}")
             _run_job(job)
         except Exception as exc:
             logger.error(f"[Worker] Error in main loop: {exc} — retrying in 2 s")
-            time.sleep(2)
+            stop_event.wait(2)
+    logger.info("[Worker] Stop signal received — worker thread exiting")
 
 
-if __name__ == "__main__":
-    main()
+def main() -> None:
+    """
+    Kept only as a thin alias for internal/manual invocation (e.g. a shell
+    inside the API pod for debugging). Normal operation never calls this
+    directly — api.py calls run_loop() on a background thread instead.
+    """
+    run_loop(threading.Event())

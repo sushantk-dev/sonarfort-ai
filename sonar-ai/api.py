@@ -15,14 +15,17 @@ pod replicas can serve any request without sticky sessions. No Redis.
   local escalations/*.md      →  escalations/ prefix
   os.environ config mutation  →  state/config.json
 
+The pipeline worker (worker.py) is NOT a separate process/Deployment.
+It runs in-process as a daemon thread started on FastAPI startup below,
+and is stopped on FastAPI shutdown. Starting the API server is what
+starts the worker — there is nothing else to deploy or run.
+
 Required env vars (K8s ConfigMap / Secret):
   GCS_BUCKET  — GCS bucket name
   GCP_PROJECT — GCP project ID
 
-Run API:
+Run (API + in-process worker together):
     uvicorn api:app --host 0.0.0.0 --port 8080
-Run Worker (separate Deployment):
-    python worker.py
 
 Endpoints (unchanged from v2):
     POST /api/pipeline/run          — enqueue a pipeline run
@@ -42,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -53,7 +57,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
 
+import worker as _worker  # in-process pipeline worker — started on startup below
+
 app = FastAPI(title="SonarAI API", version="2.1.0")
+
+# ── In-process worker thread ─────────────────────────────────────────────────
+# The worker has no CLI entrypoint of its own; it only runs as this daemon
+# thread, for the lifetime of the API process.
+
+_worker_stop_event = threading.Event()
+_worker_thread: threading.Thread | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,6 +211,17 @@ class PipelineRunRequest(BaseModel):
     no_rag:     bool = False
     dry_run:    bool = False
     severities: str  = "BLOCKER,CRITICAL,MAJOR,MINOR,INFO"
+
+    # ── Per-run overrides — supplied at runtime, not read from server config ──
+    # github_token / sonar_token: optional; blank = fall back to the process's
+    #   configured GITHUB_TOKEN / SONAR_TOKEN (K8s Secret). Never persisted to
+    #   GCS — see start_run(), which masks them before writing the run document.
+    # run_build: Maven `mvn compile` + `mvn test` in the Validator step.
+    #   Off by default — opt in per run, since a real build costs CI minutes
+    #   per issue.
+    github_token: str  = ""
+    sonar_token:  str  = ""
+    run_build:    bool = False
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -611,6 +635,18 @@ def start_run(req: PipelineRunRequest) -> dict:
 
     run_id = str(uuid.uuid4())
 
+    # ── Mask credentials before they land anywhere durable/readable ──────────
+    # The full req (with real tokens) only ever goes into the transient job
+    # blob below, which the worker deletes the instant it claims the job.
+    # The run document is polled by the UI and listed via GET /pipeline/runs,
+    # so it must never contain the raw tokens — mask them the same way
+    # GET /api/config does for the server-configured ones.
+    req_public = req.model_dump()
+    if req_public.get("github_token"):
+        req_public["github_token"] = "***"
+    if req_public.get("sonar_token"):
+        req_public["sonar_token"] = "***"
+
     # Initialise run document in GCS
     _set_run(run_id, {
         "id":         run_id,
@@ -618,7 +654,7 @@ def start_run(req: PipelineRunRequest) -> dict:
         "steps":      [],
         "results":    [],
         "error":      None,
-        "request":    req.model_dump(),
+        "request":    req_public,
         "created_at": time.time(),
     })
 
@@ -946,6 +982,8 @@ def update_config(req: ConfigUpdateRequest) -> dict:
 
 @app.on_event("startup")
 def _startup() -> None:
+    global _worker_thread
+
     logger.info("[Startup] SonarAI API — GCS-only stateless mode")
     logger.info(f"[Startup] GCS_BUCKET : {os.environ.get('GCS_BUCKET', '(not set)')}")
 
@@ -966,8 +1004,27 @@ def _startup() -> None:
     except Exception as exc:
         logger.info(f"[Startup] No GCS report to re-hydrate ({exc})")
 
+    # Start the pipeline worker in-process. This is the ONLY place the
+    # worker is started — there is no separate `python worker.py` process
+    # or Deployment. Starting the API server starts the worker.
+    _worker_stop_event.clear()
+    _worker_thread = threading.Thread(
+        target=_worker.run_loop,
+        args=(_worker_stop_event,),
+        name="pipeline-worker",
+        daemon=True,
+    )
+    _worker_thread.start()
+    logger.info("[Startup] In-process pipeline worker thread started")
+
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    """Nothing to clean up — all state lives in GCS."""
-    logger.info("[Shutdown] SonarAI API stopping — no child processes to terminate")
+    """All state lives in GCS; the only thing to clean up is the worker thread."""
+    logger.info("[Shutdown] SonarAI API stopping — signalling worker thread to stop")
+    _worker_stop_event.set()
+    if _worker_thread is not None:
+        _worker_thread.join(timeout=10)
+        if _worker_thread.is_alive():
+            logger.warning("[Shutdown] Worker thread did not stop within timeout")
+    logger.info("[Shutdown] SonarAI API stopped")
