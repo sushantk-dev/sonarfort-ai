@@ -194,9 +194,13 @@ export class IssuesStateService {
   }
 
   // ── Live SonarQube Fetch ──────────────────────────────────────────────────
-  fetchFromSonar(componentKey: string, severities = 'BLOCKER,CRITICAL,MAJOR,MINOR,INFO') {
+  fetchFromSonar(componentKey: string, sonarToken: string, severities = 'BLOCKER,CRITICAL,MAJOR,MINOR,INFO') {
     if (!componentKey.trim()) {
       this.uploadError.set('Please enter a component key to fetch from SonarQube.');
+      return;
+    }
+    if (!sonarToken.trim()) {
+      this.uploadError.set('Please enter your Sonar token to fetch from SonarQube.');
       return;
     }
     this.fetching.set(true);
@@ -205,6 +209,7 @@ export class IssuesStateService {
 
     this.apiSvc.fetchSonarIssues({
       component_keys: componentKey.trim(),
+      sonar_token: sonarToken.trim(),
       severities,
       resolved: false,
       ps: 500,

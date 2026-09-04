@@ -4,6 +4,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
 import { PipelineStateService, UiRun, RunRequest } from '../../core/pipeline-state.service';
+import { IssuesStateService } from '../../core/issues-state.service';
 import { ApiConfigService } from '../../core/api-config.service';
 import { SevClassPipe }    from '../../shared/sev-class.pipe';
 import { OutcomeClassPipe } from '../../shared/outcome-class.pipe';
@@ -28,6 +29,10 @@ const ENDPOINT_MAP: Record<FortifyMode, string> = {
 })
 export class PipelineComponent {
   state    = inject(PipelineStateService);
+  // Reused from the Issues page — same singleton, so a report uploaded/fetched
+  // here or there is visible in both places. Also the source of truth for
+  // whether a Sonar run is allowed to start (see issuesReady below).
+  st       = inject(IssuesStateService);
   private apiCfg = inject(ApiConfigService);
   private router  = inject(Router);
 
@@ -121,8 +126,10 @@ export class PipelineComponent {
   sonarGithubTokenError = computed(() => this.sonarGithubTokenMissing());
   sonarTokenError       = computed(() => this.sonarTokenMissing());
 
-  /** True once every mandatory Sonar field is filled in and the repo URL looks like a real clone URL. */
+  /** True once every mandatory Sonar field is filled in, the repo URL looks like a real
+   *  clone URL, AND at least one issue has been loaded (uploaded or fetched from Sonar). */
   sonarFormValid = computed(() => {
+    if (!this.issuesReady())           return false;
     if (!this.repoUrl().trim())        return false;
     if (!this._isValidRepoUrl(this.repoUrl())) return false;
     if (!this.githubToken().trim())    return false;
@@ -138,6 +145,42 @@ export class PipelineComponent {
     const httpsPattern = /^https?:\/\/[^\s/]+\/[^\s]+$/i;
     const sshPattern    = /^git@[^\s:]+:[^\s]+\.git$/i;
     return httpsPattern.test(url) || sshPattern.test(url);
+  }
+
+  // ── Issue source (upload / live fetch) — gates Sonar run start ────────────
+  // The backend refuses POST /api/pipeline/run with a 400 until a report has
+  // been uploaded or fetched (see PipelineRunRequest handling server-side).
+  // These fields drive a small panel inside the Sonar run form so that step
+  // can happen right here instead of requiring a trip to the Issues page.
+  sonarFetchComponentKey = signal('');
+  sonarFetchToken        = signal('');
+  // Lets a user who already has issues loaded re-open the panel to load a
+  // different report/component without losing what's currently loaded until
+  // the new source actually succeeds.
+  changingIssueSource    = signal(false);
+
+  /** True once at least one issue is loaded — from either page, this session or a previous one. */
+  issuesReady = computed(() => this.st.totalIssues() > 0);
+
+  /** Whether the upload/fetch panel should be expanded (vs. collapsed to a status strip). */
+  showIssueSourceForm = computed(() => !this.issuesReady() || this.changingIssueSource());
+
+  /** Shown only after a submit attempt, and only when issues are the missing piece —
+   *  kept distinct from sonarFormValid's field errors so Start's disabled reason is unambiguous. */
+  sonarIssuesMissingError = computed(() =>
+    this.sonarFormSubmitted() && !this.issuesReady()
+  );
+
+  uploadIssueReport(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file  = input.files?.[0];
+    if (!file) return;
+    this.st.onImport(file);
+    input.value = '';
+  }
+
+  fetchIssuesFromSonar() {
+    this.st.fetchFromSonar(this.sonarFetchComponentKey(), this.sonarFetchToken());
   }
 
   // ── Fortify run form signals ──────────────────────────────────────────────
@@ -470,7 +513,11 @@ export class PipelineComponent {
     this.sonarFormSubmitted.set(true);
 
     if (!this.sonarFormValid()) {
-      this.state.error.set('Please fill in all required fields before starting a run.');
+      this.state.error.set(
+        !this.issuesReady()
+          ? 'Upload a report or fetch issues from SonarQube before starting a run.'
+          : 'Please fill in all required fields before starting a run.'
+      );
       return;
     }
 

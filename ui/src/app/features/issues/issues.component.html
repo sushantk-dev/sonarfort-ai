@@ -52,8 +52,18 @@
       [(ngModel)]="sonarComponentKey"
       [disabled]="st.fetching()"
       (keydown.enter)="fetchFromSonar()">
+    <input
+      class="sonar-fetch-panel__input sonar-fetch-panel__input--token"
+      type="password"
+      placeholder="Sonar token (required)"
+      required
+      autocomplete="off"
+      [(ngModel)]="sonarToken"
+      [disabled]="st.fetching()"
+      (keydown.enter)="fetchFromSonar()">
     <button class="sonar-fetch-panel__btn"
-            [disabled]="st.fetching() || !sonarComponentKey.trim()"
+            [disabled]="st.fetching() || !sonarComponentKey.trim() || !sonarToken.trim()"
+            title="Component key and Sonar token are both required"
             (click)="fetchFromSonar()">
       <span *ngIf="st.fetching()" class="spinner"></span>
       {{ st.fetching() ? 'Fetching…' : 'Fetch Issues' }}

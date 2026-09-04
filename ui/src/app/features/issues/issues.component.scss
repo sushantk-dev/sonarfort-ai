@@ -794,6 +794,10 @@
     &:disabled { opacity: 0.5; cursor: not-allowed; }
   }
 
+  &__input--token {
+    flex: 0 0 180px;
+  }
+
   &__btn {
     display: inline-flex;
     align-items: center;

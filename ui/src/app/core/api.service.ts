@@ -73,6 +73,7 @@ export interface ApiIssue {
 
 export interface SonarFetchRequest {
   component_keys: string;
+  sonar_token:    string;
   severities?:    string;
   resolved?:      boolean;
   ps?:            number;
