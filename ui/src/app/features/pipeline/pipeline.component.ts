@@ -192,6 +192,14 @@ export class PipelineComponent {
                                           // every run commits to an explicit, bounded batch.
   showFortifyForm    = signal(false);
 
+  // ── JIRA ticket override — optional, applies to any Fortify mode ─────────
+  // When left blank, adr_fortify.py falls back to its own auto-generated
+  // Fortify branch/commit naming. When filled in, the backend (via
+  // config.jira_ticket_id → ConfigOverrides.jira_ticket_id) creates the
+  // branch as feature/<jira_ticket_id> and prefixes the commit subject
+  // "<jira_ticket_id> : <msg>" instead.
+  fortifyJiraTicketId = signal('');
+
   // ── Fortify form validation ─────────────────────────────────────────────────
   // Every visible field is mandatory for its mode (GitHub Repo always; Release ID
   // for Live; Report Path for Offline; App Name for App Name). Errors only render
@@ -582,6 +590,12 @@ export class PipelineComponent {
       github_token:     this.fortifyGithubToken().trim(),
       fortify_username: this._domainQualify(this.fortifyUsername()),
       fortify_password: this.fortifyPassword(),
+      // Optional — omitted entirely when blank so the backend falls back to
+      // its own auto-generated branch/commit naming (jira_id_prefix), rather
+      // than sending an empty string that would override nothing anyway.
+      ...(this.fortifyJiraTicketId().trim()
+        ? { jira_ticket_id: this.fortifyJiraTicketId().trim() }
+        : {}),
     };
 
     // The guard above already ensured Max Upgrades is within whichever range
@@ -664,6 +678,7 @@ export class PipelineComponent {
     this.fortifyGithubToken.set('');
     this.fortifyUsername.set('');
     this.fortifyPassword.set('');       // already cleared above, but reset again for clarity
+    this.fortifyJiraTicketId.set('');
     this.fortifyFormSubmitted.set(false);
     this.buildEstimateResult.set(null);
     this.buildEstimateLoading.set(false);

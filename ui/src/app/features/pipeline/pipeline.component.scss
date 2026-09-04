@@ -1764,6 +1764,30 @@
       box-shadow: 0 2px 8px rgba(29,158,117,.4);
     }
   }
+
+  // Uniform, equal-width textboxes for every field in the top-level mode
+  // grid (Release ID / Report Path / App Name, GitHub Repo, Max Upgrades,
+  // JIRA Ticket ID, ...) — a CSS Grid with equal columns replaces the
+  // shared flex-based layout (which mixes fixed --sm/--wide widths with
+  // content-driven flex-grow, so fields end up different sizes and can
+  // throw off a row's alignment when a new field joins it). Scoped with
+  // the direct-child combinator (`>`) so only this outer grid is affected
+  // — the nested .run-form__grid inside .creds-panel (GitHub Token /
+  // Fortify Username / Fortify Password) keeps its own existing layout,
+  // which already renders those three fields at equal width.
+  > .run-form__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+
+    // Every field element always carries the base .run-form__field class
+    // alongside any --sm/--wide modifier, so targeting the base class alone
+    // is enough to neutralize all of them here.
+    .run-form__field {
+      flex: unset;
+      min-width: 0;
+      width: 100%;
+    }
+  }
 }
 
 // Sonar run form keeps the existing brand colour — no extra rules needed

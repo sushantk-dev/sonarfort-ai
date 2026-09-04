@@ -484,6 +484,20 @@
         </div>
       </ng-container>
 
+      <!-- JIRA Ticket ID — optional, shared across all modes. Sizing is
+           handled by the uniform equal-width grid below (.run-form--fortify
+           > .run-form__grid), so this just uses the plain field class like
+           every other Fortify field. Blank = backend falls back to its own
+           auto-generated Fortify branch/commit naming. -->
+      <div class="run-form__field">
+        <label class="run-form__label--nowrap">JIRA Ticket ID <span class="label-opt">optional</span></label>
+        <input class="run-form__input"
+               [value]="fortifyJiraTicketId()"
+               (input)="fortifyJiraTicketId.set($any($event.target).value)"
+               placeholder="e.g. PROJ-1234">
+        <span class="run-form__hint">Branch: feature/&lt;id&gt; · Commit: "&lt;id&gt; : msg"</span>
+      </div>
+
     </div>
 
     <!-- Per-run credentials — separate GitHub token / Fortify username & password
