@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 from loguru import logger
 
@@ -44,11 +45,12 @@ def configure_logging(verbose: bool = False) -> None:
 
 # ── State factory ─────────────────────────────────────────────────────────────
 
-def initial_state(release_id: int, max_upgrades: int = 0) -> AgentState:
+def initial_state(release_id: int, max_upgrades: int = 0, jira_ticket_id: Optional[str] = None) -> AgentState:
     """Return a fully-typed initial AgentState for a new pipeline run."""
     return AgentState(
         release_id=release_id,
         max_upgrades=max_upgrades,
+        jira_ticket_id=jira_ticket_id,
         vuln_id=None,
         cve_list=[],
         dependency=None,
@@ -488,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
                 adr_path=config.adr_path,
                 project_path=str(project_path),
                 jira_prefix=config.jira_id_prefix,
+                jira_ticket_id=config.jira_ticket_id,
                 required_jdk=required_jdk,
             )
         else:

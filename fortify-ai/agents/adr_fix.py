@@ -296,9 +296,11 @@ def invoke_adr(
     cancel_check: Optional[Callable[[], bool]] = None,
     required_jdk: Optional[str] = None,
     push: bool = False,
+    jira_ticket_id: Optional[str] = None,
 ) -> tuple[bool, str, str]:
     """
-    Run adr_fortify.py --commit <commit_id> [--push] --target-versions <json>.
+    Run adr_fortify.py --commit <commit_id> [--push] --target-versions <json>
+    [--jira-ticket <jira_ticket_id>].
 
     target_versions: {
         "group_id:artifact_id": {
@@ -314,6 +316,14 @@ def invoke_adr(
         FORTIFYAI_JDK_REGISTRY env var to select the right JAVA_HOME for
         this build. None/empty means adr_fortify.py inherits whatever JDK
         is already on PATH — identical to the pre-existing behaviour.
+
+    jira_ticket_id: optional real JIRA ticket ID (e.g. "PROJ-1234"). Forwarded
+        to adr_fortify.py as --jira-ticket, which then overrides its own
+        branch/commit naming: the branch becomes 'feature/<jira_ticket_id>'
+        (instead of the auto-generated fortify-fix branch derived from
+        commit_id) and the commit subject is prefixed '<jira_ticket_id> : msg'.
+        None/empty (default) preserves the existing auto-generated naming —
+        no behaviour change for callers that don't pass this.
 
     push: forwarded to adr_fortify.py as --push. adr_fortify.py's --commit
         mode never runs a Maven build itself (that block is disabled — see
@@ -365,6 +375,8 @@ def invoke_adr(
         cmd += ["--target-versions", _json.dumps(target_versions)]
     if required_jdk:
         cmd += ["--required-jdk", str(required_jdk)]
+    if jira_ticket_id:
+        cmd += ["--jira-ticket", str(jira_ticket_id)]
 
     logger.debug(f"[ADR Fix] Running: {' '.join(cmd)}")
 
@@ -476,14 +488,17 @@ def run_adr_fix(
     cancel_check: Optional[Callable[[], bool]] = None,
     required_jdk: Optional[str] = None,
     push: bool = False,
+    jira_ticket_id: Optional[str] = None,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
 
     Steps:
       1. Build branch name: feature/fortify-fix-{releaseId}-{randId}
+         (or feature/<jira_ticket_id> when a real JIRA ticket is supplied —
+         see jira_ticket_id below)
       2. Log the doing-when preamble
-      3. Invoke adr.py --commit [--push]
+      3. Invoke adr.py --commit [--push] [--jira-ticket]
       4. Parse stdout for branch/commit/pdf/build_time
       5. Abort with success=False if ADR made 0 fixes (dep not found in poms)
       6. Log done-when result lines
@@ -499,6 +514,11 @@ def run_adr_fix(
         cancelled while this group's build is running, PipelineCancelledError
         propagates out of this function (not caught here) so the pipeline
         runner can mark the whole job "cancelled" instead of "failed".
+
+    jira_ticket_id: optional real JIRA ticket ID (e.g. "PROJ-1234"), forwarded
+        to invoke_adr() — see its docstring. When set, it takes priority over
+        the auto-generated branch_name for both the branch name and the
+        commit subject; when omitted (default), behaviour is unchanged.
     """
     parsed = group["parsed"]
     artifact_id = parsed["artifact_id"]
@@ -528,12 +548,13 @@ def run_adr_fix(
     }
 
     logger.info(f"[ADR Fix] Applying {artifact_id} {current_version} → {candidate}")
-    logger.info(f"[ADR Fix] Branch: {branch_name}")
+    logger.info(f"[ADR Fix] Branch: {branch_name}" + (f" (JIRA ticket: {jira_ticket_id})" if jira_ticket_id else ""))
     logger.info(f"[ADR Fix] Target key: '{coord_key}' (bare fallback: '{coord_key_bare}')")
 
     success, stdout, stderr = invoke_adr(
         adr_path, project_path, branch_name, target_versions=target_versions,
         cancel_check=cancel_check, required_jdk=required_jdk, push=push,
+        jira_ticket_id=jira_ticket_id,
     )
 
     if success:
@@ -560,7 +581,13 @@ def run_adr_fix(
                 error_reason=reason,
             )
 
-        branch = parsed_out["branch_name"] or branch_name  # use pre-built name as fallback
+        # Fallback if stdout parsing didn't find a branch line: use the real
+        # branch adr_fortify.py would have created (jira_ticket_id wins there
+        # too — see adr_fortify.py's _prepare_git_branch), not the pre-built
+        # fortify-fix name, so this stays accurate even on the fallback path.
+        branch = parsed_out["branch_name"] or (
+            f"feature/{jira_ticket_id}" if jira_ticket_id else branch_name
+        )
         base_branch = parsed_out["base_branch"]
         commit = parsed_out["commit_hash"] or "unknown"
         pdf = parsed_out["pdf_path"]
@@ -609,6 +636,7 @@ def adr_fix_node(
     adr_path: str,
     project_path: str,
     jira_prefix: str = "FORTIFY",
+    jira_ticket_id: Optional[str] = None,
 ) -> AgentState:
     """
     LangGraph node: adr_fix. Commit-only — does NOT build or push. Always
@@ -620,6 +648,9 @@ def adr_fix_node(
                                          invoke_adr()'s docstring. Not required;
                                          without it this node behaves as before
                                          (cancel has no effect mid-commit).
+            state["jira_ticket_id"]     optional fallback for the jira_ticket_id
+                                         param — used only if the caller didn't
+                                         pass jira_ticket_id explicitly.
     Writes: state["_adr_results"]       list of AdrResult dicts, one per group
                                          (success here means "committed", not
                                          "build passed")
@@ -646,6 +677,7 @@ def adr_fix_node(
     release_id: int = state.get("release_id", 0)  # type: ignore[attr-defined]
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
     required_jdk = state.get("required_jdk")  # type: ignore[attr-defined] — set by context_node
+    jira_ticket_id = jira_ticket_id or state.get("jira_ticket_id")  # type: ignore[attr-defined]
 
     for group in groups:
         if cancel_check is not None and cancel_check():
@@ -653,7 +685,7 @@ def adr_fix_node(
         result = run_adr_fix(
             group, adr_path, project_path, jira_prefix,
             release_id=release_id, cancel_check=cancel_check,
-            required_jdk=required_jdk,
+            required_jdk=required_jdk, jira_ticket_id=jira_ticket_id,
         )
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],

@@ -324,11 +324,17 @@ def create_pull_request(
     # ── Build PR metadata ─────────────────────────────────────────────────────
     cve_short   = cves[0] if len(cves) == 1 else f"{cves[0]}+{len(cves)-1}" if cves else "CVE"
     # Extract readable ref from branch name.
+    # Real JIRA ticket: feature/PROJ-1234                   → PROJ-1234
+    #   (set via --jira-ticket / jira_ticket_id — takes priority since the
+    #   branch is created as exactly 'feature/<JIRA_ID>' with nothing else)
     # New format: feature/fortify-fix-{releaseId}-{randId}  → fortify-fix-147266-a4105c54
     # Legacy format: feature/FORTIFY-a4105c54_fix_YYYYMMDD  → FORTIFY-a4105c54
+    jira_ticket_style = re.match(r"feature/([A-Za-z][A-Za-z0-9]+-\d+)$", branch_name)
     new_style = re.search(r"feature/(fortify-fix-[\w\-]+)", branch_name, re.IGNORECASE)
     old_style  = re.search(r"(FORTIFY-\w+)", branch_name)
-    if new_style:
+    if jira_ticket_style:
+        jira_ref = jira_ticket_style.group(1)
+    elif new_style:
         jira_ref = new_style.group(1)
     elif old_style:
         jira_ref = old_style.group(1)

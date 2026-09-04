@@ -394,6 +394,15 @@ class ConfigOverrides(BaseModel):
         ),
     )
     jira_id_prefix: Optional[str] = None
+    jira_ticket_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional real JIRA ticket ID (e.g. 'PROJ-1234'). When set, overrides the "
+            "auto-generated branch/commit naming for this run: the ADR branch becomes "
+            "'feature/<jira_ticket_id>' and the commit subject is prefixed "
+            "'<jira_ticket_id> : <msg>' instead of the Fortify-generated ID."
+        ),
+    )
     reviewers: Optional[str] = None
     adr_output_dir: Optional[str] = None
 
@@ -624,6 +633,14 @@ class AdrFixRequest(BaseModel):
     adr_path: str = Field(..., description="Absolute path to adr.py")
     project_path: str = Field(..., description="Absolute path to Maven project root")
     jira_prefix: str = Field(default="FORTIFY")
+    jira_ticket_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional real JIRA ticket ID (e.g. 'PROJ-1234'). When set, overrides the "
+            "auto-generated branch/commit naming: the branch becomes 'feature/<jira_ticket_id>' "
+            "and the commit subject is prefixed '<jira_ticket_id> : <msg>' instead of jira_prefix."
+        ),
+    )
     release_id: int = Field(default=0, description="Fortify release ID — used in branch name (feature/fortify-fix-{releaseId}-{randId})")
 
 
@@ -1219,6 +1236,7 @@ def _run_full_pipeline(
                         group, adr_path=cfg.adr_path,
                         project_path=str(project_path),
                         jira_prefix=cfg.jira_id_prefix,
+                        jira_ticket_id=cfg.jira_ticket_id,
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,
@@ -1388,6 +1406,7 @@ def _run_full_pipeline(
                         group, adr_path=cfg.adr_path,
                         project_path=str(project_path),
                         jira_prefix=cfg.jira_id_prefix,
+                        jira_ticket_id=cfg.jira_ticket_id,
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,
@@ -3016,6 +3035,7 @@ def stage_adr_fix(req: AdrFixRequest):
                 group, adr_path=req.adr_path,
                 project_path=req.project_path,
                 jira_prefix=req.jira_prefix,
+                jira_ticket_id=req.jira_ticket_id,
                 release_id=req.release_id,
             )
             results.append({"artifact_id": artifact_id, "result": result})
@@ -3410,6 +3430,7 @@ def _run_until(
                         group, adr_path=cfg.adr_path,
                         project_path=str(project_path),
                         jira_prefix=cfg.jira_id_prefix,
+                        jira_ticket_id=cfg.jira_ticket_id,
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,

@@ -123,9 +123,10 @@ def adr_fix_agent(state: AgentState) -> AgentState:
     adr_path = state.get("_adr_path")          # type: ignore[attr-defined]
     project_path = state.get("_project_path")  # type: ignore[attr-defined]
     jira_prefix = state.get("_jira_prefix", "FORTIFY")  # type: ignore[attr-defined]
+    jira_ticket_id = state.get("jira_ticket_id") or ""
     if adr_path is None or project_path is None:
         return _stub("AdrFix", state)
-    return adr_fix_node(state, adr_path, project_path, jira_prefix)
+    return adr_fix_node(state, adr_path, project_path, jira_prefix, jira_ticket_id=jira_ticket_id)
 
 
 def build_validation_agent(state: AgentState) -> AgentState:

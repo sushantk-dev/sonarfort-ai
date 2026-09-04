@@ -114,6 +114,11 @@ class AgentState(TypedDict):
     vuln_id: Optional[str]                  # Fortify vulnerability UUID (per finding)
     cve_list: list[str]                     # CVE IDs for this dep, e.g. ["CVE-2024-38820"]
     max_upgrades: int                       # 0 = unlimited; N = cap deps at N (highest severity first)
+    jira_ticket_id: Optional[str]          # optional real JIRA ticket (e.g. "PROJ-1234"), supplied
+                                            # by the caller. When set, adr_fix/adr_fortify.py use it
+                                            # verbatim: branch = "feature/<jira_ticket_id>" and the
+                                            # commit subject is prefixed "<jira_ticket_id> : <msg>",
+                                            # in place of the Fortify-generated ID/branch name.
 
     # ── Fortify finding fields ────────────────────────────────────────────────
     dependency: Optional[DependencyInfo]    # parsed from primaryLocation

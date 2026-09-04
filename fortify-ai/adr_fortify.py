@@ -677,18 +677,24 @@ def _find_git_root(path: str) -> str:
         return ""
 
 
-def _prepare_git_branch(repo_root: str, jira_id: str, base_branch_override: str = "") -> tuple:
+def _prepare_git_branch(repo_root: str, jira_id: str, base_branch_override: str = "",
+                         jira_ticket: str = "") -> tuple:
     """Fetch origin, resolve base branch, pull, then create a new feature branch.
     Returns (branch_name, base_branch).
     NOTE: Call this BEFORE applying any file changes so the branch is the
     correct base for all modifications."""
 
-    # When called from FortifyAI pipeline, jira_id is already the full branch
-    # name (e.g. 'feature/fortify-fix-1697672-c6266fa8'). Use it verbatim.
-    # For legacy/manual invocations with a plain JIRA ID, build the old format.
-    if jira_id.startswith("feature/"):
+    if jira_ticket:
+        # A real JIRA ticket ID was supplied (e.g. --jira-ticket PROJ-1234) —
+        # this always wins and is used verbatim, with no Fortify-generated
+        # suffix/date appended.
+        branch = f"feature/{jira_ticket}"
+    elif jira_id.startswith("feature/"):
+        # When called from FortifyAI pipeline, jira_id is already the full branch
+        # name (e.g. 'feature/fortify-fix-1697672-c6266fa8'). Use it verbatim.
         branch = jira_id
     else:
+        # Legacy/manual invocation with a plain Fortify ID — build the old format.
         today  = datetime.now().strftime("%Y%m%d")
         branch = f"feature/{jira_id}_fortify_fix_{today}"
 
@@ -1398,9 +1404,12 @@ def _discover_pom_files(path: str) -> list:
 
 
 def _build_commit_message(jira_id: str, all_findings: list,
-                          skip_set: set = None) -> tuple:
+                          skip_set: set = None, jira_ticket: str = "") -> tuple:
     """Returns (subject_line, body) for the git commit.
     Subject: [FORTIFY_ID]: vulnerability fix - X Critical, Y High, Z Medium (N packages, M CVEs)
+    When jira_ticket is supplied, the subject is instead prefixed
+    '<JIRA_ID> : vulnerability fix - ...' (real ticket ID, spaced colon) in place
+    of the Fortify-generated jira_id.
     Body: structured ADR commit message with Changes, Breaking Changes, and caution footer.
     Artifacts in skip_set are labelled [SKIP - Manual Action] and excluded from fix counts."""
 
@@ -1438,8 +1447,13 @@ def _build_commit_message(jira_id: str, all_findings: list,
         if sev_counts[sev]:
             parts.append(f"{sev_counts[sev]} {sev.capitalize()}")
     sev_summary = ", ".join(parts) if parts else "no CVEs"
-    subject = (f"{jira_id}: vulnerability fix - {sev_summary}"
-               f" ({len(fixed_findings)} package(s) fixed, {total_cves} CVE(s))")
+    if jira_ticket:
+        # Real JIRA ticket supplied — use requested "<JIRA_ID> : msg" spacing.
+        subject = (f"{jira_ticket} : vulnerability fix - {sev_summary}"
+                   f" ({len(fixed_findings)} package(s) fixed, {total_cves} CVE(s))")
+    else:
+        subject = (f"{jira_id}: vulnerability fix - {sev_summary}"
+                   f" ({len(fixed_findings)} package(s) fixed, {total_cves} CVE(s))")
 
     # Build body — group by WHERE the fix was applied, not where the dep appears
     #   depMgmt section : transitive deps  +  BOM-managed direct deps (_needs_depmanagement_pin)
@@ -1559,6 +1573,7 @@ def main():
             "  python adr_fortify.py /path/to/project --commit FORTIFY-a4105c54 --push\n"
             "  python adr_fortify.py /path/to/project --commit FORTIFY-a4105c54 --base-branch develop\n"
             "  python adr_fortify.py /path/to/project --commit FORTIFY-a4105c54 --push --skipTests true\n"
+            "  python adr_fortify.py /path/to/project --commit FORTIFY-a4105c54 --push --jira-ticket PROJ-1234\n"
             "  python adr_fortify.py /path/to/project --fix --skipTests false\n"
             "  python adr_fortify.py /path/to/project --fix --build-threads 4\n"
             "  python adr_fortify.py /path/to/project --fix --build-threads 1   # disable parallel build\n"
@@ -1576,6 +1591,12 @@ def main():
 
     parser.add_argument("--push",    action="store_true",
                         help="Push the created branch after committing (requires --commit)")
+    parser.add_argument("--jira-ticket", default="", metavar="JIRA_ID",
+                        help="Optional real JIRA ticket ID (e.g. PROJ-1234). When given, this "
+                             "overrides the auto-generated branch/commit naming: the branch is "
+                             "created as 'feature/<JIRA_ID>' (verbatim, no date/suffix) and the "
+                             "commit subject is prefixed '<JIRA_ID> : <msg>'. Falls back to the "
+                             "Fortify-generated ID (from --commit) when omitted.")
     parser.add_argument("--base-branch", default="", metavar="BRANCH",
                         help="Base branch to checkout from before creating the feature branch "
                              "(auto-detected from remote HEAD if not provided), e.g. --base-branch develop")
@@ -1690,6 +1711,7 @@ def main():
     # Derive convenience aliases matching old names used throughout main()
     args.analyze_only = args.scan
     args.jira_id      = args.commit or ""
+    args.jira_ticket_id = (args.jira_ticket or "").strip()
 
     # Resolve pom.xml files to process
     pom_files = _discover_pom_files(args.project_path)
@@ -1727,7 +1749,9 @@ def main():
             sys.exit(1)
         print()
         section("GIT -- PREPARING BRANCH")
-        git_branch, git_base = _prepare_git_branch(git_root, args.jira_id, args.base_branch)
+        git_branch, git_base = _prepare_git_branch(
+            git_root, args.jira_id, args.base_branch, jira_ticket=args.jira_ticket_id
+        )
 
     # ── Transitive dep pool: ONE mvn dependency:tree run on root pom ─────────
     mvn_exe       = args.mvn or _find_mvn()   # resolved once; used for transitive + effective-pom + build
@@ -2159,7 +2183,9 @@ def main():
     # ── Git: commit (branch was already created before fixes were applied) ──────
     git_info = None
     if not args.analyze_only and args.jira_id and all_applied and git_branch:
-        commit_subject, commit_body = _build_commit_message(args.jira_id, all_findings, skip_set)
+        commit_subject, commit_body = _build_commit_message(
+            args.jira_id, all_findings, skip_set, jira_ticket=args.jira_ticket_id
+        )
         # Collect poms to stage: modules with direct fixes + root pom if transitive overrides were added
         poms_to_stage = [r["pom"] for r in module_results if r["applied"]]
         if trans_root_pom_updated and pom_files[0] not in poms_to_stage:
@@ -2314,6 +2340,8 @@ def main():
         print()
         print("  >> Git Commit Verification")
         print(f"    Fortify ID   : {args.commit or ''}")
+        if args.jira_ticket_id:
+            print(f"    JIRA Ticket  : {args.jira_ticket_id}")
         print(f"    Branch       : {git_info['branch']}")
         print(f"    Created From : {git_info.get('base_branch', 'master')}")
         print(f"    Commit       : {git_info['hash'] or 'n/a'}")
