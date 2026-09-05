@@ -189,7 +189,7 @@ class FortifyAIConfig(BaseSettings):
         description=(
             "Optional real JIRA ticket ID (e.g. 'PROJ-1234'). When set, overrides the "
             "auto-generated branch/commit naming: the ADR branch becomes "
-            "'feature/<jira_ticket_id>' and the commit subject is prefixed "
+            "'feature/<jira_ticket_id>-<uid>' and the commit subject is prefixed "
             "'<jira_ticket_id> : <msg>' instead of jira_id_prefix's generated ID. "
             "Empty (default) preserves the existing auto-generated naming."
         ),

@@ -87,6 +87,7 @@ import os
 import sys
 import json
 import time
+import uuid
 import shutil
 import signal
 import ctypes
@@ -685,10 +686,17 @@ def _prepare_git_branch(repo_root: str, jira_id: str, base_branch_override: str 
     correct base for all modifications."""
 
     if jira_ticket:
-        # A real JIRA ticket ID was supplied (e.g. --jira-ticket PROJ-1234) —
-        # this always wins and is used verbatim, with no Fortify-generated
-        # suffix/date appended.
-        branch = f"feature/{jira_ticket}"
+        # A real JIRA ticket ID was supplied (e.g. --jira-ticket PROJ-1234).
+        # One ticket commonly covers several dependency fixes in the same
+        # pipeline run (each processed as its own group -> its own call into
+        # this script), so the ticket ID alone is NOT unique enough for a
+        # branch name — every group would collide on the exact same branch.
+        # Append a short random id per fix, same style as the legacy
+        # fortify-fix naming below. The commit subject (_build_commit_message)
+        # is unaffected and still uses the clean "<jira_ticket> : msg" form —
+        # only the branch gets the uniqueness suffix.
+        rand_id = uuid.uuid4().hex[:8]
+        branch = f"feature/{jira_ticket}-{rand_id}"
     elif jira_id.startswith("feature/"):
         # When called from FortifyAI pipeline, jira_id is already the full branch
         # name (e.g. 'feature/fortify-fix-1697672-c6266fa8'). Use it verbatim.
@@ -1594,9 +1602,10 @@ def main():
     parser.add_argument("--jira-ticket", default="", metavar="JIRA_ID",
                         help="Optional real JIRA ticket ID (e.g. PROJ-1234). When given, this "
                              "overrides the auto-generated branch/commit naming: the branch is "
-                             "created as 'feature/<JIRA_ID>' (verbatim, no date/suffix) and the "
-                             "commit subject is prefixed '<JIRA_ID> : <msg>'. Falls back to the "
-                             "Fortify-generated ID (from --commit) when omitted.")
+                             "created as 'feature/<JIRA_ID>-<uid>' (a short random id is appended "
+                             "so multiple fixes under the same ticket don't collide on one branch) "
+                             "and the commit subject is prefixed '<JIRA_ID> : <msg>' (no uid there). "
+                             "Falls back to the Fortify-generated ID (from --commit) when omitted.")
     parser.add_argument("--base-branch", default="", metavar="BRANCH",
                         help="Base branch to checkout from before creating the feature branch "
                              "(auto-detected from remote HEAD if not provided), e.g. --base-branch develop")

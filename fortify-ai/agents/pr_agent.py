@@ -324,12 +324,16 @@ def create_pull_request(
     # ── Build PR metadata ─────────────────────────────────────────────────────
     cve_short   = cves[0] if len(cves) == 1 else f"{cves[0]}+{len(cves)-1}" if cves else "CVE"
     # Extract readable ref from branch name.
-    # Real JIRA ticket: feature/PROJ-1234                   → PROJ-1234
-    #   (set via --jira-ticket / jira_ticket_id — takes priority since the
-    #   branch is created as exactly 'feature/<JIRA_ID>' with nothing else)
+    # Real JIRA ticket: feature/PROJ-1234-a1b2c3d4          → PROJ-1234
+    #   (set via --jira-ticket / jira_ticket_id — the trailing -<uid> is a
+    #   short random id adr_fortify.py appends so multiple fixes under the
+    #   same ticket in one run don't collide on a single branch; stripped
+    #   back off here so the PR title reads the clean ticket ID)
     # New format: feature/fortify-fix-{releaseId}-{randId}  → fortify-fix-147266-a4105c54
     # Legacy format: feature/FORTIFY-a4105c54_fix_YYYYMMDD  → FORTIFY-a4105c54
-    jira_ticket_style = re.match(r"feature/([A-Za-z][A-Za-z0-9]+-\d+)$", branch_name)
+    jira_ticket_style = re.match(
+        r"feature/([A-Za-z][A-Za-z0-9]+-\d+)(?:-[0-9a-f]{6,10})?$", branch_name
+    )
     new_style = re.search(r"feature/(fortify-fix-[\w\-]+)", branch_name, re.IGNORECASE)
     old_style  = re.search(r"(FORTIFY-\w+)", branch_name)
     if jira_ticket_style:

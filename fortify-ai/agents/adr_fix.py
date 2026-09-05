@@ -62,9 +62,19 @@ def _build_branch_name(release_id: int) -> str:
 
     Format: feature/fortify-fix-{releaseId}-{randId}
 
-    This value is passed verbatim to adr_fortify.py --commit.
-    adr_fortify.py detects the 'feature/' prefix and uses it as-is,
-    so both sides always produce the exact same branch name.
+    This value is passed verbatim to adr_fortify.py --commit, and normally
+    adr_fortify.py detects the 'feature/' prefix and uses it as-is, so both
+    sides produce the exact same branch name.
+
+    EXCEPTION: when jira_ticket_id is also supplied, adr_fortify.py's
+    --jira-ticket takes priority and creates 'feature/<jira_ticket_id>-<uid>'
+    instead (a short random id appended so multiple fixes under the same
+    ticket in one run get separate branches) — this --commit value still gets sent (and still shows up
+    verbatim in adr_fortify.py's own report as "Fortify ID : <this value>"),
+    but it is NOT the branch that actually gets created in that case. Do not
+    assume this return value is the real branch name once jira_ticket_id is
+    in play — read it back from _parse_adr_output()'s branch_name instead
+    (which is jira_ticket-aware; see run_adr_fix()).
     """
     rand_id = uuid.uuid4().hex[:8]
     return f"feature/fortify-fix-{release_id}-{rand_id}"
@@ -98,7 +108,21 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
         "machine_result": None,  # dict parsed from "ADR_MACHINE_RESULT:{...}" line, if present
     }
 
-    for line in combined.splitlines():
+    # Two passes for branch_name specifically. adr_fortify.py's own report
+    # prints a "Fortify ID   : feature/fortify-fix-..." line (the raw
+    # --commit value) BEFORE the real "Branch       : ..." line — and since
+    # --jira-ticket (jira_ticket_id) can now make those two values genuinely
+    # different, a single forward pass with first-match-wins would let the
+    # loose "any feature/..." fallback below lock onto the Fortify ID line
+    # and then block the correct, explicitly-labeled Branch line from ever
+    # overwriting it. So: pass 1 looks ONLY for authoritative sources
+    # (ADR_BRANCH_INFO / ADR_MACHINE_RESULT / a line explicitly labeled
+    # "Branch"/"Pushed branch"). Only if none of those exist anywhere in the
+    # output does pass 2 fall back to the loose "any feature/..." match —
+    # explicitly skipping "Fortify ID" lines so it can never repeat this bug.
+    lines = combined.splitlines()
+
+    for line in lines:
         line_s = line.strip()
 
         # Per-dependency machine-readable result (preferred source of truth —
@@ -124,7 +148,10 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
                 pass
             continue
 
-        # Branch name
+        # Branch name — explicitly labeled lines only ("Branch :", "Branch
+        # created:", "Pushed branch:"). Deliberately does NOT match on
+        # "Fortify ID :" or any other line that merely happens to contain a
+        # "feature/..." substring — see the loose fallback pass below for that.
         m = re.search(
             r"(?:Branch(?:\s+created)?|Pushed(?:\s+branch)?)[:\s]+\s*([\w/\-\.]+)",
             line_s, re.IGNORECASE,
@@ -133,11 +160,6 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
             candidate = m.group(1).strip()
             if candidate.startswith("feature/") or "fix" in candidate.lower():
                 result["branch_name"] = candidate
-
-        # Also match "git checkout -b feature/..." lines from verbose ADR output
-        m2 = re.search(r"feature/[\w\-\.]+", line_s)
-        if m2 and not result["branch_name"]:
-            result["branch_name"] = m2.group(0)
 
         # Commit hash — short SHA (7-8 hex chars) or full SHA
         m3 = re.search(
@@ -179,6 +201,22 @@ def _parse_adr_output(stdout: str, stderr: str) -> dict:
         m9 = re.search(r"Findings\s*:\s*(\d+)\s+unique", line_s, re.IGNORECASE)
         if m9 and result["findings_count"] is None:
             result["findings_count"] = int(m9.group(1))
+
+    # Pass 2 — loose fallback, only reached if nothing above (ADR_BRANCH_INFO,
+    # ADR_MACHINE_RESULT, or a properly-labeled "Branch"/"Pushed branch" line)
+    # ever set branch_name. Explicitly skips "Fortify ID" lines — those carry
+    # the raw --commit value, which is NOT the real branch whenever
+    # --jira-ticket was supplied, and matching it here is exactly the bug
+    # this two-pass split exists to prevent (see the comment above the loop).
+    if not result["branch_name"]:
+        for line in lines:
+            line_s = line.strip()
+            if line_s.lower().startswith("fortify id"):
+                continue
+            m2 = re.search(r"feature/[\w\-\.]+", line_s)
+            if m2:
+                result["branch_name"] = m2.group(0)
+                break
 
     return result
 
@@ -319,10 +357,12 @@ def invoke_adr(
 
     jira_ticket_id: optional real JIRA ticket ID (e.g. "PROJ-1234"). Forwarded
         to adr_fortify.py as --jira-ticket, which then overrides its own
-        branch/commit naming: the branch becomes 'feature/<jira_ticket_id>'
-        (instead of the auto-generated fortify-fix branch derived from
-        commit_id) and the commit subject is prefixed '<jira_ticket_id> : msg'.
-        None/empty (default) preserves the existing auto-generated naming —
+        branch/commit naming: the branch becomes 'feature/<jira_ticket_id>-<uid>'
+        (a short random id per fix, so multiple fixes under one ticket in the
+        same run don't collide on one branch; instead of the auto-generated
+        fortify-fix branch derived from commit_id) and the commit subject is
+        prefixed '<jira_ticket_id> : msg' (no uid there — commit message
+        stays clean). None/empty (default) preserves the existing auto-generated naming —
         no behaviour change for callers that don't pass this.
 
     push: forwarded to adr_fortify.py as --push. adr_fortify.py's --commit
@@ -495,8 +535,8 @@ def run_adr_fix(
 
     Steps:
       1. Build branch name: feature/fortify-fix-{releaseId}-{randId}
-         (or feature/<jira_ticket_id> when a real JIRA ticket is supplied —
-         see jira_ticket_id below)
+         (or feature/<jira_ticket_id>-<uid> when a real JIRA ticket is
+         supplied — see jira_ticket_id below)
       2. Log the doing-when preamble
       3. Invoke adr.py --commit [--push] [--jira-ticket]
       4. Parse stdout for branch/commit/pdf/build_time
@@ -581,13 +621,28 @@ def run_adr_fix(
                 error_reason=reason,
             )
 
-        # Fallback if stdout parsing didn't find a branch line: use the real
-        # branch adr_fortify.py would have created (jira_ticket_id wins there
-        # too — see adr_fortify.py's _prepare_git_branch), not the pre-built
-        # fortify-fix name, so this stays accurate even on the fallback path.
-        branch = parsed_out["branch_name"] or (
-            f"feature/{jira_ticket_id}" if jira_ticket_id else branch_name
-        )
+        # Fallback if stdout parsing didn't find a branch line at all (should
+        # be rare — pass 1 of _parse_adr_output looks for ADR_BRANCH_INFO,
+        # ADR_MACHINE_RESULT, and the explicitly-labeled "Branch :" line).
+        # Since adr_fortify.py appends a random per-fix uid to jira_ticket_id
+        # branches (feature/<jira_ticket_id>-<uid>) precisely so multiple
+        # fixes under one ticket don't collide, that uid is generated inside
+        # the subprocess and NOT knowable here — so this fallback can only
+        # guess the bare "feature/<jira_ticket_id>" (no uid), which is almost
+        # certainly NOT the real branch that got created/pushed. Rather than
+        # silently handing pr_agent a branch name that's wrong in the same
+        # way as the bug this two-pass parser was written to fix, log it
+        # loudly so a real parsing gap gets noticed instead of quietly
+        # producing another failed PR.
+        branch = parsed_out["branch_name"]
+        if not branch:
+            branch = f"feature/{jira_ticket_id}" if jira_ticket_id else branch_name
+            logger.warning(
+                f"[ADR Fix] ⚠️  Could not parse branch name from adr_fortify.py output — "
+                f"falling back to a best-guess '{branch}', which is likely WRONG when "
+                f"jira_ticket_id is set (the real branch has a uid suffix adr_fortify.py "
+                f"generates internally). PR creation may fail — check ADR's raw stdout."
+            )
         base_branch = parsed_out["base_branch"]
         commit = parsed_out["commit_hash"] or "unknown"
         pdf = parsed_out["pdf_path"]

@@ -116,9 +116,11 @@ class AgentState(TypedDict):
     max_upgrades: int                       # 0 = unlimited; N = cap deps at N (highest severity first)
     jira_ticket_id: Optional[str]          # optional real JIRA ticket (e.g. "PROJ-1234"), supplied
                                             # by the caller. When set, adr_fix/adr_fortify.py use it
-                                            # verbatim: branch = "feature/<jira_ticket_id>" and the
-                                            # commit subject is prefixed "<jira_ticket_id> : <msg>",
-                                            # in place of the Fortify-generated ID/branch name.
+                                            # verbatim: branch = "feature/<jira_ticket_id>-<uid>" (a
+                                            # short random id per fix, so multiple fixes under one
+                                            # ticket in the same run don't collide on one branch) and
+                                            # the commit subject is prefixed "<jira_ticket_id> : <msg>"
+                                            # (no uid there), in place of the Fortify-generated ID.
 
     # ── Fortify finding fields ────────────────────────────────────────────────
     dependency: Optional[DependencyInfo]    # parsed from primaryLocation

@@ -399,7 +399,7 @@ class ConfigOverrides(BaseModel):
         description=(
             "Optional real JIRA ticket ID (e.g. 'PROJ-1234'). When set, overrides the "
             "auto-generated branch/commit naming for this run: the ADR branch becomes "
-            "'feature/<jira_ticket_id>' and the commit subject is prefixed "
+            "'feature/<jira_ticket_id>-<uid>' and the commit subject is prefixed "
             "'<jira_ticket_id> : <msg>' instead of the Fortify-generated ID."
         ),
     )
@@ -637,7 +637,7 @@ class AdrFixRequest(BaseModel):
         default=None,
         description=(
             "Optional real JIRA ticket ID (e.g. 'PROJ-1234'). When set, overrides the "
-            "auto-generated branch/commit naming: the branch becomes 'feature/<jira_ticket_id>' "
+            "auto-generated branch/commit naming: the branch becomes 'feature/<jira_ticket_id>-<uid>' "
             "and the commit subject is prefixed '<jira_ticket_id> : <msg>' instead of jira_prefix."
         ),
     )
