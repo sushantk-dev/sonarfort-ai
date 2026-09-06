@@ -46,6 +46,7 @@ local per-machine, so each pod maintains (and pays for) its own session.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -79,6 +80,7 @@ def _run(
     cmd: list[str],
     timeout: int,
     redact: Optional[str] = None,
+    env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """
     subprocess.run wrapper with consistent timeout/not-found handling.
@@ -86,16 +88,46 @@ def _run(
     ``redact`` — a literal value (e.g. a password) to scrub from any
     exception message so it never ends up in logs or a failed job's
     stored error string.
+
+    ``env`` — full environment dict for the subprocess (e.g. from
+    ``_maven_env`` to cap JVM heap for scancentral's own Maven build
+    tool integration). ``None`` inherits the parent process's
+    environment unchanged, same as plain ``subprocess.run``.
     """
     logger.debug(f"[FortifyScan] Running: {' '.join(_safe_cmd(cmd, redact))}")
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as exc:
         raise FcliError(
             f"Command timed out after {timeout}s: {' '.join(_safe_cmd(cmd, redact))}"
         ) from exc
     except FileNotFoundError as exc:
         raise FcliError(f"Executable not found on PATH: {cmd[0]!r}") from exc
+
+
+# Fixed JVM heap cap for scancentral's own Maven build-tool integration —
+# hardcoded rather than driven by config.maven_heap_mb, since scancentral
+# packaging routinely needs more headroom than build_validation's mvn
+# build heap default (512MB) to resolve a large reactor without OOMing.
+# Change this constant directly if a different cap is needed; an operator
+# -set MAVEN_OPTS in the real environment still overrides it (see
+# _maven_env below).
+_SCANCENTRAL_MAVEN_HEAP_MB = 4096
+
+
+def _maven_env(maven_heap_mb: Optional[int]) -> dict:
+    """
+    Build a subprocess environment that caps the JVM heap scancentral's
+    own Maven integration uses, via MAVEN_OPTS — same precedence rule as
+    adr_fortify.py's ``_build_subprocess_env``: an MAVEN_OPTS already set
+    in the inherited environment (an explicit operator override) always
+    wins, and a falsy ``maven_heap_mb`` disables the cap entirely,
+    leaving the JVM's own default heap sizing in place.
+    """
+    env = os.environ.copy()
+    if maven_heap_mb and not env.get("MAVEN_OPTS", "").strip():
+        env["MAVEN_OPTS"] = f"-Xmx{maven_heap_mb}m"
+    return env
 
 
 # ── ScanCentral packaging ─────────────────────────────────────────────────────
@@ -111,6 +143,12 @@ def package_project(
 
         scancentral package -bt <build_tool> -exclude <patterns>
             -bf <project_path>/pom.xml -o <output_zip>
+
+    scancentral's own Maven build-tool integration inherits the process
+    environment, so a fixed heap cap (_SCANCENTRAL_MAVEN_HEAP_MB) is
+    applied here via MAVEN_OPTS to avoid an uncapped mvn JVM getting
+    OOM-killed on a memory-limited pod. An operator-set MAVEN_OPTS in
+    the real environment always overrides this (see _maven_env).
 
     Returns ``output_zip`` on success.
 
@@ -136,7 +174,7 @@ def package_project(
     ]
 
     try:
-        result = _run(cmd, timeout=timeout)
+        result = _run(cmd, timeout=timeout, env=_maven_env(_SCANCENTRAL_MAVEN_HEAP_MB))
     except FcliError as exc:
         # _run raises FcliError generically; re-wrap as ScanCentralError so
         # callers can tell packaging failures apart from fcli/FoD failures.
