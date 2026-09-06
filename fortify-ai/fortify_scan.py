@@ -211,7 +211,10 @@ def package_project(
 
 # ── fcli FoD session ───────────────────────────────────────────────────────────
 
-_session_lock = threading.Lock()
+_session_lock = threading.RLock()  # reentrant: ensure_fod_session holds this
+                                    # while calling _session_is_fresh, which
+                                    # also acquires it — a plain Lock() here
+                                    # deadlocks the thread against itself.
 _session_expiry: dict[tuple[str, str, str], float] = {}   # (url, tenant, user) -> epoch
 _SESSION_EXPIRY_BUFFER_SECS = 60
 
