@@ -224,13 +224,34 @@ def _fcli_base_cmd(cfg: FortifyAIConfig) -> list[str]:
 
 
 def _session_key(cfg: FortifyAIConfig) -> tuple[str, str, str]:
-    return (cfg.fortify_base_url.rstrip("/"), cfg.fod_tenant, cfg.fortify_username)
+    # Use the same stripped form fcli actually logs in with, so
+    # 'equifax\\jdoe' and 'jdoe' hit the same cache entry instead of each
+    # triggering their own separate login.
+    return (cfg.fortify_base_url.rstrip("/"), cfg.fod_tenant, _strip_domain_prefix(cfg.fortify_username))
 
 
 def _session_is_fresh(cfg: FortifyAIConfig) -> bool:
     with _session_lock:
         expires_at = _session_expiry.get(_session_key(cfg))
     return bool(expires_at and time.time() < expires_at - _SESSION_EXPIRY_BUFFER_SECS)
+
+
+def _strip_domain_prefix(username: str) -> str:
+    """
+    Strip a Windows-style 'domain\\user' prefix (e.g. 'equifax\\jdoe' ->
+    'jdoe') for fcli's FoD login specifically.
+
+    FoD's `fcli fod session login` takes a bare username and the org
+    separately via --tenant (confirmed against a working manual CLI
+    test: `-u "sushant.kumar" --tenant="equifax"`) — unlike Fortify SSC's
+    OAuth endpoint, which does expect the domain-qualified form (see
+    fortify_auth.py). Both flows currently read the same
+    `cfg.fortify_username`, so rather than require the caller to send a
+    different value for each, this strips the prefix only at the point
+    fcli is actually invoked — cfg.fortify_username itself, and any SSC
+    OAuth call made elsewhere from the same config, are left untouched.
+    """
+    return username.split("\\", 1)[-1] if "\\" in username else username
 
 
 def ensure_fod_session(cfg: FortifyAIConfig, timeout: int = 60) -> None:
@@ -275,7 +296,7 @@ def ensure_fod_session(cfg: FortifyAIConfig, timeout: int = 60) -> None:
         cmd = _fcli_base_cmd(cfg) + [
             "fod", "session", "login",
             "--url", cfg.fortify_base_url,
-            "-u", cfg.fortify_username,
+            "-u", _strip_domain_prefix(cfg.fortify_username),
             "-p", cfg.fortify_password,
             "--tenant", cfg.fod_tenant,
             "--session", cfg.fod_session_name,
