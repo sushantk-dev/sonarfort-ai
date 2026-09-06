@@ -208,11 +208,88 @@ class FortifyAIConfig(BaseSettings):
         description="Local directory where ADR PDF reports and logs are written",
     )
 
+    # ── Fortify Scan — ScanCentral packaging ─────────────────────────────────
+    # Used by POST /fortify/scan to trigger an actual new SAST scan, as
+    # opposed to every other endpoint here which only reads vulnerabilities
+    # off an already-existing release.
+    scancentral_exe: str = Field(
+        default="scancentral",
+        description=(
+            "scancentral executable name/path. Default assumes it's on PATH "
+            "(confirmed for this deployment) — set an absolute path if that "
+            "ever changes."
+        ),
+    )
+    scancentral_build_tool: str = Field(
+        default="mvn",
+        description="Build tool passed to `scancentral package -bt <value>`.",
+    )
+    scancentral_exclude_patterns: str = Field(
+        default=(
+            "DFD/**:CODEOWNERS:**/Dockerfile:**/Jenkinsfile:**/scm/**:"
+            "**/sonar-project*:**/.gitignore:**/.gitattributes:**/.git:"
+            "**/.git/**:**/.github:**/.github/**:**/.DS_Store"
+        ),
+        description=(
+            "Colon-separated glob patterns passed to `scancentral package "
+            "-exclude`."
+        ),
+    )
+    scancentral_package_timeout_seconds: int = Field(
+        default=900,
+        ge=30,
+        description="Subprocess timeout for `scancentral package` (Maven reactor resolution can be slow on large repos).",
+    )
+
+    # ── Fortify Scan — fcli / Fortify on Demand SAST submission ──────────────
+    # fcli's FoD login (`fcli fod session login`) reuses fortify_base_url /
+    # fortify_username / fortify_password above — no separate URL/creds
+    # fields here, since /fortify/scan takes those as required per-request
+    # inputs (not env defaults) rather than a standing server identity.
+    fcli_jar_path: str = Field(
+        default="fcli.jar",
+        description="Absolute path to fcli.jar (Fortify CLI). Relative default assumes it's on the working directory/PATH.",
+    )
+    fod_tenant: str = Field(
+        default="",
+        description="Fortify on Demand tenant name, e.g. 'equifax' — passed to `fcli fod session login --tenant`.",
+    )
+    fod_session_name: str = Field(
+        default="default",
+        description="Name of the fcli FoD session created/reused by ensure_fod_session.",
+    )
+    fod_session_ttl_seconds: int = Field(
+        default=18000,
+        description=(
+            "How long a freshly-logged-in fcli FoD session is trusted before "
+            "ensure_fod_session re-logs in. Kept conservatively under the "
+            "~6h expiry observed from fcli itself."
+        ),
+    )
+    fod_remediation_preference: str = Field(
+        default="NonRemediationScanOnly",
+        description="Value passed to `fcli fod sast-scan start --remediation-preference`.",
+    )
+    scan_poll_interval_seconds: int = Field(
+        default=60,
+        ge=5,
+        description="How often (fcli's own --interval and our own progress-tick granularity) to check scan status.",
+    )
+    scan_poll_timeout_seconds: int = Field(
+        default=7200,
+        ge=60,
+        description="Overall budget for a scan to reach a terminal status before /fortify/scan gives up and fails the job.",
+    )
+
     def get_reviewers(self) -> list[str]:
         """Parse the comma-separated reviewers string into a list."""
         if not self.reviewers.strip():
             return []
         return [r.strip() for r in self.reviewers.split(",") if r.strip()]
+
+    def get_scancentral_exclude_patterns(self) -> list[str]:
+        """Parse the colon-separated scancentral exclude patterns into a list."""
+        return [p.strip() for p in self.scancentral_exclude_patterns.split(":") if p.strip()]
 
 
 def load_config() -> FortifyAIConfig:

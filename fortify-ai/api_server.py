@@ -90,6 +90,20 @@ Execution Modes:
     POST /pipeline/until/build-validation
     POST /pipeline/until/pr-agent
 
+  FORTIFY SCAN (triggers an actual new SAST scan — not a read of an existing release)
+    POST /fortify/scan                    — clone repo_name -> ScanCentral package -> fcli
+                                             FoD session -> submit SAST scan -> poll to
+                                             completion. Body: {app_name, repo_name,
+                                             branch_name?, release_id?, github_token,
+                                             fortify_username, fortify_password}.
+                                             branch_name optional (defaults to the repo's
+                                             default branch, e.g. master/main); release_id
+                                             optional (defaults to app_name's latest
+                                             release); credentials required per-request,
+                                             never persisted. Returns scan_id immediately.
+    GET  /fortify/scan/status/{scan_id}   — overall + per-stage status (same shape as
+                                             GET /pipeline/status/{pipeline_id})
+
   UTILITY
     GET  /health                   — liveness probe
     GET  /api/config               — read current config (env vars; tokens masked)
@@ -580,6 +594,56 @@ class BuildTimeEstimateRequest(BaseModel):
     config: ConfigOverrides = Field(default_factory=ConfigOverrides)
 
 
+# ── Fortify Scan (ScanCentral package + FoD SAST submission) ───────────────────
+
+class FortifyScanRequest(BaseModel):
+    """
+    Trigger an actual **new** Fortify SAST scan — unlike every other model
+    in this file, which only reads vulnerabilities off an *existing*
+    release. Clones `repo_name`, packages it with ScanCentral, and submits
+    + polls the scan via fcli against Fortify on Demand.
+
+    Credentials are required **per-request** here rather than falling back
+    to server env defaults (contrast with ConfigOverrides elsewhere) —
+    this endpoint always runs with the caller's own identity, and its
+    credentials are never persisted to the shared process env/GCS config
+    (mirrors ``persist_token=False`` usage elsewhere in this file).
+    FORTIFY_BASE_URL is read from the server's existing env config as-is.
+    """
+    app_name: str = Field(
+        ...,
+        description="Fortify application name — resolved to the latest release_id unless release_id is given",
+    )
+    repo_name: str = Field(
+        ...,
+        description="GitHub repository in 'owner/repo' format — cloned and packaged for scanning",
+    )
+    branch_name: Optional[str] = Field(
+        default=None,
+        description="Branch to clone. Omit to clone the repo's default branch (master/main/whatever HEAD points to).",
+    )
+    release_id: Optional[int] = Field(
+        default=None,
+        description="Existing release/applicationVersion ID to scan into. Omit to resolve app_name's latest release.",
+    )
+    github_token: str = Field(
+        ...,
+        description="GitHub personal access token with read access to repo_name, used only for this request's clone.",
+    )
+    fortify_username: str = Field(
+        ...,
+        description=(
+            "Fortify username — used both to resolve app_name -> release_id "
+            "against FORTIFY_BASE_URL and to log in the fcli FoD session "
+            "that submits the scan."
+        ),
+    )
+    fortify_password: str = Field(
+        ...,
+        description="Fortify password, paired with fortify_username for both uses described above.",
+    )
+
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 class AuthTokenRequest(BaseModel):
@@ -839,13 +903,21 @@ def _resolve_vulnerabilities(
     return client, raw_vulns, release_id, resolved_app_id
 
 
-def _clone_repo_if_needed(cfg: FortifyAIConfig, repo: str | None) -> tuple[FortifyAIConfig, str | None]:
+def _clone_repo_if_needed(
+    cfg: FortifyAIConfig,
+    repo: str | None,
+    branch: str | None = None,
+) -> tuple[FortifyAIConfig, str | None]:
     """
     Mirror the CLI --repo auto-clone behaviour for the API server.
 
     If *repo* is provided:
       1. Overrides cfg.github_repo with *repo*.
       2. Clones the repo into a temp directory (shallow, depth=1).
+         If *branch* is given, clones that branch specifically
+         (`git clone --branch <branch>`); otherwise clones whatever the
+         remote's default branch is (master/main/etc. — whatever HEAD
+         points to), same as before this parameter existed.
       3. Overrides cfg.project_path with the cloned directory — so ADR,
          context, api-diff, and every other stage that reads project_path
          will operate on the fresh clone instead of a stale local path.
@@ -865,21 +937,26 @@ def _clone_repo_if_needed(cfg: FortifyAIConfig, repo: str | None) -> tuple[Forti
     # 2 — clone
     repo_url = f"https://{cfg.github_token}@github.com/{cfg.github_repo}.git"
     clone_dir = tempfile.mkdtemp(prefix="fortifyai_clone_")
+    clone_cmd = ["git", "-c", "http.sslVerify=false", "clone", "--depth", "1"]
+    if branch:
+        clone_cmd += ["--branch", branch]
+    clone_cmd += [repo_url, clone_dir]
+    branch_desc = f" (branch '{branch}')" if branch else " (default branch)"
     try:
         result = _sp.run(
-            ["git", "-c", "http.sslVerify=false", "clone", "--depth", "1", repo_url, clone_dir],
+            clone_cmd,
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
             import shutil
             shutil.rmtree(clone_dir, ignore_errors=True)
             raise RuntimeError(
-                f"git clone failed for {repo}:\n{result.stderr[:500]}"
+                f"git clone failed for {repo}{branch_desc}:\n{result.stderr[:500]}"
             )
     except _sp.TimeoutExpired:
         import shutil
         shutil.rmtree(clone_dir, ignore_errors=True)
-        raise RuntimeError(f"git clone timed out after 300s for {repo}")
+        raise RuntimeError(f"git clone timed out after 300s for {repo}{branch_desc}")
     except FileNotFoundError:
         import shutil
         shutil.rmtree(clone_dir, ignore_errors=True)
@@ -2342,6 +2419,186 @@ async def pipeline_dry_run(req: DryRunRequest):
 
     asyncio.create_task(_run())
     return ok({"pipeline_id": pid, "status": "queued"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FORTIFY SCAN — ScanCentral packaging + FoD SAST submission
+#
+# Unlike every /pipeline/* and /stages/* endpoint above (which read
+# vulnerabilities off an *existing* Fortify release), this triggers an
+# actual new scan: clone -> package (ScanCentral) -> ensure fcli FoD
+# session -> submit -> poll to completion. See fortify_scan.py.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/fortify/scan", tags=["Fortify Scan"])
+async def run_fortify_scan(req: FortifyScanRequest):
+    """
+    Package **repo_name** with ScanCentral and submit a new SAST scan
+    against Fortify on Demand, targeting **release_id** (or the latest
+    release for **app_name** if `release_id` is omitted). Clones
+    **branch_name** if given, otherwise the repo's default branch.
+
+    Credentials (`github_token`, `fortify_username`, `fortify_password`)
+    are required in the request body — this endpoint always runs as the
+    caller, never the server's own default identity, and none of these
+    values are persisted to shared env/GCS config.
+
+    Returns a *scan_id* immediately. Poll
+    **GET /fortify/scan/status/{scan_id}** to track progress.
+
+    Stages: resolve -> clone -> package -> session -> submit -> poll
+
+    On success the cloned repo + payload zip are deleted. On failure they
+    are left on disk (path is in the `clone` stage's output_summary) for
+    debugging.
+    """
+    job = _new_job(stages=["resolve", "clone", "package", "session", "submit", "poll"])
+    pid = job["pipeline_id"]
+
+    async def _run():
+        t0 = time.time()
+        loop = asyncio.get_event_loop()
+        clone_dir: str | None = None
+        succeeded = False
+        _store.update_job(pid, status="running")
+        _track_start(pid)
+        try:
+            from fortify_client import FortifyClient
+            import fortify_scan as fscan
+
+            # Per-request credentials only — never touches the shared
+            # process env / GCS runtime config (see FortifyScanRequest's
+            # docstring). FORTIFY_BASE_URL still comes from the server's
+            # own env config, per the request.
+            cfg = load_config().model_copy(update={
+                "github_token": req.github_token,
+                "fortify_username": req.fortify_username,
+                "fortify_password": req.fortify_password,
+            })
+            client = None
+
+            # ── resolve ──────────────────────────────────────────────────────
+            _update_stage(pid, "resolve", status="running", started_at=_now())
+            release_id = req.release_id
+            if release_id is None:
+                client = await loop.run_in_executor(
+                    _EXECUTOR, lambda: FortifyClient.from_config(cfg, persist_token=False)
+                )
+                release_id = await loop.run_in_executor(
+                    _EXECUTOR, lambda: client.resolve_release_id_from_app_name(req.app_name)
+                )
+            _update_stage(pid, "resolve", status="completed", finished_at=_now(),
+                          output_summary={"release_id": release_id})
+
+            # ── clone ────────────────────────────────────────────────────────
+            _update_stage(pid, "clone", status="running", started_at=_now())
+            cfg, clone_dir = await loop.run_in_executor(
+                _EXECUTOR, lambda: _clone_repo_if_needed(cfg, req.repo_name, req.branch_name)
+            )
+            if not clone_dir:
+                raise ValueError("repo_name is required for /fortify/scan")
+            _update_stage(pid, "clone", status="completed", finished_at=_now(),
+                          output_summary={"clone_dir": clone_dir, "branch": req.branch_name or "(default)"})
+
+            # ── package ──────────────────────────────────────────────────────
+            _update_stage(pid, "package", status="running", started_at=_now())
+            zip_path = os.path.join(clone_dir, "fortify-payload.zip")
+            await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: fscan.package_project(
+                    clone_dir, zip_path, cfg,
+                    timeout=cfg.scancentral_package_timeout_seconds,
+                ),
+            )
+            _update_stage(pid, "package", status="completed", finished_at=_now(),
+                          output_summary={"zip_path": zip_path})
+
+            # ── session ──────────────────────────────────────────────────────
+            _update_stage(pid, "session", status="running", started_at=_now())
+            await loop.run_in_executor(_EXECUTOR, lambda: fscan.ensure_fod_session(cfg))
+            _update_stage(pid, "session", status="completed", finished_at=_now())
+
+            # ── submit ───────────────────────────────────────────────────────
+            _update_stage(pid, "submit", status="running", started_at=_now())
+            fod_scan_id = await loop.run_in_executor(
+                _EXECUTOR, lambda: fscan.start_scan(zip_path, release_id, cfg)
+            )
+            _update_stage(pid, "submit", status="completed", finished_at=_now(),
+                          output_summary={"fod_scan_id": fod_scan_id})
+
+            # ── poll ─────────────────────────────────────────────────────────
+            _update_stage(pid, "poll", status="running", started_at=_now())
+
+            def _progress(info: dict) -> None:
+                _update_stage(pid, "poll", status="running", output_summary=info)
+
+            poll_result = await loop.run_in_executor(
+                _EXECUTOR,
+                lambda: fscan.poll_scan(
+                    release_id, fod_scan_id, cfg,
+                    interval_seconds=cfg.scan_poll_interval_seconds,
+                    timeout_seconds=cfg.scan_poll_timeout_seconds,
+                    on_progress=_progress,
+                ),
+            )
+            _update_stage(pid, "poll", status="completed", finished_at=_now(),
+                          output_summary={"final_status": poll_result.get("status")})
+
+            # Best-effort vulnerability count for the now-scanned release —
+            # non-fatal if it fails, the scan itself already succeeded.
+            vuln_count = None
+            try:
+                if client is None:
+                    client = await loop.run_in_executor(
+                        _EXECUTOR, lambda: FortifyClient.from_config(cfg, persist_token=False)
+                    )
+                vulns = await loop.run_in_executor(
+                    _EXECUTOR, lambda: client.get_vulnerabilities(release_id)
+                )
+                vuln_count = len(vulns)
+            except Exception as exc:
+                print(f"[FortifyScan] Post-scan vulnerability fetch failed: {exc}")
+
+            result = {
+                "app_name": req.app_name,
+                "repo_name": req.repo_name,
+                "branch_name": req.branch_name or "(default)",
+                "release_id": release_id,
+                "fod_scan_id": fod_scan_id,
+                "scan_status": poll_result.get("status"),
+                "vulnerability_count": vuln_count,
+            }
+            succeeded = True
+            _finish_job(pid, "completed", result=result, t0=t0)
+        except Exception as exc:
+            _finish_job(pid, "failed", error=str(exc), t0=t0)
+        finally:
+            _track_end(pid)
+            if clone_dir:
+                if succeeded:
+                    import shutil
+                    shutil.rmtree(clone_dir, ignore_errors=True)
+                else:
+                    print(
+                        f"[FortifyScan] Leaving clone+payload at '{clone_dir}' "
+                        f"for debugging (job {pid} failed)."
+                    )
+
+    asyncio.create_task(_run())
+    return ok({"scan_id": pid, "status": "queued"})
+
+
+@app.get("/fortify/scan/status/{scan_id}", tags=["Fortify Scan"])
+def fortify_scan_status(scan_id: str):
+    """
+    Same shape as GET /pipeline/status/{pipeline_id} — overall status plus
+    the resolve/clone/package/session/submit/poll stage breakdown — scoped
+    to a /fortify/scan job.
+    """
+    job = _store.get_job(scan_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"scan_id '{scan_id}' not found")
+    return ok(_sanitize_job_for_response(job))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
