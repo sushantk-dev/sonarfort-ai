@@ -93,10 +93,24 @@ def _run(
     ``_maven_env`` to cap JVM heap for scancentral's own Maven build
     tool integration). ``None`` inherits the parent process's
     environment unchanged, same as plain ``subprocess.run``.
+
+    stdin is always explicitly closed (DEVNULL) — none of these CLIs
+    (scancentral, fcli) should ever need interactive input from this
+    server process. Without this, a CLI that unexpectedly prompts (an
+    MFA/security-code prompt, a certificate-trust confirmation, etc.)
+    blocks reading from whatever stdin this process inherited — which
+    can hang well past ``timeout`` instead of failing fast, since a
+    blocked read on an inherited-but-unusable stdin doesn't reliably
+    surface as a normal timeout on every platform. Closing it up front
+    means a prompt-shaped hang fails immediately with a clear non-zero
+    exit / EOF error instead of parking a worker thread indefinitely.
     """
-    logger.debug(f"[FortifyScan] Running: {' '.join(_safe_cmd(cmd, redact))}")
+    logger.info(f"[FortifyScan] Running: {' '.join(_safe_cmd(cmd, redact))}")
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired as exc:
         raise FcliError(
             f"Command timed out after {timeout}s: {' '.join(_safe_cmd(cmd, redact))}"
