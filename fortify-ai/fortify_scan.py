@@ -239,13 +239,21 @@ def ensure_fod_session(cfg: FortifyAIConfig, timeout: int = 60) -> None:
     only shells out to `fcli fod session login` when the cached expiry
     is missing or within the buffer window.
     """
+    logger.info(
+        f"[FortifyScan] ensure_fod_session entered "
+        f"(thread={threading.current_thread().name}) — checking cached session freshness."
+    )
     if _session_is_fresh(cfg):
+        logger.info("[FortifyScan] Cached FoD session still fresh — skipping login.")
         return
 
+    logger.info("[FortifyScan] No fresh cached session — acquiring session lock (may wait if another thread is logging in)...")
     with _session_lock:
+        logger.info("[FortifyScan] Session lock acquired.")
         # Re-check after acquiring the lock: another thread on this pod
         # may have just refreshed it while we were waiting.
         if _session_is_fresh(cfg):
+            logger.info("[FortifyScan] Session became fresh while waiting for the lock — skipping login.")
             return
 
         missing = [

@@ -2462,6 +2462,34 @@ async def run_fortify_scan(req: FortifyScanRequest):
         succeeded = False
         _store.update_job(pid, status="running")
         _track_start(pid)
+
+        async def _stage(fn, timeout_s: float, stage_name: str):
+            """
+            Run *fn* (a zero-arg callable) in the shared executor with a
+            hard wall-clock ceiling.
+
+            Without this, any hang inside a stage — a subprocess that
+            doesn't respect its own timeout, a lock wait behind another
+            stuck request, thread-pool exhaustion — leaves the job stuck
+            at "running" forever with zero visibility, since nothing ever
+            raises to reach the except/finish_job below. wait_for can't
+            forcibly kill a blocking OS thread (Python has no API for
+            that), so a genuinely wedged worker thread may still occupy a
+            slot in `_EXECUTOR` afterward — but the job itself now always
+            reaches a terminal status within `timeout_s`, which is what
+            actually matters for anyone watching GET /fortify/scan/status.
+            """
+            try:
+                return await asyncio.wait_for(loop.run_in_executor(_EXECUTOR, fn), timeout=timeout_s)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"Stage '{stage_name}' did not finish within {timeout_s:.0f}s and was "
+                    f"abandoned. If this keeps happening, check the server logs for what "
+                    f"'{stage_name}' was actually doing (or hung on) — a wedged worker "
+                    f"thread cannot be forcibly killed, so it may still be occupying a "
+                    f"slot in the shared thread pool even though this job has now failed."
+                ) from exc
+
         try:
             from fortify_client import FortifyClient
             import fortify_scan as fscan
@@ -2481,19 +2509,18 @@ async def run_fortify_scan(req: FortifyScanRequest):
             _update_stage(pid, "resolve", status="running", started_at=_now())
             release_id = req.release_id
             if release_id is None:
-                client = await loop.run_in_executor(
-                    _EXECUTOR, lambda: FortifyClient.from_config(cfg, persist_token=False)
-                )
-                release_id = await loop.run_in_executor(
-                    _EXECUTOR, lambda: client.resolve_release_id_from_app_name(req.app_name)
-                )
+                def _resolve():
+                    c = FortifyClient.from_config(cfg, persist_token=False)
+                    return c, c.resolve_release_id_from_app_name(req.app_name)
+                client, release_id = await _stage(_resolve, 90, "resolve")
             _update_stage(pid, "resolve", status="completed", finished_at=_now(),
                           output_summary={"release_id": release_id})
 
             # ── clone ────────────────────────────────────────────────────────
             _update_stage(pid, "clone", status="running", started_at=_now())
-            cfg, clone_dir = await loop.run_in_executor(
-                _EXECUTOR, lambda: _clone_repo_if_needed(cfg, req.repo_name, req.branch_name)
+            cfg, clone_dir = await _stage(
+                lambda: _clone_repo_if_needed(cfg, req.repo_name, req.branch_name),
+                330, "clone",
             )
             if not clone_dir:
                 raise ValueError("repo_name is required for /fortify/scan")
@@ -2503,25 +2530,25 @@ async def run_fortify_scan(req: FortifyScanRequest):
             # ── package ──────────────────────────────────────────────────────
             _update_stage(pid, "package", status="running", started_at=_now())
             zip_path = os.path.join(clone_dir, "fortify-payload.zip")
-            await loop.run_in_executor(
-                _EXECUTOR,
+            await _stage(
                 lambda: fscan.package_project(
                     clone_dir, zip_path, cfg,
                     timeout=cfg.scancentral_package_timeout_seconds,
                 ),
+                cfg.scancentral_package_timeout_seconds + 60, "package",
             )
             _update_stage(pid, "package", status="completed", finished_at=_now(),
                           output_summary={"zip_path": zip_path})
 
             # ── session ──────────────────────────────────────────────────────
             _update_stage(pid, "session", status="running", started_at=_now())
-            await loop.run_in_executor(_EXECUTOR, lambda: fscan.ensure_fod_session(cfg))
+            await _stage(lambda: fscan.ensure_fod_session(cfg), 90, "session")
             _update_stage(pid, "session", status="completed", finished_at=_now())
 
             # ── submit ───────────────────────────────────────────────────────
             _update_stage(pid, "submit", status="running", started_at=_now())
-            fod_scan_id = await loop.run_in_executor(
-                _EXECUTOR, lambda: fscan.start_scan(zip_path, release_id, cfg)
+            fod_scan_id = await _stage(
+                lambda: fscan.start_scan(zip_path, release_id, cfg), 330, "submit",
             )
             _update_stage(pid, "submit", status="completed", finished_at=_now(),
                           output_summary={"fod_scan_id": fod_scan_id})
@@ -2532,14 +2559,14 @@ async def run_fortify_scan(req: FortifyScanRequest):
             def _progress(info: dict) -> None:
                 _update_stage(pid, "poll", status="running", output_summary=info)
 
-            poll_result = await loop.run_in_executor(
-                _EXECUTOR,
+            poll_result = await _stage(
                 lambda: fscan.poll_scan(
                     release_id, fod_scan_id, cfg,
                     interval_seconds=cfg.scan_poll_interval_seconds,
                     timeout_seconds=cfg.scan_poll_timeout_seconds,
                     on_progress=_progress,
                 ),
+                cfg.scan_poll_timeout_seconds + 120, "poll",
             )
             _update_stage(pid, "poll", status="completed", finished_at=_now(),
                           output_summary={"final_status": poll_result.get("status")})
@@ -2549,12 +2576,10 @@ async def run_fortify_scan(req: FortifyScanRequest):
             vuln_count = None
             try:
                 if client is None:
-                    client = await loop.run_in_executor(
-                        _EXECUTOR, lambda: FortifyClient.from_config(cfg, persist_token=False)
+                    client = await _stage(
+                        lambda: FortifyClient.from_config(cfg, persist_token=False), 60, "vuln-fetch-auth",
                     )
-                vulns = await loop.run_in_executor(
-                    _EXECUTOR, lambda: client.get_vulnerabilities(release_id)
-                )
+                vulns = await _stage(lambda: client.get_vulnerabilities(release_id), 60, "vuln-fetch")
                 vuln_count = len(vulns)
             except Exception as exc:
                 print(f"[FortifyScan] Post-scan vulnerability fetch failed: {exc}")
