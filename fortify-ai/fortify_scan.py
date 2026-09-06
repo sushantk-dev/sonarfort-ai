@@ -299,7 +299,6 @@ def ensure_fod_session(cfg: FortifyAIConfig, timeout: int = 60) -> None:
             "-u", _strip_domain_prefix(cfg.fortify_username),
             "-p", cfg.fortify_password,
             "--tenant", cfg.fod_tenant,
-            "--session", cfg.fod_session_name,
             "--output=json",
         ]
         result = _run(cmd, timeout=timeout, redact=cfg.fortify_password)
