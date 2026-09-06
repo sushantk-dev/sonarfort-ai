@@ -7,7 +7,7 @@ shell, container, or orchestrator running this service.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 from typing import Optional
 
 
@@ -270,6 +270,18 @@ class FortifyAIConfig(BaseSettings):
         default="NonRemediationScanOnly",
         description="Value passed to `fcli fod sast-scan start --remediation-preference`.",
     )
+    fod_submit_timeout_seconds: int = Field(
+        default=1800,
+        ge=60,
+        description=(
+            "Subprocess timeout for `fcli fod sast-scan start` — this call "
+            "uploads the packaged zip to FoD in chunks, which can take a "
+            "long time for a large repo over a slow connection. 300s was "
+            "the original placeholder default and is too short for a real "
+            "upload; raise further if you're still seeing timeouts here on "
+            "very large payloads."
+        ),
+    )
     scan_poll_interval_seconds: int = Field(
         default=60,
         ge=5,
@@ -290,6 +302,24 @@ class FortifyAIConfig(BaseSettings):
     def get_scancentral_exclude_patterns(self) -> list[str]:
         """Parse the colon-separated scancentral exclude patterns into a list."""
         return [p.strip() for p in self.scancentral_exclude_patterns.split(":") if p.strip()]
+
+    # Env vars for executable/jar paths are easy to accidentally set WITH
+    # the quotes needed for shell quoting still attached (e.g.
+    # FCLI_JAR_PATH="C:\path\fcli.jar") — those quote characters then
+    # become literal, non-existent path text once read as a raw env var
+    # value (subprocess.run doesn't go through a shell, so it never strips
+    # them). Strip one layer of wrapping quotes and surrounding whitespace
+    # so a copy-pasted, shell-quoted value still works instead of failing
+    # with a cryptic "Unable to access jarfile "..."" / "Executable not
+    # found" error that looks like a wrong path rather than a formatting
+    # mistake.
+    @field_validator("scancentral_exe", "fcli_jar_path", mode="after")
+    @classmethod
+    def _strip_wrapping_quotes(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
+        return value
 
 
 def load_config() -> FortifyAIConfig:

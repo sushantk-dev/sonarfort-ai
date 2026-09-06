@@ -83,11 +83,26 @@ def _run(
     env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """
-    subprocess.run wrapper with consistent timeout/not-found handling.
+    subprocess wrapper with consistent timeout/not-found handling that
+    streams output line-by-line to the log as it arrives, instead of
+    buffering it all silently until the command finishes.
+
+    ``subprocess.run(capture_output=True)`` (the previous implementation)
+    only hands back stdout/stderr once the whole process exits — for a
+    long-running call like fcli's chunked FoD upload, that means zero
+    visibility for however long it takes, then everything dumped at once.
+    This uses Popen + a background watchdog timer instead: each line is
+    logged the moment it's read, and the timeout is enforced by wall
+    clock regardless of whether the child is producing output at all
+    (so a genuinely silent hang still gets killed on schedule, same
+    guarantee as before). Whether this actually shows *progress* depends
+    on the child process itself emitting anything incremental — if
+    fcli only prints a final JSON block with nothing in between, that's
+    what you'll still see, just as it's produced rather than buffered.
 
     ``redact`` — a literal value (e.g. a password) to scrub from any
-    exception message so it never ends up in logs or a failed job's
-    stored error string.
+    logged line or exception message so it never ends up in logs or a
+    failed job's stored error string.
 
     ``env`` — full environment dict for the subprocess (e.g. from
     ``_maven_env`` to cap JVM heap for scancentral's own Maven build
@@ -98,25 +113,46 @@ def _run(
     (scancentral, fcli) should ever need interactive input from this
     server process. Without this, a CLI that unexpectedly prompts (an
     MFA/security-code prompt, a certificate-trust confirmation, etc.)
-    blocks reading from whatever stdin this process inherited — which
-    can hang well past ``timeout`` instead of failing fast, since a
-    blocked read on an inherited-but-unusable stdin doesn't reliably
-    surface as a normal timeout on every platform. Closing it up front
-    means a prompt-shaped hang fails immediately with a clear non-zero
-    exit / EOF error instead of parking a worker thread indefinitely.
+    blocks reading from whatever stdin this process inherited.
     """
     logger.info(f"[FortifyScan] Running: {' '.join(_safe_cmd(cmd, redact))}")
+
     try:
-        return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env,
-            stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=env, stdin=subprocess.DEVNULL,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise FcliError(
-            f"Command timed out after {timeout}s: {' '.join(_safe_cmd(cmd, redact))}"
-        ) from exc
     except FileNotFoundError as exc:
         raise FcliError(f"Executable not found on PATH: {cmd[0]!r}") from exc
+
+    timed_out = threading.Event()
+
+    def _kill_on_timeout() -> None:
+        timed_out.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, _kill_on_timeout)
+    watchdog.start()
+
+    output_lines: list[str] = []
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output_lines.append(line)
+            logged = _safe_cmd([line.rstrip()], redact)[0]
+            logger.info(f"[FortifyScan]   {logged}")
+        proc.wait()
+    finally:
+        watchdog.cancel()
+
+    if timed_out.is_set():
+        raise FcliError(
+            f"Command timed out after {timeout}s: {' '.join(_safe_cmd(cmd, redact))}"
+        )
+
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode, stdout="".join(output_lines), stderr="",
+    )
 
 
 # Fixed JVM heap cap for scancentral's own Maven build-tool integration —
@@ -299,6 +335,7 @@ def ensure_fod_session(cfg: FortifyAIConfig, timeout: int = 60) -> None:
             "-u", _strip_domain_prefix(cfg.fortify_username),
             "-p", cfg.fortify_password,
             "--tenant", cfg.fod_tenant,
+            "--session", cfg.fod_session_name,
             "--output=json",
         ]
         result = _run(cmd, timeout=timeout, redact=cfg.fortify_password)
@@ -352,7 +389,7 @@ def start_scan(
     zip_path: str,
     release_id: int,
     cfg: FortifyAIConfig,
-    timeout: int = 300,
+    timeout: int = 1800,
 ) -> str:
     """
     Upload the packaged zip and start a SAST scan against ``release_id``:
@@ -362,8 +399,22 @@ def start_scan(
 
     Returns the fcli-assigned scan id.
 
-    Raises FcliError on non-zero exit or an unparseable response.
+    Raises:
+        ScanCentralError — ``zip_path`` doesn't exist at call time (distinct
+                            from an upload timeout — see FcliError below).
+        FcliError — non-zero exit, an unparseable response, or the upload
+                    itself exceeding ``timeout`` (default 1800s — chunked
+                    uploads of a large payload over a slow connection can
+                    legitimately take a while; raise
+                    config.fod_submit_timeout_seconds further if needed).
     """
+    if not Path(zip_path).exists():
+        raise ScanCentralError(
+            f"Payload zip '{zip_path}' does not exist at submit time — it "
+            "may have been cleaned up already, or scancentral wrote it "
+            "somewhere else. Check the 'package' stage's output_summary "
+            "for the actual zip_path it reported."
+        )
     cmd = _fcli_base_cmd(cfg) + [
         "fod", "sast-scan", "start",
         f"-f={zip_path}",

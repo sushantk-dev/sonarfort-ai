@@ -2548,7 +2548,10 @@ async def run_fortify_scan(req: FortifyScanRequest):
             # ── submit ───────────────────────────────────────────────────────
             _update_stage(pid, "submit", status="running", started_at=_now())
             fod_scan_id = await _stage(
-                lambda: fscan.start_scan(zip_path, release_id, cfg), 330, "submit",
+                lambda: fscan.start_scan(
+                    zip_path, release_id, cfg, timeout=cfg.fod_submit_timeout_seconds,
+                ),
+                cfg.fod_submit_timeout_seconds + 60, "submit",
             )
             _update_stage(pid, "submit", status="completed", finished_at=_now(),
                           output_summary={"fod_scan_id": fod_scan_id})
