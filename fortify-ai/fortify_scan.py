@@ -87,18 +87,22 @@ def _run(
     streams output line-by-line to the log as it arrives, instead of
     buffering it all silently until the command finishes.
 
-    ``subprocess.run(capture_output=True)`` (the previous implementation)
-    only hands back stdout/stderr once the whole process exits — for a
-    long-running call like fcli's chunked FoD upload, that means zero
-    visibility for however long it takes, then everything dumped at once.
-    This uses Popen + a background watchdog timer instead: each line is
-    logged the moment it's read, and the timeout is enforced by wall
-    clock regardless of whether the child is producing output at all
-    (so a genuinely silent hang still gets killed on schedule, same
-    guarantee as before). Whether this actually shows *progress* depends
-    on the child process itself emitting anything incremental — if
-    fcli only prints a final JSON block with nothing in between, that's
-    what you'll still see, just as it's produced rather than buffered.
+    ``timeout`` is an **idle/inactivity timeout**, not a total wall-clock
+    cap: it resets every time a line of output is read, and only fires
+    if the child goes completely silent for that long. A slow-but-active
+    upload that keeps printing progress can run indefinitely without
+    being killed; a genuinely wedged process (no output at all) still
+    gets killed after ``timeout`` seconds either way. This matters for
+    calls like fcli's chunked FoD upload, which can legitimately take
+    much longer than any single fixed cap while still actively working —
+    a plain wall-clock timeout would kill a slow-but-healthy upload for
+    no good reason.
+
+    Whether you actually see incremental progress lines at all still
+    depends on the child process itself emitting something — if fcli
+    only prints a final JSON block with nothing in between, the idle
+    clock is effectively counting from process start to that single
+    burst of output, same as a wall-clock timeout would in that case.
 
     ``redact`` — a literal value (e.g. a password) to scrub from any
     logged line or exception message so it never ends up in logs or a
@@ -126,28 +130,43 @@ def _run(
         raise FcliError(f"Executable not found on PATH: {cmd[0]!r}") from exc
 
     timed_out = threading.Event()
+    stop_watchdog = threading.Event()
+    activity_lock = threading.Lock()
+    last_activity = time.time()
 
-    def _kill_on_timeout() -> None:
-        timed_out.set()
-        proc.kill()
+    def _watchdog() -> None:
+        # Polls rather than using a single Timer, because the timer needs
+        # to be able to keep getting pushed back on every line of output
+        # instead of firing on a fixed schedule from process start.
+        while not stop_watchdog.wait(1):
+            with activity_lock:
+                idle_for = time.time() - last_activity
+            if idle_for > timeout:
+                timed_out.set()
+                proc.kill()
+                return
 
-    watchdog = threading.Timer(timeout, _kill_on_timeout)
-    watchdog.start()
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
 
     output_lines: list[str] = []
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            with activity_lock:
+                last_activity = time.time()
             output_lines.append(line)
             logged = _safe_cmd([line.rstrip()], redact)[0]
             logger.info(f"[FortifyScan]   {logged}")
         proc.wait()
     finally:
-        watchdog.cancel()
+        stop_watchdog.set()
+        watchdog_thread.join(timeout=2)
 
     if timed_out.is_set():
         raise FcliError(
-            f"Command timed out after {timeout}s: {' '.join(_safe_cmd(cmd, redact))}"
+            f"Command produced no output for {timeout}s and was killed "
+            f"(idle timeout, not a total-time cap): {' '.join(_safe_cmd(cmd, redact))}"
         )
 
     return subprocess.CompletedProcess(
