@@ -61,6 +61,7 @@ const STAGE_LABELS: Record<StageKey, string> = {
 };
 
 const POLL_INTERVAL_MS = 4000;
+const FORTIFY_DOMAIN_PREFIX = 'equifax\\';
 
 @Component({
   selector: 'app-fortify-scan',
@@ -78,9 +79,12 @@ export class FortifyScanComponent {
   branchName     = signal('');       // optional — default branch if empty
   releaseId      = signal('');       // optional — string so the input can be blank
   githubToken    = signal('');
-  fortifyUsername = signal('');      // plain username, no domain prefix — FoD login
-                                      // (unlike SSC OAuth) takes it bare; --tenant
-                                      // carries the org, e.g. -u sushant.kumar --tenant equifax
+  fortifyUsername = signal('');      // domain prefix ("equifax\") added automatically
+                                      // on submit — needed for the SSC-style release
+                                      // resolve step; the backend strips it back off
+                                      // again specifically for the FoD fcli login,
+                                      // which wants the bare form (see fortify_scan.py's
+                                      // _strip_domain_prefix).
   fortifyPassword  = signal('');
 
   showForm    = signal(true);        // form starts open — nothing to hide behind yet
@@ -102,6 +106,15 @@ export class FortifyScanComponent {
     const id = this.selectedId();
     return id ? (this.jobs()[id] ?? null) : null;
   });
+
+  /** Prepend the "equifax\" domain prefix Fortify SSC OAuth expects, once. */
+  private _domainQualify(username: string): string {
+    const trimmed = username.trim();
+    if (!trimmed) return '';
+    return trimmed.toLowerCase().startsWith(FORTIFY_DOMAIN_PREFIX.toLowerCase())
+      ? trimmed
+      : `${FORTIFY_DOMAIN_PREFIX}${trimmed}`;
+  }
 
   canSubmit(): boolean {
     return !!(
@@ -126,7 +139,7 @@ export class FortifyScanComponent {
       ...(this.branchName().trim() ? { branch_name: this.branchName().trim() } : {}),
       ...(this.releaseId().trim()  ? { release_id: Number(this.releaseId().trim()) } : {}),
       github_token:      this.githubToken().trim(),
-      fortify_username:  this.fortifyUsername().trim(),
+      fortify_username:  this._domainQualify(this.fortifyUsername()),
       fortify_password:  this.fortifyPassword(),
     };
 
