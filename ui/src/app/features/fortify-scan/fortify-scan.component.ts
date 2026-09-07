@@ -47,7 +47,7 @@ interface ScanRun {
   startedAt: number;
 }
 
-const STAGE_ORDER = ['resolve', 'clone', 'package', 'session', 'submit', 'poll'] as const;
+const STAGE_ORDER = ['resolve', 'clone', 'package', 'session', 'setup', 'submit', 'poll'] as const;
 type StageKey = typeof STAGE_ORDER[number];
 
 const STAGE_LABELS: Record<StageKey, string> = {
@@ -55,12 +55,12 @@ const STAGE_LABELS: Record<StageKey, string> = {
   clone:   'Clone Repository',
   package: 'ScanCentral Package',
   session: 'FoD Session',
+  setup:   'Configure Scan Setup',
   submit:  'Submit Scan',
   poll:    'Poll to Completion',
 };
 
 const POLL_INTERVAL_MS = 4000;
-const FORTIFY_DOMAIN_PREFIX = 'equifax\\';
 
 @Component({
   selector: 'app-fortify-scan',
@@ -78,7 +78,9 @@ export class FortifyScanComponent {
   branchName     = signal('');       // optional — default branch if empty
   releaseId      = signal('');       // optional — string so the input can be blank
   githubToken    = signal('');
-  fortifyUsername = signal('');      // WITHOUT the "equifax\" prefix — added on submit
+  fortifyUsername = signal('');      // plain username, no domain prefix — FoD login
+                                      // (unlike SSC OAuth) takes it bare; --tenant
+                                      // carries the org, e.g. -u sushant.kumar --tenant equifax
   fortifyPassword  = signal('');
 
   showForm    = signal(true);        // form starts open — nothing to hide behind yet
@@ -100,15 +102,6 @@ export class FortifyScanComponent {
     const id = this.selectedId();
     return id ? (this.jobs()[id] ?? null) : null;
   });
-
-  /** Prepend the "equifax\" domain prefix Fortify OAuth expects, once. */
-  private _domainQualify(username: string): string {
-    const trimmed = username.trim();
-    if (!trimmed) return '';
-    return trimmed.toLowerCase().startsWith(FORTIFY_DOMAIN_PREFIX.toLowerCase())
-      ? trimmed
-      : `${FORTIFY_DOMAIN_PREFIX}${trimmed}`;
-  }
 
   canSubmit(): boolean {
     return !!(
@@ -133,7 +126,7 @@ export class FortifyScanComponent {
       ...(this.branchName().trim() ? { branch_name: this.branchName().trim() } : {}),
       ...(this.releaseId().trim()  ? { release_id: Number(this.releaseId().trim()) } : {}),
       github_token:      this.githubToken().trim(),
-      fortify_username:  this._domainQualify(this.fortifyUsername()),
+      fortify_username:  this.fortifyUsername().trim(),
       fortify_password:  this.fortifyPassword(),
     };
 

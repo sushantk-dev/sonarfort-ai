@@ -431,6 +431,51 @@ def _extract_scan_id(stdout: str) -> Optional[str]:
     return str(value) if value is not None else None
 
 
+def setup_scan(
+    release_id: int,
+    cfg: FortifyAIConfig,
+    timeout: Optional[int] = None,
+) -> None:
+    """
+    Configure the release's assessment type/entitlement/tech stack in FoD
+    before a scan can be submitted — must run before ``start_scan``.
+    Mirrors the working CI pipeline's call exactly:
+
+        fcli fod sast-scan setup --assessment-type=<...> --frequency <...>
+            --technology-stack=<...> --language-level=<...> [--oss]
+            --audit-preference=<...> --release=<release_id>
+            -o table=assessmentTypeId,entitlementId,entitlementFrequencyType,
+                     releaseId,technologyStack,languageLevel,performOpenSourceAnalysis
+
+    The table output columns aren't parsed/returned — the CI pipeline
+    doesn't feed them into its own `start` call either (its `start`
+    command's args are identical with or without them); `setup`'s job is
+    the side effect of configuring the release in FoD, not producing a
+    value this code needs downstream.
+
+    Raises FcliError on non-zero exit.
+    """
+    cmd = _fcli_base_cmd(cfg) + [
+        "fod", "sast-scan", "setup",
+        f"--assessment-type={cfg.fod_assessment_type}",
+        "--frequency", cfg.fod_scan_frequency,
+        f"--technology-stack={cfg.fod_technology_stack}",
+        f"--language-level={cfg.fod_language_level}",
+        *(["--oss"] if cfg.fod_oss_scan else []),
+        f"--audit-preference={cfg.fod_audit_preference}",
+        f"--release={release_id}",
+        "-o", "table=assessmentTypeId,entitlementId,entitlementFrequencyType,"
+              "releaseId,technologyStack,languageLevel,performOpenSourceAnalysis",
+    ]
+    result = _run(cmd, timeout=timeout or cfg.fod_setup_timeout_seconds)
+    if result.returncode != 0:
+        raise FcliError(
+            f"fcli fod sast-scan setup failed (exit {result.returncode}):\n"
+            f"{(result.stderr or result.stdout)[-1000:]}"
+        )
+    logger.info(f"[FortifyScan] SAST scan setup complete — release={release_id}")
+
+
 def start_scan(
     zip_path: str,
     release_id: int,

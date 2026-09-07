@@ -2452,7 +2452,7 @@ async def run_fortify_scan(req: FortifyScanRequest):
     are left on disk (path is in the `clone` stage's output_summary) for
     debugging.
     """
-    job = _new_job(stages=["resolve", "clone", "package", "session", "submit", "poll"])
+    job = _new_job(stages=["resolve", "clone", "package", "session", "setup", "submit", "poll"])
     pid = job["pipeline_id"]
 
     async def _run():
@@ -2544,6 +2544,17 @@ async def run_fortify_scan(req: FortifyScanRequest):
             _update_stage(pid, "session", status="running", started_at=_now())
             await _stage(lambda: fscan.ensure_fod_session(cfg), 90, "session")
             _update_stage(pid, "session", status="completed", finished_at=_now())
+
+            # ── setup ────────────────────────────────────────────────────────
+            # Must run before submit — configures the release's assessment
+            # type/entitlement/tech stack in FoD (mirrors the working CI
+            # pipeline, which also calls `sast-scan setup` before `start`).
+            _update_stage(pid, "setup", status="running", started_at=_now())
+            await _stage(
+                lambda: fscan.setup_scan(release_id, cfg, timeout=cfg.fod_setup_timeout_seconds),
+                cfg.fod_setup_timeout_seconds + 30, "setup",
+            )
+            _update_stage(pid, "setup", status="completed", finished_at=_now())
 
             # ── submit ───────────────────────────────────────────────────────
             _update_stage(pid, "submit", status="running", started_at=_now())

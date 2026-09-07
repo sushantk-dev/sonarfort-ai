@@ -270,6 +270,42 @@ class FortifyAIConfig(BaseSettings):
         default="NonRemediationScanOnly",
         description="Value passed to `fcli fod sast-scan start --remediation-preference`.",
     )
+
+    # ── fcli / FoD — scan setup (must run before sast-scan start) ────────────
+    # Mirrors the working CI pipeline's `fcli fod sast-scan setup` call —
+    # configures the release's assessment type/entitlement/tech stack in FoD
+    # before a scan can be submitted against it. Defaults match that
+    # pipeline's values; override per-environment if a different tech stack
+    # /assessment type is needed.
+    fod_assessment_type: str = Field(
+        default="Static Assessment",
+        description="Value passed to `fcli fod sast-scan setup --assessment-type`.",
+    )
+    fod_scan_frequency: str = Field(
+        default="Subscription",
+        description="Value passed to `fcli fod sast-scan setup --frequency`.",
+    )
+    fod_technology_stack: str = Field(
+        default="JAVA/J2EE/Kotlin",
+        description="Value passed to `fcli fod sast-scan setup --technology-stack`.",
+    )
+    fod_language_level: str = Field(
+        default="1.8",
+        description="Value passed to `fcli fod sast-scan setup --language-level`.",
+    )
+    fod_audit_preference: str = Field(
+        default="Automated",
+        description="Value passed to `fcli fod sast-scan setup --audit-preference`.",
+    )
+    fod_oss_scan: bool = Field(
+        default=True,
+        description="Whether to pass `--oss` (open-source analysis) to `fcli fod sast-scan setup`.",
+    )
+    fod_setup_timeout_seconds: int = Field(
+        default=120,
+        ge=10,
+        description="Idle timeout for `fcli fod sast-scan setup` — a quick config call, not an upload.",
+    )
     fod_submit_timeout_seconds: int = Field(
         default=1800,
         ge=60,
