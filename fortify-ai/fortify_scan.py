@@ -354,6 +354,7 @@ def ensure_fod_session(cfg: FortifyAIConfig, timeout: int = 60) -> None:
             "-u", _strip_domain_prefix(cfg.fortify_username),
             "-p", cfg.fortify_password,
             "--tenant", cfg.fod_tenant,
+            "--session", cfg.fod_session_name,
             "--output=json",
         ]
         result = _run(cmd, timeout=timeout, redact=cfg.fortify_password)
@@ -383,24 +384,52 @@ def invalidate_fod_session(cfg: FortifyAIConfig) -> None:
 
 # ── SAST scan submit + poll ───────────────────────────────────────────────────
 
+def _extract_json_object(text: str) -> Optional[dict | list]:
+    """
+    Find and parse the trailing JSON object/array in *text*.
+
+    fcli's `--output=json` doesn't mean stdout *is* JSON — plain-text
+    progress lines (e.g. `Upload fortify-payload.zip: N of M bytes
+    complete`, one line per chunk) are interleaved with, and precede,
+    the actual JSON result. ``json.loads()`` on the whole captured
+    output fails outright because of that leading noise, even when the
+    command genuinely succeeded — confirmed against a real run where a
+    valid `{"scanId": ..., "__action__": "STARTED"}` was misreported as
+    "no parseable scan id" purely because of this.
+
+    Scans backward from the last '{' or '[' in the text and tries each
+    candidate substring to end-of-text, falling back to the next one
+    further back if a given '{'/'[' turns out to be inside a progress
+    line rather than the real start of the JSON block.
+    """
+    for opener, closer in (("{", "}"), ("[", "]")):
+        idx = text.rfind(opener)
+        while idx != -1:
+            candidate = text[idx:].strip()
+            if candidate.endswith(closer):
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+            idx = text.rfind(opener, 0, idx)
+    return None
+
+
 def _extract_scan_id(stdout: str) -> Optional[str]:
     """
     Parse the scan id out of `fcli fod sast-scan start --output=json`.
 
-    fcli's JSON output can be a single object or a list of one — handle
-    both. Key name is a best guess ('id' / 'scanId' / 'Id') — VERIFY
-    against real output for your fcli version; see module docstring.
+    Confirmed against real output: the field is ``scanId`` (an int in
+    the JSON, returned here as a string). ``id``/``Id`` kept as
+    fallbacks in case this varies across fcli versions.
     """
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    data = _extract_json_object(stdout)
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
         return None
-    value = data.get("id") or data.get("scanId") or data.get("Id")
-    return str(value) if value else None
+    value = data.get("scanId") or data.get("id") or data.get("Id")
+    return str(value) if value is not None else None
 
 
 def start_scan(
@@ -463,11 +492,14 @@ _TERMINAL_STATUSES = {"Completed", "Canceled", "Cancelled", "Failed"}
 
 
 def _extract_status(stdout: str) -> Optional[str]:
-    """Best-guess status field extraction — see module docstring caveat."""
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    """
+    Parse scan status out of `fcli fod sast-scan wait-for --output=json`.
+
+    Confirmed field name from real output: ``analysisStatusType``.
+    Same trailing-JSON-among-progress-noise handling as
+    ``_extract_scan_id`` — see ``_extract_json_object``.
+    """
+    data = _extract_json_object(stdout)
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
