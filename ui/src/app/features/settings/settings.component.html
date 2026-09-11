@@ -119,51 +119,6 @@
           </div>
         </div>
 
-        <div class="section">
-          <div class="section__head">
-            <div class="section__title">Confidence Thresholds</div>
-            <div class="section__desc">Determines which outcome each fixed issue receives</div>
-          </div>
-          <div class="fields">
-            <div class="field">
-              <label class="field__label">HIGH — opens a normal PR</label>
-              <div class="slider-row">
-                <input type="range" class="slider" min="0" max="1" step="0.05"
-                       [value]="cfg.highThresh"
-                       (input)="patch('highThresh', +$any($event.target).value)">
-                <span class="slider-val slider-val--success">
-                  {{ cfg.highThresh | number:'1.2-2' }}
-                </span>
-              </div>
-            </div>
-            <div class="field">
-              <label class="field__label">MEDIUM — opens a draft PR</label>
-              <div class="slider-row">
-                <input type="range" class="slider" min="0" max="1" step="0.05"
-                       [value]="cfg.medThresh"
-                       (input)="patch('medThresh', +$any($event.target).value)">
-                <span class="slider-val slider-val--warn">
-                  {{ cfg.medThresh | number:'1.2-2' }}
-                </span>
-              </div>
-            </div>
-          </div>
-          <div class="thresh-legend">
-            <div class="thresh-row thresh-row--success">
-              <span class="thresh-dot"></span>
-              ≥ {{ cfg.highThresh | number:'1.2-2' }} → PR opened + CODEOWNERS assigned
-            </div>
-            <div class="thresh-row thresh-row--warn">
-              <span class="thresh-dot"></span>
-              ≥ {{ cfg.medThresh | number:'1.2-2' }} → Draft PR + review requested
-            </div>
-            <div class="thresh-row thresh-row--danger">
-              <span class="thresh-dot"></span>
-              Below {{ cfg.medThresh | number:'1.2-2' }} → Escalation .md written
-            </div>
-          </div>
-        </div>
-
       </ng-container>
 
       <!-- ════ INTEGRATIONS ════ -->
@@ -228,29 +183,9 @@
         <div class="section">
           <div class="section__head">
             <div class="section__title">LLM Agent Chain</div>
-            <div class="section__desc">Planner → Generator → Critic temperatures and retry limit</div>
+            <div class="section__desc">Critic retry limit</div>
           </div>
           <div class="fields">
-            <div class="field">
-              <div class="field__label-row">
-                <label class="field__label">Planner temperature</label>
-                <span class="field__val">{{ cfg.plannerTemp }}</span>
-              </div>
-              <input type="range" class="slider" min="0" max="1" step="0.1"
-                     [value]="cfg.plannerTemp"
-                     (input)="patch('plannerTemp', +$any($event.target).value)">
-              <span class="field__hint">Lower = more deterministic reasoning</span>
-            </div>
-            <div class="field">
-              <div class="field__label-row">
-                <label class="field__label">Generator temperature</label>
-                <span class="field__val">{{ cfg.generatorTemp }}</span>
-              </div>
-              <input type="range" class="slider" min="0" max="1" step="0.1"
-                     [value]="cfg.generatorTemp"
-                     (input)="patch('generatorTemp', +$any($event.target).value)">
-              <span class="field__hint">Lower = more consistent diffs</span>
-            </div>
             <div class="field">
               <label class="field__label">Max Critic Retries</label>
               <input class="input input--sm" type="number"

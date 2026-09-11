@@ -539,6 +539,23 @@ class FortifyClient:
         )
         return releases
 
+    def get_release(self, release_id: int) -> dict:
+        """
+        GET /api/v3/releases/{releaseId}
+
+        Returns the raw release resource — used by /fortify/scan/poll to
+        read the release's current scan status (expected field:
+        ``currentAnalysisStatusType`` — matches the same status vocabulary
+        fcli's `sast-scan` commands use: Pending/Scanning/Completed/etc.,
+        confirmed against real fcli output in fortify_scan.py, but NOT
+        independently confirmed against this particular REST resource's
+        exact field name — verify against a real response and adjust
+        ``poll_scan_status`` in fortify_scan.py if it differs).
+        """
+        logger.info(f"[FortifyClient] Fetching release {release_id}")
+        path = f"/api/v3/releases/{release_id}"
+        return self._get(path)
+
     def get_vulnerabilities(self, release_id: int) -> list[dict]:
         """
         GET /api/v3/releases/{releaseId}/vulnerabilities
@@ -550,6 +567,11 @@ class FortifyClient:
 
         Client-side filter also applied for robustness (API filter availability
         varies by SSC version).
+
+        NOTE: this is the OSS-only view used by the dependency-remediation
+        pipeline. For a full SAST scan's findings (which span many more
+        categories than just Open Source — SQL injection, XSS, etc.), use
+        ``get_all_vulnerabilities`` instead.
         """
         logger.info(f"[FortifyClient] Fetching vulnerabilities for release {release_id}")
 
@@ -572,6 +594,27 @@ class FortifyClient:
             f"[FortifyClient] {len(vulns)} OSS vulnerability/ies returned "
             f"(of {len(raw)} total items before client filter)"
         )
+        return vulns
+
+    def get_all_vulnerabilities(self, release_id: int) -> list[dict]:
+        """
+        GET /api/v3/releases/{releaseId}/vulnerabilities — unfiltered.
+
+        Unlike ``get_vulnerabilities``, does NOT restrict to category
+        "Open Source" — a real SAST scan (/fortify/scan) produces findings
+        across many categories (SQL Injection, XSS, Path Manipulation,
+        etc.), not just OSS dependency issues, so a full finding list needs
+        every category. Only the isSuppressed:false filter is kept.
+
+        Used by /fortify/scan/poll to compute severity counts once a scan
+        completes.
+        """
+        logger.info(f"[FortifyClient] Fetching all vulnerabilities for release {release_id}")
+        path = f"/api/v3/releases/{release_id}/vulnerabilities"
+        params = {"filters": "isSuppressed:false"}
+        raw = self._get_all_pages(path, params)
+        vulns = [v for v in raw if not v.get("isSuppressed", False)]
+        logger.info(f"[FortifyClient] {len(vulns)} vulnerability/ies returned (all categories)")
         return vulns
 
     def get_recommendations(self, release_id: int, vuln_id: str) -> dict:

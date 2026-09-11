@@ -6,7 +6,7 @@
       <h1>Fortify Scan</h1>
       <p class="meta">Package a repo with ScanCentral and submit a new SAST scan to Fortify on Demand</p>
     </div>
-    <button class="run-btn" (click)="newScan()">
+    <button class="run-btn" (click)="newScan()" *ngIf="activeTab() === 'start'">
       <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
         <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
       </svg>
@@ -14,7 +14,26 @@
     </button>
   </div>
 
-  <div class="layout">
+  <!-- ── Tab switcher ── -->
+  <div class="source-tabs">
+    <button class="source-tab" [class.source-tab--active]="activeTab() === 'start'"
+            (click)="switchTab('start')">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+        <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
+      </svg>
+      Start Scan
+    </button>
+    <button class="source-tab" [class.source-tab--active]="activeTab() === 'poll'"
+            (click)="switchTab('poll')">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+        <path d="M2 6.5A4.5 4.5 0 1 1 6.5 11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        <path d="M2 4V7H5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Check Status
+    </button>
+  </div>
+
+  <div class="layout" *ngIf="activeTab() === 'start'">
 
     <!-- ── Left: form (when open) + run history ── -->
     <div class="left-col">
@@ -175,17 +194,110 @@
           </div>
         </div>
 
-        <!-- Result summary -->
+        <!-- Result summary — submission only; scan itself hasn't run yet -->
         <div class="result-panel" *ngIf="selectedJob()?.result as result">
           <div class="result-panel__row"><span>Release ID</span><strong>{{ result.release_id }}</strong></div>
           <div class="result-panel__row"><span>FoD Scan ID</span><strong>{{ result.fod_scan_id }}</strong></div>
-          <div class="result-panel__row"><span>Scan Status</span><strong>{{ result.scan_status }}</strong></div>
-          <div class="result-panel__row" *ngIf="result.vulnerability_count !== null">
-            <span>Vulnerabilities</span><strong>{{ result.vulnerability_count }}</strong>
+          <div class="result-panel__note">
+            Submitted — this doesn't wait for the scan to finish.
+            <button class="result-panel__poll-link" (click)="switchTab('poll')">Check its status &rarr;</button>
           </div>
         </div>
       </ng-container>
     </div>
 
   </div>
+
+  <!-- ── Check Status tab ── -->
+  <div class="layout layout--single" *ngIf="activeTab() === 'poll'">
+    <div class="detail detail--form">
+
+      <form class="run-form" (ngSubmit)="checkStatus()">
+
+        <div class="run-form__grid">
+          <div class="run-form__field">
+            <label>Release ID</label>
+            <input class="run-form__input" type="text" [(ngModel)]="pollReleaseId" name="pollReleaseId"
+                   placeholder="1799826" required>
+          </div>
+          <div class="run-form__field">
+            <label>FoD Scan ID</label>
+            <input class="run-form__input" type="text" [(ngModel)]="pollFodScanId" name="pollFodScanId"
+                   placeholder="19890408" required>
+            <span class="run-form__hint">Both returned by Start Scan — prefilled automatically after a successful submit</span>
+          </div>
+        </div>
+
+        <div class="creds-panel">
+          <div class="creds-panel__header">
+            <span class="creds-panel__title">
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+                <rect x="3" y="6.5" width="8" height="6" rx="1.2" stroke="currentColor" stroke-width="1.2"/>
+                <path d="M4.5 6.5V4.5A2.5 2.5 0 0 1 9.5 4.5V6.5" stroke="currentColor" stroke-width="1.2"/>
+              </svg>
+              Credentials
+            </span>
+            <span class="creds-panel__badge creds-panel__badge--required">
+              Required — never saved server-side
+            </span>
+          </div>
+
+          <div class="run-form__grid">
+            <div class="run-form__field">
+              <label>Fortify Username</label>
+              <input class="run-form__input" type="text" [(ngModel)]="pollUsername" name="pollUsername"
+                     placeholder="jdoe" autocomplete="off" required>
+              <span class="run-form__hint">"equifax\" prefix added automatically</span>
+            </div>
+            <div class="run-form__field">
+              <label>Fortify Password</label>
+              <input class="run-form__input" type="password" [(ngModel)]="pollPassword" name="pollPassword"
+                     autocomplete="off" required>
+            </div>
+          </div>
+        </div>
+
+        <div class="run-form__flags">
+          <span class="submit-error" *ngIf="pollError()">{{ pollError() }}</span>
+          <button type="submit" class="run-form__submit" [disabled]="!canCheckStatus()">
+            <span *ngIf="checkingStatus()" class="spinner"></span>
+            {{ checkingStatus() ? 'Checking...' : 'Check Status' }}
+          </button>
+        </div>
+      </form>
+
+      <!-- Poll result -->
+      <ng-container *ngIf="pollResult() as result">
+        <div class="detail__header">
+          <div class="detail__header-row">
+            <span class="detail__rule">Release {{ result.release_id }} &middot; Scan {{ result.fod_scan_id }}</span>
+            <span class="run-status" [class.run-status--completed]="result.is_complete"
+                  [class.run-status--running]="!result.is_complete">
+              {{ result.scan_status ?? 'Unknown' }}
+            </span>
+          </div>
+        </div>
+
+        <div class="poll-pending" *ngIf="!result.is_complete">
+          Scan is still in progress — check again in a bit.
+        </div>
+
+        <div class="result-panel" *ngIf="result.is_complete">
+          <div class="result-panel__row">
+            <span>Total Findings</span><strong>{{ result.vulnerability_total ?? '—' }}</strong>
+          </div>
+        </div>
+
+        <div class="severity-table" *ngIf="result.is_complete && result.severity_counts as counts">
+          <div class="severity-table__row" *ngFor="let row of severityRows(counts)">
+            <span class="severity-table__label severity-table__label--{{ row.severity.toLowerCase() }}">
+              {{ row.severity }}
+            </span>
+            <span class="severity-table__count">{{ row.count }}</span>
+          </div>
+        </div>
+      </ng-container>
+    </div>
+  </div>
+
 </div>

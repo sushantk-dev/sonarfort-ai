@@ -7,7 +7,8 @@ import { ApiConfigService } from '../../core/api-config.service';
 // ── Job shape returned by GET /fortify/scan/status/{scan_id} ─────────────────
 // Same envelope as GET /pipeline/status/{pipeline_id} — this endpoint just
 // scopes it to a /fortify/scan job (stages: resolve/clone/package/session/
-// submit/poll instead of the full remediation pipeline's stage list).
+// setup/submit — submission only, does not wait for the scan itself to
+// finish; see FortifyScanPollResult for that).
 export interface FortifyScanStage {
   status: 'pending' | 'running' | 'completed' | 'skipped' | 'failed';
   started_at: string | null;
@@ -23,8 +24,6 @@ export interface FortifyScanResult {
   branch_name: string;
   release_id: number;
   fod_scan_id: string;
-  scan_status: string;
-  vulnerability_count: number | null;
 }
 
 export interface FortifyScanJob {
@@ -37,6 +36,16 @@ export interface FortifyScanJob {
   stages: Record<string, FortifyScanStage>;
 }
 
+// ── Response shape from POST /fortify/scan/poll (one-shot, not a job) ────────
+export interface FortifyScanPollResult {
+  release_id: number;
+  fod_scan_id: string;
+  scan_status: string | null;
+  is_complete: boolean;
+  vulnerability_total: number | null;
+  severity_counts: Record<string, number> | null;
+}
+
 // ── Session-local record of a triggered scan — just enough to render the
 //    run list without re-fetching until the user selects it ─────────────────
 interface ScanRun {
@@ -47,7 +56,7 @@ interface ScanRun {
   startedAt: number;
 }
 
-const STAGE_ORDER = ['resolve', 'clone', 'package', 'session', 'setup', 'submit', 'poll'] as const;
+const STAGE_ORDER = ['resolve', 'clone', 'package', 'session', 'setup', 'submit'] as const;
 type StageKey = typeof STAGE_ORDER[number];
 
 const STAGE_LABELS: Record<StageKey, string> = {
@@ -57,11 +66,17 @@ const STAGE_LABELS: Record<StageKey, string> = {
   session: 'FoD Session',
   setup:   'Configure Scan Setup',
   submit:  'Submit Scan',
-  poll:    'Poll to Completion',
 };
+
+// Display order for severity buckets — anything not in this list (e.g. an
+// unrecognized field name from severity_counts, see summarize_vulnerabilities_
+// by_severity's field-name caveat in fortify_scan.py) is appended after.
+const SEVERITY_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Unknown'];
 
 const POLL_INTERVAL_MS = 4000;
 const FORTIFY_DOMAIN_PREFIX = 'equifax\\';
+
+type Tab = 'start' | 'poll';
 
 @Component({
   selector: 'app-fortify-scan',
@@ -73,7 +88,14 @@ const FORTIFY_DOMAIN_PREFIX = 'equifax\\';
 export class FortifyScanComponent {
   private apiCfg = inject(ApiConfigService);
 
-  // ── Form fields ────────────────────────────────────────────────────────────
+  // ── Tabs ─────────────────────────────────────────────────────────────────
+  activeTab = signal<Tab>('start');
+
+  switchTab(tab: Tab) {
+    this.activeTab.set(tab);
+  }
+
+  // ── "Start Scan" tab — form fields ─────────────────────────────────────────
   appName        = signal('');
   repoName       = signal('');       // owner/repo
   branchName     = signal('');       // optional — default branch if empty
@@ -126,7 +148,10 @@ export class FortifyScanComponent {
     ) && !this.submitting();
   }
 
-  // ── Submit — POST /fortify/scan, then start polling the returned scan_id ──
+  // ── Submit — POST /fortify/scan. Returns as soon as the scan is
+  //    submitted; does NOT wait for it to complete. Job status polling
+  //    below only tracks the submission stages (resolve..submit), not
+  //    the scan itself — that's the Poll tab's job.
   startScan() {
     if (!this.canSubmit()) return;
 
@@ -181,7 +206,9 @@ export class FortifyScanComponent {
       });
   }
 
-  // ── Poll GET /fortify/scan/status/{scan_id} until terminal ────────────────
+  // ── Poll GET /fortify/scan/status/{scan_id} until the *submission* job
+  //    (resolve..submit) reaches a terminal status. Unrelated to the scan
+  //    itself finishing — that's checked separately on the Poll tab.
   private _poll(scanId: string) {
     const baseUrl = this.apiCfg.fortifyBaseUrl();
     const tick = () => {
@@ -195,6 +222,13 @@ export class FortifyScanComponent {
             this._pollTimers.set(scanId, setTimeout(tick, POLL_INTERVAL_MS));
           } else {
             this._pollTimers.delete(scanId);
+            // Convenience: once submission succeeds, prefill the Poll tab
+            // with this scan's ids so checking status is a one-click hop
+            // rather than copying numbers across tabs by hand.
+            if (job.status === 'completed' && job.result) {
+              this.pollReleaseId.set(String(job.result.release_id));
+              this.pollFodScanId.set(job.result.fod_scan_id);
+            }
           }
         })
         .catch(() => {
@@ -215,6 +249,7 @@ export class FortifyScanComponent {
   }
 
   newScan() {
+    this.activeTab.set('start');
     this.showForm.set(true);
     this.selectedId.set(null);
   }
@@ -258,5 +293,87 @@ export class FortifyScanComponent {
     const hrs = Math.floor(mins / 60);
     if (hrs < 24)  return `${hrs}h ago`;
     return `${Math.floor(hrs / 24)}d ago`;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ── "Check Status" tab ────────────────────────────────────────────────
+  // One-shot POST /fortify/scan/poll — not a background job, no polling
+  // loop needed here; the user clicks "Check Status" whenever they want a
+  // fresh read.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  pollReleaseId   = signal('');
+  pollFodScanId   = signal('');
+  pollUsername    = signal('');
+  pollPassword    = signal('');
+
+  checkingStatus  = signal(false);
+  pollError       = signal('');
+  pollResult      = signal<FortifyScanPollResult | null>(null);
+
+  canCheckStatus(): boolean {
+    return !!(
+      this.pollReleaseId().trim() &&
+      this.pollFodScanId().trim() &&
+      this.pollUsername().trim() &&
+      this.pollPassword().trim()
+    ) && !this.checkingStatus();
+  }
+
+  checkStatus() {
+    if (!this.canCheckStatus()) return;
+
+    this.checkingStatus.set(true);
+    this.pollError.set('');
+
+    const body = {
+      release_id:       Number(this.pollReleaseId().trim()),
+      fod_scan_id:       this.pollFodScanId().trim(),
+      fortify_username:  this._domainQualify(this.pollUsername()),
+      fortify_password:  this.pollPassword(),
+    };
+
+    const baseUrl = this.apiCfg.fortifyBaseUrl();
+
+    fetch(`${baseUrl}/fortify/scan/poll`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    })
+      .then(async r => {
+        const resp = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(resp?.error ?? resp?.detail ?? `HTTP ${r.status}`);
+        return resp;
+      })
+      .then(resp => {
+        const result: FortifyScanPollResult | undefined = resp?.data ?? resp;
+        if (!result) {
+          this.pollError.set(`No result in response — ${JSON.stringify(resp)}`);
+          return;
+        }
+        this.pollResult.set(result);
+      })
+      .catch(err => this.pollError.set(err?.message ?? 'Failed to check status'))
+      .finally(() => {
+        this.checkingStatus.set(false);
+        // Same reasoning as startScan — don't hold plaintext credentials
+        // in memory longer than needed.
+        this.pollPassword.set('');
+      });
+  }
+
+  /** Severity buckets in a stable, sensible display order. */
+  severityRows(counts: Record<string, number>): { severity: string; count: number }[] {
+    const known = SEVERITY_ORDER
+      .filter(s => s in counts)
+      .map(severity => ({ severity, count: counts[severity] }));
+    const rest = Object.keys(counts)
+      .filter(s => !SEVERITY_ORDER.includes(s))
+      .map(severity => ({ severity, count: counts[severity] }));
+    return [...known, ...rest];
+  }
+
+  severityTotal(counts: Record<string, number>): number {
+    return Object.values(counts).reduce((sum, n) => sum + n, 0);
   }
 }

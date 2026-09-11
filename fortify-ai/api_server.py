@@ -92,17 +92,24 @@ Execution Modes:
 
   FORTIFY SCAN (triggers an actual new SAST scan — not a read of an existing release)
     POST /fortify/scan                    — clone repo_name -> ScanCentral package -> fcli
-                                             FoD session -> submit SAST scan -> poll to
-                                             completion. Body: {app_name, repo_name,
-                                             branch_name?, release_id?, github_token,
-                                             fortify_username, fortify_password}.
-                                             branch_name optional (defaults to the repo's
-                                             default branch, e.g. master/main); release_id
-                                             optional (defaults to app_name's latest
-                                             release); credentials required per-request,
-                                             never persisted. Returns scan_id immediately.
-    GET  /fortify/scan/status/{scan_id}   — overall + per-stage status (same shape as
-                                             GET /pipeline/status/{pipeline_id})
+                                             FoD session -> configure setup -> submit SAST
+                                             scan. Does NOT wait for the scan to complete.
+                                             Body: {app_name, repo_name, branch_name?,
+                                             release_id?, github_token, fortify_username,
+                                             fortify_password}. branch_name optional
+                                             (defaults to the repo's default branch, e.g.
+                                             master/main); release_id optional (defaults to
+                                             app_name's latest release); credentials
+                                             required per-request, never persisted. Returns
+                                             scan_id, release_id, fod_scan_id immediately.
+    GET  /fortify/scan/status/{scan_id}   — overall + per-stage status of the *submission*
+                                             (same shape as GET /pipeline/status/{pipeline_id})
+    POST /fortify/scan/poll               — one-shot check of a scan's status on FoD (not
+                                             a background job). Body: {release_id,
+                                             fod_scan_id, fortify_username,
+                                             fortify_password}. Once complete, also returns
+                                             severity_counts (vulnerability findings grouped
+                                             by severity) and vulnerability_total.
 
   UTILITY
     GET  /health                   — liveness probe
@@ -601,7 +608,11 @@ class FortifyScanRequest(BaseModel):
     Trigger an actual **new** Fortify SAST scan — unlike every other model
     in this file, which only reads vulnerabilities off an *existing*
     release. Clones `repo_name`, packages it with ScanCentral, and submits
-    + polls the scan via fcli against Fortify on Demand.
+    the scan via fcli against Fortify on Demand.
+
+    Deliberately does NOT wait for the scan to complete — returns as soon
+    as it's submitted. Check progress separately with
+    ``FortifyScanPollRequest`` / POST /fortify/scan/poll.
 
     Credentials are required **per-request** here rather than falling back
     to server env defaults (contrast with ConfigOverrides elsewhere) —
@@ -642,6 +653,22 @@ class FortifyScanRequest(BaseModel):
         ...,
         description="Fortify password, paired with fortify_username for both uses described above.",
     )
+
+
+class FortifyScanPollRequest(BaseModel):
+    """
+    One-shot status check for a scan previously submitted via
+    POST /fortify/scan — NOT a background job, this returns synchronously
+    with whatever the current status is right now. Credentials are
+    required again here (not persisted from the original submit, and not
+    stored server-side at all) since this can be called independently,
+    any time later, potentially by a different caller checking on the
+    same scan.
+    """
+    release_id: int = Field(..., description="The release_id returned by POST /fortify/scan.")
+    fod_scan_id: str = Field(..., description="The fod_scan_id returned by POST /fortify/scan.")
+    fortify_username: str = Field(..., description="Fortify username, used to authenticate this status check.")
+    fortify_password: str = Field(..., description="Fortify password, paired with fortify_username.")
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -2427,7 +2454,10 @@ async def pipeline_dry_run(req: DryRunRequest):
 # Unlike every /pipeline/* and /stages/* endpoint above (which read
 # vulnerabilities off an *existing* Fortify release), this triggers an
 # actual new scan: clone -> package (ScanCentral) -> ensure fcli FoD
-# session -> submit -> poll to completion. See fortify_scan.py.
+# session -> configure setup -> submit. Deliberately does NOT wait for
+# the scan to finish — POST /fortify/scan returns as soon as the upload
+# is submitted. Check progress/results separately via the one-shot
+# POST /fortify/scan/poll (REST-based, not fcli — see fortify_scan.py).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/fortify/scan", tags=["Fortify Scan"])
@@ -2443,16 +2473,19 @@ async def run_fortify_scan(req: FortifyScanRequest):
     caller, never the server's own default identity, and none of these
     values are persisted to shared env/GCS config.
 
-    Returns a *scan_id* immediately. Poll
-    **GET /fortify/scan/status/{scan_id}** to track progress.
+    Returns as soon as the scan is submitted — does NOT wait for it to
+    complete. The result includes `release_id` and `fod_scan_id`; use
+    those with **POST /fortify/scan/poll** (separately, with your own
+    Fortify credentials again) to check progress or completion.
 
-    Stages: resolve -> clone -> package -> session -> submit -> poll
+    Stages: resolve -> clone -> package -> session -> setup -> submit
 
-    On success the cloned repo + payload zip are deleted. On failure they
-    are left on disk (path is in the `clone` stage's output_summary) for
-    debugging.
+    On success the cloned repo + payload zip are deleted immediately
+    (they're not needed for polling — that's REST-based against FoD
+    directly). On failure they are left on disk (path is in the `clone`
+    stage's output_summary) for debugging.
     """
-    job = _new_job(stages=["resolve", "clone", "package", "session", "setup", "submit", "poll"])
+    job = _new_job(stages=["resolve", "clone", "package", "session", "setup", "submit"])
     pid = job["pipeline_id"]
 
     async def _run():
@@ -2567,45 +2600,17 @@ async def run_fortify_scan(req: FortifyScanRequest):
             _update_stage(pid, "submit", status="completed", finished_at=_now(),
                           output_summary={"fod_scan_id": fod_scan_id})
 
-            # ── poll ─────────────────────────────────────────────────────────
-            _update_stage(pid, "poll", status="running", started_at=_now())
-
-            def _progress(info: dict) -> None:
-                _update_stage(pid, "poll", status="running", output_summary=info)
-
-            poll_result = await _stage(
-                lambda: fscan.poll_scan(
-                    release_id, fod_scan_id, cfg,
-                    interval_seconds=cfg.scan_poll_interval_seconds,
-                    timeout_seconds=cfg.scan_poll_timeout_seconds,
-                    on_progress=_progress,
-                ),
-                cfg.scan_poll_timeout_seconds + 120, "poll",
-            )
-            _update_stage(pid, "poll", status="completed", finished_at=_now(),
-                          output_summary={"final_status": poll_result.get("status")})
-
-            # Best-effort vulnerability count for the now-scanned release —
-            # non-fatal if it fails, the scan itself already succeeded.
-            vuln_count = None
-            try:
-                if client is None:
-                    client = await _stage(
-                        lambda: FortifyClient.from_config(cfg, persist_token=False), 60, "vuln-fetch-auth",
-                    )
-                vulns = await _stage(lambda: client.get_vulnerabilities(release_id), 60, "vuln-fetch")
-                vuln_count = len(vulns)
-            except Exception as exc:
-                print(f"[FortifyScan] Post-scan vulnerability fetch failed: {exc}")
-
+            # Deliberately stops here — does NOT wait for the scan to
+            # complete. Check progress separately via
+            # POST /fortify/scan/poll (release_id + fod_scan_id below),
+            # which does its own one-shot status check rather than this
+            # job blocking on it.
             result = {
                 "app_name": req.app_name,
                 "repo_name": req.repo_name,
                 "branch_name": req.branch_name or "(default)",
                 "release_id": release_id,
                 "fod_scan_id": fod_scan_id,
-                "scan_status": poll_result.get("status"),
-                "vulnerability_count": vuln_count,
             }
             succeeded = True
             _finish_job(pid, "completed", result=result, t0=t0)
@@ -2631,13 +2636,82 @@ async def run_fortify_scan(req: FortifyScanRequest):
 def fortify_scan_status(scan_id: str):
     """
     Same shape as GET /pipeline/status/{pipeline_id} — overall status plus
-    the resolve/clone/package/session/submit/poll stage breakdown — scoped
-    to a /fortify/scan job.
+    the resolve/clone/package/session/setup/submit stage breakdown —
+    scoped to a /fortify/scan job. This only covers submission, not scan
+    completion — use POST /fortify/scan/poll for that.
     """
     job = _store.get_job(scan_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"scan_id '{scan_id}' not found")
     return ok(_sanitize_job_for_response(job))
+
+
+@app.post("/fortify/scan/poll", tags=["Fortify Scan"])
+async def poll_fortify_scan(req: FortifyScanPollRequest):
+    """
+    One-shot check of a scan's current status on Fortify on Demand —
+    NOT a background job, this is a synchronous REST call (via
+    FortifyClient, not fcli) and returns immediately with whatever the
+    status is right now. Call it again later to re-check; it does not
+    itself wait or retry.
+
+    Once the scan is complete, also fetches every finding for the release
+    and returns counts grouped by severity (`severity_counts`) — a real
+    SAST scan spans many categories (SQL Injection, XSS, etc.), not just
+    the Open Source dependency findings the rest of this file works with,
+    so this uses FortifyClient.get_all_vulnerabilities (unfiltered by
+    category) rather than get_vulnerabilities.
+
+    Credentials are required in the body (see FortifyScanPollRequest) —
+    not persisted, not reused from the original POST /fortify/scan call.
+    """
+    cfg = load_config().model_copy(update={
+        "fortify_username": req.fortify_username,
+        "fortify_password": req.fortify_password,
+    })
+
+    from fortify_client import FortifyClient
+    import fortify_scan as fscan
+
+    loop = asyncio.get_event_loop()
+    try:
+        client = await asyncio.wait_for(
+            loop.run_in_executor(_EXECUTOR, lambda: FortifyClient.from_config(cfg, persist_token=False)),
+            timeout=60,
+        )
+        release = await asyncio.wait_for(
+            loop.run_in_executor(_EXECUTOR, lambda: client.get_release(req.release_id)),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        return err("Timed out authenticating or fetching release status.")
+    except Exception as exc:
+        return err(f"Could not fetch scan status: {exc}", exc)
+
+    status = fscan.extract_release_status(release)
+    is_complete = bool(status and status in fscan.TERMINAL_SCAN_STATUSES)
+
+    severity_counts = None
+    vulnerability_total = None
+    if is_complete:
+        try:
+            vulns = await asyncio.wait_for(
+                loop.run_in_executor(_EXECUTOR, lambda: client.get_all_vulnerabilities(req.release_id)),
+                timeout=120,
+            )
+            severity_counts = fscan.summarize_vulnerabilities_by_severity(vulns)
+            vulnerability_total = len(vulns)
+        except Exception as exc:
+            print(f"[FortifyScan] Poll: vulnerability fetch failed for release {req.release_id}: {exc}")
+
+    return ok({
+        "release_id": req.release_id,
+        "fod_scan_id": req.fod_scan_id,
+        "scan_status": status,
+        "is_complete": is_complete,
+        "vulnerability_total": vulnerability_total,
+        "severity_counts": severity_counts,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

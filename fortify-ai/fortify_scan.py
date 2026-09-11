@@ -532,7 +532,7 @@ def start_scan(
     return scan_id
 
 
-_TERMINAL_STATUSES = {"Completed", "Canceled", "Cancelled", "Failed"}
+TERMINAL_SCAN_STATUSES = {"Completed", "Canceled", "Cancelled", "Failed"}
 
 
 def _extract_status(stdout: str) -> Optional[str]:
@@ -623,3 +623,56 @@ def poll_scan(
         # field _extract_status expects (status will just be None/logged
         # as "Completed" rather than blocking further on a parse miss).
         return {"status": status or "Completed", "raw": last_output}
+
+
+# ── One-shot status check (used by POST /fortify/scan/poll) ──────────────────
+#
+# Deliberately REST-based (FortifyClient), not fcli — a single status check
+# needs a single request/response, and fcli's `sast-scan wait-for` is built
+# to block until terminal rather than report a snapshot, which doesn't fit
+# a "check right now" endpoint. See FortifyClient.get_release /
+# get_all_vulnerabilities in fortify_client.py.
+
+def extract_release_status(release: dict) -> Optional[str]:
+    """
+    Pull the current scan status off a release resource (from
+    FortifyClient.get_release). Field name uncertainty: fcli's own output
+    confirmed ``analysisStatusType`` (see _extract_status above), but
+    whether this REST resource uses the same name, a
+    ``currentAnalysisStatusType`` variant, or something else entirely
+    hasn't been independently confirmed — tries the plausible candidates
+    in order. VERIFY against a real response and simplify once confirmed.
+    """
+    return (
+        release.get("currentAnalysisStatusType")
+        or release.get("analysisStatusType")
+        or release.get("status")
+    )
+
+
+_SEVERITY_FIELD_CANDIDATES = ("friority", "severity", "Friority", "Severity")
+
+
+def summarize_vulnerabilities_by_severity(vulns: list[dict]) -> dict[str, int]:
+    """
+    Group a Fortify vulnerability list into per-severity counts.
+
+    Field name uncertainty: Fortify's v3 vulnerability resource has used
+    different severity field names across products/versions (SSC's
+    "friority" vs a plainer "severity" elsewhere) — tries several
+    plausible names per item and uses whichever is actually present.
+    Anything with no match on any candidate goes in "Unknown" rather than
+    being silently dropped, so counts always sum to len(vulns). VERIFY
+    the winning field name against a real response for your Fortify
+    version and simplify this once confirmed.
+    """
+    counts: dict[str, int] = {}
+    for v in vulns:
+        severity = None
+        for field in _SEVERITY_FIELD_CANDIDATES:
+            if v.get(field):
+                severity = str(v[field])
+                break
+        key = severity or "Unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return counts

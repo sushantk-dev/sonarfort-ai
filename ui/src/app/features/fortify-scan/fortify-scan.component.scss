@@ -548,4 +548,138 @@
     span { color: var(--text-muted); }
     strong { color: var(--text-primary); font-family: var(--font-mono); font-weight: 600; }
   }
+
+  &__note {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  &__poll-link {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--brand);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+
+    &:hover { text-decoration: underline; }
+  }
+}
+
+// ── Tab switcher (Start Scan / Check Status) ────────────────────────────────
+.source-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.source-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 4px 11px;
+  margin-bottom: -1px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+
+  svg { flex-shrink: 0; opacity: 0.7; }
+
+  &:hover { color: var(--text-secondary); }
+
+  &--active {
+    color: var(--brand);
+    border-bottom-color: var(--brand);
+
+    svg { opacity: 1; }
+  }
+
+  & + .source-tab { margin-left: 14px; }
+}
+
+// ── "Check Status" tab layout ───────────────────────────────────────────────
+.layout--single {
+  grid-template-columns: 1fr;
+  max-width: 640px;
+}
+
+.detail--form {
+  padding: 20px 22px;
+
+  .run-form {
+    border: none;
+    padding: 0;
+    margin-bottom: 4px;
+  }
+
+  .detail__header {
+    padding: 18px 0 14px;
+    margin-top: 8px;
+  }
+
+  .result-panel,
+  .severity-table {
+    margin-left: 0;
+    margin-right: 0;
+  }
+}
+
+.poll-pending {
+  margin: 4px 0 20px;
+  padding: 12px 14px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+// ── Severity breakdown table ────────────────────────────────────────────────
+.severity-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+
+  &__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  &__label {
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 2px 9px;
+    border-radius: 5px;
+
+    &--critical { background: rgba(220,38,38,.12);  color: var(--status-danger, #dc2626); }
+    &--high     { background: rgba(234,88,12,.12);  color: #ea580c; }
+    &--medium   { background: rgba(202,138,4,.12);  color: #ca8a04; }
+    &--low      { background: rgba(22,163,74,.12);  color: var(--status-success); }
+    &--unknown  { background: var(--surface-2);     color: var(--text-muted); }
+  }
+
+  &__count {
+    font-size: 13px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+  }
 }
