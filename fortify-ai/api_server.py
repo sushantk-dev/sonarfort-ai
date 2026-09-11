@@ -1316,9 +1316,18 @@ def _run_full_pipeline(
             for group in reasoned:
                 _check_cancelled(pipeline_id)  # stop before committing the next group
                 artifact_id = group["parsed"]["artifact_id"]
+                # primary_location (groupId:artifactId@version) — the real
+                # unique key. artifact_id alone collides when the same dep
+                # appears at different versions in different modules; every
+                # adr_results/merged_results entry below carries both so
+                # downstream stages (build-validation retry lookup, PR
+                # matching, fortify-writeback) can join on the unique key
+                # instead of silently conflating two different groups.
+                primary_location = group["primary_location"]
                 if group.get("next_node") == "escalate":
                     adr_results.append({
                         "artifact_id": artifact_id,
+                        "primary_location": primary_location,
                         "result": AdrResult(
                             success=False, branch_name=None, base_branch=None,
                             commit_hash=None, build_time_seconds=None, pdf_path=None,
@@ -1329,6 +1338,7 @@ def _run_full_pipeline(
                 if dry_run or not cfg.adr_path:
                     adr_results.append({
                         "artifact_id": artifact_id,
+                        "primary_location": primary_location,
                         "result": AdrResult(
                             success=False, branch_name=None, base_branch=None,
                             commit_hash=None, build_time_seconds=None, pdf_path=None,
@@ -1349,7 +1359,11 @@ def _run_full_pipeline(
                         # so build-validation can push-on-success / roll back on failure.
                         push=not run_build,
                     )
-                    adr_results.append({"artifact_id": artifact_id, "result": result})
+                    adr_results.append({
+                        "artifact_id": artifact_id,
+                        "primary_location": primary_location,
+                        "result": result,
+                    })
         except PipelineCancelledError:
             # Raised either between groups (_check_cancelled) or from inside
             # run_adr_fix if cancellation landed mid-commit — either way the
@@ -1380,10 +1394,13 @@ def _run_full_pipeline(
         java_home = _resolve_java_home(cfg.java_home, required_jdk or "")
         max_retries = cfg.max_retries or 3
 
-        # Indexed by artifact_id so a failed build can pull back the calling
-        # code / API-diff context ai_code_fix needs — see Stage 7 (AI Code
-        # Fix retry loop) below.
-        reasoned_by_id = {g["parsed"]["artifact_id"]: g for g in reasoned}
+        # Indexed by primary_location (not artifact_id) so a failed build
+        # pulls back the calling code / API-diff context for the SAME
+        # dependency+version that failed — see Stage 7 (AI Code Fix retry
+        # loop) below. artifact_id alone would collide whenever the same
+        # dep appears at two different versions across modules, silently
+        # handing the retry loop the wrong group's context/history.
+        reasoned_by_loc = {g["primary_location"]: g for g in reasoned}
 
         def _build_one(artifact_id: str, adr_result: dict) -> dict:
             return validate_one(
@@ -1399,12 +1416,15 @@ def _run_full_pipeline(
             for entry in adr_results:
                 _check_cancelled(pipeline_id)  # stop before pushing the next branch
                 artifact_id = entry["artifact_id"]
+                primary_location = entry["primary_location"]
                 adr_result = entry["result"]
                 if not adr_result.get("success"):
                     # Nothing was committed for this group — nothing to build.
-                    merged_results.append({"artifact_id": artifact_id, "result": {
-                        **adr_result, "build_time_seconds": None,
-                    }})
+                    merged_results.append({
+                        "artifact_id": artifact_id,
+                        "primary_location": primary_location,
+                        "result": {**adr_result, "build_time_seconds": None},
+                    })
                     continue
 
                 bv_result = _build_one(artifact_id, adr_result)
@@ -1418,7 +1438,7 @@ def _run_full_pipeline(
                 # require re-running version_resolver for a single group,
                 # which this REST pipeline doesn't support yet — that route
                 # is treated the same as "escalate" (see note below).
-                group = reasoned_by_id.get(artifact_id)
+                group = reasoned_by_loc.get(primary_location)
                 retries_used = 0
                 while (not bv_result.get("success")) and group is not None and retries_used < max_retries:
                     _check_cancelled(pipeline_id)
@@ -1528,14 +1548,18 @@ def _run_full_pipeline(
                           f"{'build passed after AI code fix' if bv_result.get('success') else 'still failing'} "
                           f"after {retries_used} retr{'y' if retries_used == 1 else 'ies'}")
 
-                merged_results.append({"artifact_id": artifact_id, "result": {
-                    **adr_result,
-                    "success": bv_result["success"],
-                    "branch_name": bv_result["branch_name"],
-                    "build_time_seconds": bv_result["build_time_seconds"],
-                    "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
-                    "ai_code_fix_retries": retries_used,
-                }})
+                merged_results.append({
+                    "artifact_id": artifact_id,
+                    "primary_location": primary_location,
+                    "result": {
+                        **adr_result,
+                        "success": bv_result["success"],
+                        "branch_name": bv_result["branch_name"],
+                        "build_time_seconds": bv_result["build_time_seconds"],
+                        "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+                        "ai_code_fix_retries": retries_used,
+                    },
+                })
         except PipelineCancelledError:
             # Mid-build or mid-push termination — see validate_one's docstring;
             # treat state as unknown, not a clean rollback.
@@ -3391,9 +3415,15 @@ def stage_adr_fix(req: AdrFixRequest):
         results = []
         for group in req.groups:
             artifact_id = group["parsed"]["artifact_id"]
+            # primary_location, not just artifact_id — two groups can share
+            # an artifact_id at different versions (same dep in different
+            # modules), and downstream stages join adr_results back to
+            # groups on this field, so it has to travel with every entry.
+            primary_location = group["primary_location"]
             if group.get("next_node") == "escalate":
                 results.append({
                     "artifact_id": artifact_id,
+                    "primary_location": primary_location,
                     "result": AdrResult(
                         success=False, branch_name=None, base_branch=None,
                         commit_hash=None, build_time_seconds=None, pdf_path=None,
@@ -3408,7 +3438,11 @@ def stage_adr_fix(req: AdrFixRequest):
                 jira_ticket_id=req.jira_ticket_id,
                 release_id=req.release_id,
             )
-            results.append({"artifact_id": artifact_id, "result": result})
+            results.append({
+                "artifact_id": artifact_id,
+                "primary_location": primary_location,
+                "result": result,
+            })
 
         return ok({"adr_results": results}, time.time() - t0)
     except Exception as exc:
@@ -3448,14 +3482,16 @@ def stage_build_validation(req: BuildValidationRequest):
         results = []
         for entry in req.adr_results:
             artifact_id = entry["artifact_id"]
+            primary_location = entry.get("primary_location")
             adr_result = entry["result"]
 
             if not adr_result.get("success"):
                 # Nothing was committed for this group — pass the failure through.
-                results.append({"artifact_id": artifact_id, "result": {
-                    **adr_result,
-                    "build_time_seconds": None,
-                }})
+                results.append({
+                    "artifact_id": artifact_id,
+                    "primary_location": primary_location,
+                    "result": {**adr_result, "build_time_seconds": None},
+                })
                 continue
 
             bv_kwargs: dict = {
@@ -3474,13 +3510,17 @@ def stage_build_validation(req: BuildValidationRequest):
             )
             # Merge into the AdrResult shape so downstream /stages/pr-agent and
             # /stages/fortify-writeback (which expect adr_results[]) need no changes.
-            results.append({"artifact_id": artifact_id, "result": {
-                **adr_result,
-                "success": bv_result["success"],
-                "branch_name": bv_result["branch_name"],
-                "build_time_seconds": bv_result["build_time_seconds"],
-                "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
-            }})
+            results.append({
+                "artifact_id": artifact_id,
+                "primary_location": primary_location,
+                "result": {
+                    **adr_result,
+                    "success": bv_result["success"],
+                    "branch_name": bv_result["branch_name"],
+                    "build_time_seconds": bv_result["build_time_seconds"],
+                    "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+                },
+            })
 
         return ok({"adr_results": results}, time.time() - t0)
     except Exception as exc:
@@ -3784,9 +3824,13 @@ def _run_until(
         for group in reasoned:
             _check_cancelled(pipeline_id)  # stop before committing the next group
             artifact_id = group["parsed"]["artifact_id"]
+            # See the full-pipeline adr-fix stage above for why this travels
+            # alongside artifact_id: it's the actual unique join key.
+            primary_location = group["primary_location"]
             if group.get("next_node") == "escalate" or not cfg.adr_path:
                 adr_results.append({
                     "artifact_id": artifact_id,
+                    "primary_location": primary_location,
                     "result": AdrResult(
                         success=False, branch_name=None, base_branch=None,
                         commit_hash=None, build_time_seconds=None, pdf_path=None,
@@ -3796,6 +3840,7 @@ def _run_until(
             else:
                 adr_results.append({
                     "artifact_id": artifact_id,
+                    "primary_location": primary_location,
                     "result": run_adr_fix(
                         group, adr_path=cfg.adr_path,
                         project_path=str(project_path),
@@ -3835,11 +3880,14 @@ def _run_until(
             for entry in adr_results:
                 _check_cancelled(pipeline_id)  # stop before pushing the next branch
                 artifact_id = entry["artifact_id"]
+                primary_location = entry.get("primary_location")
                 adr_result = entry["result"]
                 if not adr_result.get("success"):
-                    merged_results.append({"artifact_id": artifact_id, "result": {
-                        **adr_result, "build_time_seconds": None,
-                    }})
+                    merged_results.append({
+                        "artifact_id": artifact_id,
+                        "primary_location": primary_location,
+                        "result": {**adr_result, "build_time_seconds": None},
+                    })
                     continue
                 bv_result = validate_one(
                     artifact_id, adr_result, str(project_path),
@@ -3848,13 +3896,17 @@ def _run_until(
                     **({"maven_heap_mb": cfg.maven_heap_mb} if cfg.maven_heap_mb is not None else {}),
                     cancel_check=cancel_check,
                 )
-                merged_results.append({"artifact_id": artifact_id, "result": {
-                    **adr_result,
-                    "success": bv_result["success"],
-                    "branch_name": bv_result["branch_name"],
-                    "build_time_seconds": bv_result["build_time_seconds"],
-                    "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
-                }})
+                merged_results.append({
+                    "artifact_id": artifact_id,
+                    "primary_location": primary_location,
+                    "result": {
+                        **adr_result,
+                        "success": bv_result["success"],
+                        "branch_name": bv_result["branch_name"],
+                        "build_time_seconds": bv_result["build_time_seconds"],
+                        "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+                    },
+                })
         except PipelineCancelledError:
             _s_fail("build-validation", t, "Cancelled by user")
             raise

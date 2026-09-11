@@ -466,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             adr_results.append({
                 "artifact_id": group["parsed"]["artifact_id"],
+                "primary_location": group["primary_location"],
                 "result": {
                     "success": False, "branch_name": None, "base_branch": None,
                     "commit_hash": None, "build_time_seconds": None, "pdf_path": None,
@@ -504,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
 
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],
+            "primary_location": group["primary_location"],
             "result": result,
         })
 
@@ -522,25 +524,32 @@ def main(argv: list[str] | None = None) -> int:
     merged_results: list[dict] = []
     for entry in adr_results:
         artifact_id = entry["artifact_id"]
+        primary_location = entry["primary_location"]
         adr_result = entry["result"]
         if not adr_result.get("success"):
             # Nothing was committed for this group (escalated / ADR_PATH not
             # set / commit failed) — nothing to build.
-            merged_results.append({"artifact_id": artifact_id, "result": {
-                **adr_result, "build_time_seconds": None,
-            }})
+            merged_results.append({
+                "artifact_id": artifact_id,
+                "primary_location": primary_location,
+                "result": {**adr_result, "build_time_seconds": None},
+            })
             continue
         bv_result = validate_one(
             artifact_id, adr_result, str(project_path),
             required_jdk=required_jdk,
         )
-        merged_results.append({"artifact_id": artifact_id, "result": {
-            **adr_result,
-            "success": bv_result["success"],
-            "branch_name": bv_result["branch_name"],
-            "build_time_seconds": bv_result["build_time_seconds"],
-            "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
-        }})
+        merged_results.append({
+            "artifact_id": artifact_id,
+            "primary_location": primary_location,
+            "result": {
+                **adr_result,
+                "success": bv_result["success"],
+                "branch_name": bv_result["branch_name"],
+                "build_time_seconds": bv_result["build_time_seconds"],
+                "error_reason": bv_result["error_reason"] or adr_result.get("error_reason"),
+            },
+        })
     adr_results = merged_results
 
     # ── PR creation ───────────────────────────────────────────────────────────

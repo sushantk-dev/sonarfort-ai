@@ -456,11 +456,16 @@ def create_prs_for_all_groups(
 ) -> list[PrResult]:
     """
     Open a PR for every group that has a successful ADR result.
-    adr_results is the list from adr_fix_node: [{"artifact_id": ..., "result": AdrResult}].
+    adr_results is the list from adr_fix_node: [{"artifact_id", "primary_location", "result": AdrResult}].
     """
-    # Build a lookup from artifact_id → adr_result
-    adr_by_artifact = {
-        r["artifact_id"]: r["result"]
+    # Build a lookup from primary_location → adr_result. Keying on bare
+    # artifact_id would collapse two groups that share an artifact_id at
+    # different versions (same dep pulled in by different modules), handing
+    # both groups the same ADR result and opening a PR against the wrong
+    # branch/commit for one of them. primary_location (groupId:artifactId@
+    # version) is the actual unique key used throughout the pipeline.
+    adr_by_loc = {
+        r["primary_location"]: r["result"]
         for r in adr_results
         if r["result"].get("success")
     }
@@ -469,7 +474,7 @@ def create_prs_for_all_groups(
 
     for group in groups:
         artifact_id  = group["parsed"]["artifact_id"]
-        adr_result   = adr_by_artifact.get(artifact_id)
+        adr_result   = adr_by_loc.get(group["primary_location"])
         ai_reasoning = group.get("ai_reasoning", {})
 
         if not adr_result:

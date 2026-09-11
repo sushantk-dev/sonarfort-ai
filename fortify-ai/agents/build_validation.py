@@ -418,6 +418,7 @@ def build_validation_node(
     bv_results: list[dict] = []
     for entry in adr_results:
         artifact_id = entry["artifact_id"]
+        primary_location = entry.get("primary_location")
         adr_result = entry["result"]
 
         if not adr_result.get("success"):
@@ -437,7 +438,11 @@ def build_validation_node(
                 maven_heap_mb=maven_heap_mb, cancel_check=cancel_check,
             )
 
-        bv_results.append({"artifact_id": artifact_id, "result": bv_result})
+        bv_results.append({
+            "artifact_id": artifact_id,
+            "primary_location": primary_location,
+            "result": bv_result,
+        })
 
     first_result = bv_results[0]["result"] if bv_results else None
     state["build_validation_result"] = first_result  # type: ignore[typeddict-item]
@@ -454,6 +459,7 @@ def build_validation_node(
         br = bv_entry["result"]
         merged_adr_results.append({
             "artifact_id": adr_entry["artifact_id"],
+            "primary_location": adr_entry.get("primary_location"),
             "result": {
                 **ar,
                 "success": br["success"],

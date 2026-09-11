@@ -216,10 +216,14 @@ def _escalation_report(
     # REST flow mutates the same group object across stages) — either works.
     effective_ai_code_fix_reason = ai_code_fix_reason or group.get("ai_code_fix_reason")
 
-    # Gather retry attempts from adr_results if available
+    # Gather retry attempts from adr_results if available. Matched on
+    # primary_location (not artifact_id) — two groups can share an
+    # artifact_id at different versions, and matching on the bare name
+    # would risk pulling another group's build error into this report.
+    primary_location = group["primary_location"]
     adr = next(
         (r["result"] for r in adr_results
-         if r["artifact_id"] == artifact_id),
+         if r["primary_location"] == primary_location),
         {}
     )
     build_error = adr.get("error_reason", "")
@@ -406,11 +410,19 @@ def write_escalation_report(
     Returns the GCS URI or local file path on success, None on failure.
     """
     artifact_id = group["parsed"]["artifact_id"]
+    # Include current_version in the filename slug, not just artifact_id —
+    # two escalated groups can share an artifact_id at different versions
+    # (same dep pulled in at different versions by different modules), and
+    # an artifact_id-only filename would let the second group's report
+    # overwrite the first's, or (in the pipeline_id/idempotency branch
+    # below) get silently skipped as an "already written" duplicate.
+    version_slug = re.sub(r"[^A-Za-z0-9._-]", "_", group["parsed"]["current_version"])
+    dep_slug     = f"{artifact_id}_{version_slug}"
     if pipeline_id:
-        filename = f"escalation_{artifact_id}_{pipeline_id}.txt"
+        filename = f"escalation_{dep_slug}_{pipeline_id}.txt"
     else:
         ts       = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"escalation_{artifact_id}_{ts}.txt"
+        filename = f"escalation_{dep_slug}_{ts}.txt"
     text        = _escalation_report(
         group, escalation_reason, adr_results, gcp_project, gcp_location,
         is_jdk_mismatch=is_jdk_mismatch, required_jdk=required_jdk,
@@ -520,14 +532,20 @@ def run_all_reports(
     Returns summary dict: total_fixed, total_escalated, total_failed,
                           escalation_files (list of written paths)
     """
-    adr_by_artifact = {r["artifact_id"]: r["result"] for r in adr_results}
+    # Keyed by primary_location (groupId:artifactId@version), NOT bare
+    # artifact_id — two groups can share an artifact_id when the same
+    # dependency appears at different versions in different modules, and
+    # keying by artifact_id alone would collapse them, silently making one
+    # group's result overwrite the other's in this dict and causing both
+    # groups to display the same (wrong) version/outcome downstream.
+    adr_by_loc = {r["primary_location"]: r["result"] for r in adr_results}
 
-    pr_by_artifact: dict[str, dict] = {}
+    pr_by_loc: dict[str, dict] = {}
     pr_idx = 0
     for g in groups:
-        art = g["parsed"]["artifact_id"]
-        if adr_by_artifact.get(art, {}).get("success") and pr_idx < len(pr_results):
-            pr_by_artifact[art] = pr_results[pr_idx]
+        loc = g["primary_location"]
+        if adr_by_loc.get(loc, {}).get("success") and pr_idx < len(pr_results):
+            pr_by_loc[loc] = pr_results[pr_idx]
             pr_idx += 1
 
     total_fixed      = 0
@@ -536,9 +554,9 @@ def run_all_reports(
     escalation_files: list[str] = []
 
     for group in groups:
-        art        = group["parsed"]["artifact_id"]
-        adr_result = adr_by_artifact.get(art, {})
-        pr_result  = pr_by_artifact.get(art, {})
+        loc        = group["primary_location"]
+        adr_result = adr_by_loc.get(loc, {})
+        pr_result  = pr_by_loc.get(loc, {})
 
         if adr_result.get("success"):
             summary = _fixed_summary(group, adr_result, pr_result)

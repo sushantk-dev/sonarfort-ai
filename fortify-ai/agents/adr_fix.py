@@ -744,6 +744,7 @@ def adr_fix_node(
         )
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],
+            "primary_location": group["primary_location"],
             "result": result,
         })
 
