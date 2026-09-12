@@ -171,7 +171,9 @@
 
       <!-- Actions -->
       <div class="col col--actions">
-        <a [routerLink]="['/pipeline/summary', run.id]" class="action-link">Details</a>
+        <a [routerLink]="['/pipeline/summary', run.id]"
+           [queryParams]="{ source: run.source ?? activeSource() }"
+           class="action-link">Details</a>
         <button *ngIf="canResume(run)" class="action-link action-link--resume" (click)="resume(run)">
           Resume
         </button>

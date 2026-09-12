@@ -103,6 +103,42 @@ interface PipelineStatus {
   result?:          PipelineResult;
 }
 
+// ── Sonar run shape ──────────────────────────────────────────────────────────
+// Mirrors RunStatus / PipelineStep / IssueResult in core/api.service.ts and
+// the run doc written by get_run_status() in api.py. Deliberately kept
+// separate from PipelineStatus above rather than shoehorned into it — a
+// Sonar run fixes a single Sonar issue (one rule/file/PR), it isn't a batch
+// of dependency "groups" like Fortify, so the two don't share a shape.
+interface SonarStep {
+  label:  string;
+  status: 'pending' | 'running' | 'done' | 'error' | 'cancelled';
+  detail: string;
+  ms:     number;
+}
+
+interface SonarIssueResult {
+  issue_key?:       string;
+  rule_key?:        string;
+  severity?:        string;
+  file_path?:       string;
+  line?:            number;
+  outcome?:         string;
+  pr_url?:          string | null;
+  escalation_path?: string | null;
+  confidence?:      number;
+  sonar_rescan_ok?: boolean | null;
+  error?:           string | null;
+}
+
+interface SonarRunStatus {
+  id:          string;
+  status:      'queued' | 'running' | 'done' | 'error' | 'cancelled';
+  steps:       SonarStep[];
+  results:     SonarIssueResult[];
+  error:       string | null;
+  elapsed_ms?: number;
+}
+
 // ── Stage metadata ────────────────────────────────────────────────────────────
 
 const STAGE_LABELS: Record<string, string> = {
@@ -143,7 +179,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
           Back to pipeline
         </a>
 
-        <div class="summary__nav-right" *ngIf="status()">
+        <div class="summary__nav-right" *ngIf="runSource() === 'fortify' && status()">
           <span class="release-label" *ngIf="pipelineResult()?.release_id">
             Release {{ pipelineResult()!.release_id }}
           </span>
@@ -154,6 +190,15 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                 [class.status-pill--ok]="status()!.status === 'completed'"
                 [class.status-pill--err]="status()!.status === 'failed'">
             {{ status()!.status === 'completed' ? 'Completed' : status()!.status }}
+          </span>
+        </div>
+
+        <div class="summary__nav-right" *ngIf="runSource() === 'sonar' && sonarRun()">
+          <span class="elapsed-label" *ngIf="sonarElapsed() as el">{{ el }}</span>
+          <span class="status-pill"
+                [class.status-pill--ok]="sonarRun()!.status === 'done'"
+                [class.status-pill--err]="sonarRun()!.status === 'error'">
+            {{ sonarStatusLabel() }}
           </span>
         </div>
       </div>
@@ -174,7 +219,91 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
         {{ fetchError() }}
       </div>
 
-      <ng-container *ngIf="!loading() && !fetchError() && status()">
+      <!-- ── Sonar report (single-issue view — different shape from Fortify) ── -->
+      <ng-container *ngIf="!loading() && !fetchError() && runSource() === 'sonar' && sonarRun() as run">
+        <ng-container *ngIf="sonarIssue() as issue; else sonarNoResult">
+          <div class="stat-grid">
+            <div class="stat-card stat-card--fixed" *ngIf="issue.outcome === 'pr_opened' || issue.outcome === 'draft_pr'">
+              <div class="stat-card__body">
+                <span class="stat-card__label">Outcome</span>
+                <span class="stat-card__value">{{ issue.outcome === 'pr_opened' ? 'PR opened' : 'Draft PR' }}</span>
+              </div>
+            </div>
+            <div class="stat-card stat-card--escalated" *ngIf="issue.outcome === 'escalated'">
+              <div class="stat-card__body">
+                <span class="stat-card__label">Outcome</span>
+                <span class="stat-card__value">Escalated</span>
+              </div>
+            </div>
+            <div class="stat-card stat-card--failed" *ngIf="issue.outcome === 'error' || run.status === 'error'">
+              <div class="stat-card__body">
+                <span class="stat-card__label">Outcome</span>
+                <span class="stat-card__value">Failed</span>
+              </div>
+            </div>
+            <div class="stat-card stat-card--conf" *ngIf="issue.confidence != null">
+              <div class="stat-card__body">
+                <span class="stat-card__label">Confidence</span>
+                <span class="stat-card__value">{{ (issue.confidence * 100).toFixed(0) }}%</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:flex-start; justify-content:space-between; margin-top:16px; gap:10px;">
+            <div>
+              <div style="font-weight:600; font-size:14px;">{{ issue.rule_key }}</div>
+              <div style="font-size:12px; color:var(--text-muted); margin-top:2px;" *ngIf="issue.file_path">
+                {{ issue.file_path }}<span *ngIf="issue.line">:{{ issue.line }}</span>
+              </div>
+            </div>
+            <span class="sev-badge sev-badge--{{ issue.severity?.toLowerCase() }}" *ngIf="issue.severity">
+              {{ issue.severity }}
+            </span>
+          </div>
+
+          <div class="pr-links" *ngIf="issue.pr_url">
+            <a [href]="issue.pr_url" target="_blank" rel="noopener" class="pr-link">PR ↗</a>
+          </div>
+
+          <div class="pr-links" *ngIf="issue.escalation_path">
+            <button class="pr-link" style="background:none; border:none; cursor:pointer; padding:0;"
+                    (click)="downloadSonarEscalation(issue.escalation_path, $event)">
+              {{ escalationDownloading() === (issue.escalation_path.split('/').pop() ?? issue.escalation_path)
+                  ? 'Downloading…' : 'Download escalation report ⬇' }}
+            </button>
+          </div>
+
+          <div class="summary__error" *ngIf="issue.error">{{ issue.error }}</div>
+        </ng-container>
+
+        <ng-template #sonarNoResult>
+          <div class="dep-table__empty">
+            {{ run.error ?? 'This run has no results yet.' }}
+          </div>
+        </ng-template>
+
+        <!-- Step timeline — reuses the same stage-pill styling as the
+             Fortify "Stages" tab (see below) rather than new markup. -->
+        <div class="stage-grid" style="margin-top:20px;">
+          <div *ngFor="let s of run.steps"
+               class="stage-pill stage-pill--{{ sonarStepUiStatus(s) }}">
+            <svg *ngIf="s.status === 'done'" width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L4.8 8.5L9.5 3.5" stroke="currentColor" stroke-width="1.4"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <svg *ngIf="s.status === 'error'" width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M3 3L9 9M9 3L3 9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+            </svg>
+            <svg *ngIf="s.status === 'pending'" width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M3 6H9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+            </svg>
+            <span class="stage-pill__label">{{ s.label }}</span>
+            <span class="stage-pill__elapsed" *ngIf="s.ms">{{ (s.ms / 1000).toFixed(1) }}s</span>
+          </div>
+        </div>
+      </ng-container>
+
+      <ng-container *ngIf="!loading() && !fetchError() && runSource() === 'fortify' && status()">
 
         <!-- ── Stat cards ───────────────────────────────────────────────── -->
         <div class="stat-grid">
@@ -411,7 +540,6 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                       stroke-width="1.2" stroke-linecap="round"/>
               </svg>
               <span *ngIf="pr.artifact_id" class="pr-link__artifact">{{ pr.artifact_id }}</span>
-              <span *ngIf="pr.current_version" class="pr-link__version">{{ pr.current_version }}</span>
               <span *ngIf="pr.pr_number">· PR #{{ pr.pr_number }}</span>
               <span *ngIf="!pr.pr_number">· Open PR</span>
             </a>
@@ -434,7 +562,6 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                 <circle cx="6.5" cy="9.5" r=".5" fill="currentColor"/>
               </svg>
               <span class="esc-card__name">{{ dep.parsed?.artifact_id || dep.artifact_id }}</span>
-              <span class="esc-card__version">{{ dep.parsed?.current_version || dep.current_version || '—' }}</span>
               <span class="esc-card__sev sev-badge sev-badge--{{ (dep.parsed?.severity || dep.severity || 'INFO').toLowerCase() }}">
                 {{ dep.parsed?.severity || dep.severity || 'INFO' }}
               </span>
@@ -476,7 +603,6 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                       stroke-linecap="round"/>
               </svg>
               <span class="esc-card__name">{{ dep.parsed?.artifact_id || dep.artifact_id }}</span>
-              <span class="esc-card__version">{{ dep.parsed?.current_version || dep.current_version || '—' }}</span>
               <svg class="esc-card__chevron" width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.3"
                       stroke-linecap="round" stroke-linejoin="round"/>
@@ -886,11 +1012,6 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
 
     /* PR link footer artifact label */
     .pr-link__artifact { font-weight: 500; }
-    .pr-link__version {
-      font-family: var(--font-mono, ui-monospace, monospace);
-      font-size: 11.5px;
-      color: var(--text-muted);
-    }
 
     /* Severity badges */
     .sev-badge {
@@ -958,15 +1079,6 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
       font-size: 13px;
       font-weight: 500;
       color: var(--text);
-    }
-    .esc-card__version {
-      font-family: var(--font-mono, ui-monospace, monospace);
-      font-size: 11.5px;
-      color: var(--text-muted);
-      background: var(--surface-2, rgba(127,127,127,0.12));
-      border-radius: 4px;
-      padding: 1px 6px;
-      flex-shrink: 0;
     }
     .esc-card__chevron {
       color: var(--text-muted);
@@ -1089,11 +1201,34 @@ export class SummaryReportComponent implements OnInit {
 
   pipelineId = '';
 
+  // Which backend produced this run. Read from the ?source= query param set
+  // by the Activity page (see UiRun.source in pipeline-state.service.ts).
+  // Defaults to 'fortify' so links that predate this param (e.g. the
+  // auto-navigate from PipelineComponent after a Fortify run completes)
+  // keep working unchanged.
+  //
+  // This matters because Sonar and Fortify runs live in completely
+  // different backends with different response shapes:
+  //   - Fortify: GET {fortifyBaseUrl}/pipeline/status/{id}
+  //              -> { status, elapsed_seconds, stages, result: { groups, adr_results, ... } }
+  //   - Sonar:   GET {sonarBaseUrl}/api/pipeline/status/{id}
+  //              -> { id, status, steps, results, error }  (see api.py get_run_status)
+  // Fetching a Sonar run id from the Fortify endpoint 404s (wrong host,
+  // and the id doesn't exist in the Fortify job store), which is why Sonar
+  // report pages were showing "Could not load report" / staying blank.
+  runSource   = signal<'sonar' | 'fortify'>('fortify');
+
   loading     = signal(true);
   fetchError  = signal<string | null>(null);
   status      = signal<PipelineStatus | null>(null);
   activeTab   = signal<'all' | 'fixed' | 'escalated' | 'stages'>('all');
   expandedId  = signal<string | null>(null);
+
+  // ── Sonar run state (separate shape from Fortify's `status` above) ───────
+  sonarRun              = signal<SonarRunStatus | null>(null);
+  sonarEscalationOpen   = signal(false);
+  sonarEscalationBody   = signal<string | null>(null);
+  sonarEscalationLoading = signal(false);
 
   // ── Core derived: annotate each group with _outcome and _prUrl ────────────
   //
@@ -1178,15 +1313,14 @@ export class SummaryReportComponent implements OnInit {
     this.activeTab() === 'fixed' ? this.fixedGroups() : this.allGroups();
 
   // All PRs with URLs, preserving per-group mapping
-  allPrResults = (): { pr_url: string; pr_number?: number; artifact_id?: string; current_version?: string }[] =>
+  allPrResults = (): { pr_url: string; pr_number?: number; artifact_id?: string }[] =>
     this.fixedGroups()
       .filter(g => g._prUrl)
       .map(g => ({
-        pr_url:          g._prUrl!,
-        pr_number:       (this.status()?.result?.pr_results ?? [])
-                           .find(p => p.pr_url === g._prUrl)?.pr_number,
-        artifact_id:     g.parsed?.artifact_id ?? g.artifact_id,
-        current_version: g.parsed?.current_version ?? g.current_version,
+        pr_url:      g._prUrl!,
+        pr_number:   (this.status()?.result?.pr_results ?? [])
+                       .find(p => p.pr_url === g._prUrl)?.pr_number,
+        artifact_id: g.parsed?.artifact_id ?? g.artifact_id,
       }));
 
   // Totals — prefer top-level summary counts, then result sub-fields, then group count
@@ -1304,7 +1438,12 @@ export class SummaryReportComponent implements OnInit {
       this.loading.set(false);
       return;
     }
-    this._fetchStatus();
+
+    const src = this.route.snapshot.queryParamMap.get('source');
+    this.runSource.set(src === 'sonar' ? 'sonar' : 'fortify');
+
+    if (this.runSource() === 'sonar') this._fetchSonarStatus();
+    else this._fetchStatus();
   }
 
   private _fetchStatus(): void {
@@ -1317,6 +1456,29 @@ export class SummaryReportComponent implements OnInit {
       .then(data => {
         const payload: PipelineStatus = data?.data ?? data;
         this.status.set(payload);
+        this.loading.set(false);
+      })
+      .catch(err => {
+        this.fetchError.set(`Could not load report: ${err.message}`);
+        this.loading.set(false);
+      });
+  }
+
+  // Sonar's status endpoint lives on the shared host (no /fortify prefix)
+  // under /api, and returns the flat run doc from Redis directly — no
+  // `.data` wrapper, no `stages`/`result` nesting. See get_run_status() in
+  // api.py and ApiService.getRunStatus() in core/api.service.ts, which this
+  // mirrors rather than reuses so this component doesn't need to depend on
+  // ApiService's RxJS Observable plumbing just for one fetch.
+  private _fetchSonarStatus(): void {
+    const base = this.apiCfg.sonarBaseUrl();
+    fetch(`${base}/api/pipeline/status/${this.pipelineId}`)
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data: SonarRunStatus) => {
+        this.sonarRun.set(data);
         this.loading.set(false);
       })
       .catch(err => {
@@ -1394,5 +1556,50 @@ export class SummaryReportComponent implements OnInit {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  // ── Sonar view helpers ───────────────────────────────────────────────────
+  // A Sonar run currently corresponds to one issue, so results[0] is the
+  // whole report (unlike Fortify's list of dependency groups). If a run was
+  // exploded into multiple per-issue cards in this browser tab before a
+  // page reload (see PipelineStateService._explodeResults), its id has the
+  // form `${realRunId}-${index}` and won't resolve on the backend — that's
+  // a separate, narrower issue from the wrong-endpoint bug fixed here, and
+  // shows up as the same "Could not load report" error only for runs
+  // completed earlier in the same session, not after a refresh.
+  sonarIssue = (): SonarIssueResult | null => this.sonarRun()?.results?.[0] ?? null;
+
+  sonarStatusLabel = (): string => {
+    const s = this.sonarRun()?.status;
+    return { queued: 'Queued', running: 'Running', done: 'Completed',
+              error: 'Failed', cancelled: 'Cancelled' }[s ?? 'queued'] ?? s ?? '';
+  };
+
+  sonarElapsed = (): string | null => {
+    const ms = this.sonarRun()?.elapsed_ms;
+    return ms != null ? this.formatSeconds(ms / 1000) : null;
+  };
+
+  sonarStepUiStatus = (s: SonarStep): string =>
+    s.status === 'done' ? 'done' : s.status === 'error' ? 'error' : s.status;
+
+  async downloadSonarEscalation(path: string, event: Event): Promise<void> {
+    event.stopPropagation();
+    const filename = path.split('/').pop() ?? path;
+    this.escalationDownloading.set(filename);
+    try {
+      // Sonar escalations live under the shared host's /api prefix, not
+      // {fortifyBaseUrl}/escalations — see list_escalations()/get_escalation()
+      // in api.py.
+      const base = this.apiCfg.sonarBaseUrl();
+      const resp = await fetch(`${base}/api/escalations/${encodeURIComponent(filename)}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      this._triggerDownload(data.content ?? '', filename);
+    } catch (err: any) {
+      this.fetchError.set(`Could not download escalation report: ${err.message}`);
+    } finally {
+      this.escalationDownloading.set(null);
+    }
   }
 }
