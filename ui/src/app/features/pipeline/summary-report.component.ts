@@ -411,6 +411,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                       stroke-width="1.2" stroke-linecap="round"/>
               </svg>
               <span *ngIf="pr.artifact_id" class="pr-link__artifact">{{ pr.artifact_id }}</span>
+              <span *ngIf="pr.current_version" class="pr-link__version">{{ pr.current_version }}</span>
               <span *ngIf="pr.pr_number">· PR #{{ pr.pr_number }}</span>
               <span *ngIf="!pr.pr_number">· Open PR</span>
             </a>
@@ -433,6 +434,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                 <circle cx="6.5" cy="9.5" r=".5" fill="currentColor"/>
               </svg>
               <span class="esc-card__name">{{ dep.parsed?.artifact_id || dep.artifact_id }}</span>
+              <span class="esc-card__version">{{ dep.parsed?.current_version || dep.current_version || '—' }}</span>
               <span class="esc-card__sev sev-badge sev-badge--{{ (dep.parsed?.severity || dep.severity || 'INFO').toLowerCase() }}">
                 {{ dep.parsed?.severity || dep.severity || 'INFO' }}
               </span>
@@ -474,6 +476,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                       stroke-linecap="round"/>
               </svg>
               <span class="esc-card__name">{{ dep.parsed?.artifact_id || dep.artifact_id }}</span>
+              <span class="esc-card__version">{{ dep.parsed?.current_version || dep.current_version || '—' }}</span>
               <svg class="esc-card__chevron" width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.3"
                       stroke-linecap="round" stroke-linejoin="round"/>
@@ -883,6 +886,11 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
 
     /* PR link footer artifact label */
     .pr-link__artifact { font-weight: 500; }
+    .pr-link__version {
+      font-family: var(--font-mono, ui-monospace, monospace);
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
 
     /* Severity badges */
     .sev-badge {
@@ -950,6 +958,15 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
       font-size: 13px;
       font-weight: 500;
       color: var(--text);
+    }
+    .esc-card__version {
+      font-family: var(--font-mono, ui-monospace, monospace);
+      font-size: 11.5px;
+      color: var(--text-muted);
+      background: var(--surface-2, rgba(127,127,127,0.12));
+      border-radius: 4px;
+      padding: 1px 6px;
+      flex-shrink: 0;
     }
     .esc-card__chevron {
       color: var(--text-muted);
@@ -1161,14 +1178,15 @@ export class SummaryReportComponent implements OnInit {
     this.activeTab() === 'fixed' ? this.fixedGroups() : this.allGroups();
 
   // All PRs with URLs, preserving per-group mapping
-  allPrResults = (): { pr_url: string; pr_number?: number; artifact_id?: string }[] =>
+  allPrResults = (): { pr_url: string; pr_number?: number; artifact_id?: string; current_version?: string }[] =>
     this.fixedGroups()
       .filter(g => g._prUrl)
       .map(g => ({
-        pr_url:      g._prUrl!,
-        pr_number:   (this.status()?.result?.pr_results ?? [])
-                       .find(p => p.pr_url === g._prUrl)?.pr_number,
-        artifact_id: g.parsed?.artifact_id ?? g.artifact_id,
+        pr_url:          g._prUrl!,
+        pr_number:       (this.status()?.result?.pr_results ?? [])
+                           .find(p => p.pr_url === g._prUrl)?.pr_number,
+        artifact_id:     g.parsed?.artifact_id ?? g.artifact_id,
+        current_version: g.parsed?.current_version ?? g.current_version,
       }));
 
   // Totals — prefer top-level summary counts, then result sub-fields, then group count
