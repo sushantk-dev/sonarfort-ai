@@ -14,6 +14,12 @@ interface DepGroup {
     severity?:    string;
     cves?:        string[];
   };
+  // groupId:artifactId@version — the real unique key for a dependency group.
+  // Two groups CAN share artifact_id (same dep pulled in at different
+  // versions by different modules) — anywhere rows need to be told apart
+  // (expand/collapse state, ADR-result lookup, escalation file matching)
+  // must key on this, not on artifact_id alone.
+  primary_location?: string;
   artifact_id?:     string;
   current_version?: string;
   severity?:        string;
@@ -35,6 +41,7 @@ interface DepGroup {
 
 interface AdrEntry {
   artifact_id: string;
+  primary_location?: string;
   result?: {
     success?:       boolean;
     branch_name?:   string;
@@ -416,8 +423,8 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
             Manual action required
           </p>
           <div class="esc-card" *ngFor="let dep of escalatedGroups()"
-               [class.esc-card--open]="expandedId() === dep.parsed?.artifact_id"
-               (click)="toggleExpanded(dep.parsed?.artifact_id || '')">
+               [class.esc-card--open]="expandedId() === rowId(dep)"
+               (click)="toggleExpanded(rowId(dep))">
             <div class="esc-card__header">
               <svg width="13" height="13" viewBox="0 0 13 13" fill="none" class="esc-icon">
                 <path d="M6.5 1.5L12 11H1L6.5 1.5Z" stroke="currentColor" stroke-width="1.2"
@@ -435,7 +442,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
               </svg>
             </div>
             <div class="esc-card__body"
-                 *ngIf="expandedId() === dep.parsed?.artifact_id">
+                 *ngIf="expandedId() === rowId(dep)">
               {{ dep.escalate_reason || dep.ai_reasoning?.reason || 'No safe version found.' }}
               <div class="esc-card__report-row" *ngIf="escalationFileFor(dep) as file">
                 <button type="button"
@@ -458,8 +465,8 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
             Pipeline error
           </p>
           <div class="esc-card esc-card--failed" *ngFor="let dep of failedGroups()"
-               [class.esc-card--open]="expandedId() === dep.parsed?.artifact_id"
-               (click)="toggleExpanded(dep.parsed?.artifact_id || '')">
+               [class.esc-card--open]="expandedId() === rowId(dep)"
+               (click)="toggleExpanded(rowId(dep))">
             <div class="esc-card__header">
               <svg width="13" height="13" viewBox="0 0 13 13" fill="none" class="esc-icon esc-icon--failed">
                 <circle cx="6.5" cy="6.5" r="5.5" stroke="currentColor" stroke-width="1.2"/>
@@ -473,7 +480,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
               </svg>
             </div>
             <div class="esc-card__body"
-                 *ngIf="expandedId() === dep.parsed?.artifact_id">
+                 *ngIf="expandedId() === rowId(dep)">
               {{ dep.escalate_reason || 'Dependency resolution failed.' }}
             </div>
           </div>
@@ -1088,10 +1095,15 @@ export class SummaryReportComponent implements OnInit {
     const adrResults = result.adr_results ?? [];
     const prResults  = result.pr_results  ?? [];
 
-    // Build artifact_id → adr result lookup
-    const adrByArtifact = new Map<string, any>();
+    // Build primary_location → adr result lookup. Falls back to bare
+    // artifact_id when primary_location isn't present on either side (older
+    // backend payloads, pre primary_location fix) — this fallback must match
+    // whatever key groups[] resolves to below (_groupLocKey), NOT rowId()'s
+    // fallback, since AdrEntry never carries current_version to reconstruct
+    // an artifactId@version key from.
+    const adrByLoc = new Map<string, any>();
     for (const r of adrResults) {
-      adrByArtifact.set(r.artifact_id, r.result ?? r);
+      adrByLoc.set(r.primary_location ?? r.artifact_id, r.result ?? r);
     }
 
     // Walk pr_results in order — they match successful adr_results positionally
@@ -1102,8 +1114,8 @@ export class SummaryReportComponent implements OnInit {
 
     if (groups.length > 0) {
       return groups.map(g => {
-        const artifactId = g.parsed?.artifact_id ?? g.artifact_id ?? '';
-        const adr        = adrByArtifact.get(artifactId);
+        const groupLocKey = g.primary_location ?? g.parsed?.artifact_id ?? g.artifact_id ?? '';
+        const adr        = adrByLoc.get(groupLocKey);
         const confidence = g.ai_reasoning?.confidence_score;
 
         if (adr?.success === true) {
@@ -1301,17 +1313,40 @@ export class SummaryReportComponent implements OnInit {
     this.expandedId.update(cur => cur === id ? null : id);
   }
 
+  // Stable per-row identity. primary_location (groupId:artifactId@version)
+  // is the real unique key — falls back to artifact_id@version for older
+  // backend payloads that predate the primary_location fix, and finally to
+  // bare artifact_id only if even the version is missing. Do NOT use bare
+  // artifact_id alone: two rows can share an artifact_id at different
+  // versions, and comparing on that would make expanding one row also
+  // expand the other.
+  rowId(dep: DepGroup): string {
+    if (dep.primary_location) return dep.primary_location;
+    const artifactId = dep.parsed?.artifact_id ?? dep.artifact_id ?? '';
+    const version    = dep.parsed?.current_version ?? dep.current_version ?? '';
+    return version ? `${artifactId}@${version}` : artifactId;
+  }
+
   // ── Escalation report download ────────────────────────────────────────────
-  // Escalation .txt filenames are written as escalation_{artifact_id}_{ts}.txt,
-  // so a substring match against the artifact_id reliably finds the file
-  // written for a given dependency without needing an explicit backend link.
+  // Escalation .txt filenames are written as
+  // escalation_{artifact_id}_{version_slug}_{ts|pipeline_id}.txt, where
+  // version_slug sanitizes current_version the same way the backend does
+  // (non [A-Za-z0-9._-] chars → '_'). Matching on artifact_id alone would
+  // hit whichever escalation file happens to come first when two versions
+  // of the same dependency both escalated.
   private _escalationFiles = (): string[] =>
     this.status()?.result?.summary?.escalation_files ?? [];
 
   escalationFileFor(dep: DepGroup): string | null {
     const artifactId = dep.parsed?.artifact_id ?? dep.artifact_id;
     if (!artifactId) return null;
-    const match = this._escalationFiles().find(path => path.includes(artifactId));
+    const version = dep.parsed?.current_version ?? dep.current_version ?? '';
+    const versionSlug = version.replace(/[^A-Za-z0-9._-]/g, '_');
+    const files = this._escalationFiles();
+    const preciseMatch = versionSlug
+      ? files.find(path => path.includes(`${artifactId}_${versionSlug}`))
+      : undefined;
+    const match = preciseMatch ?? files.find(path => path.includes(artifactId));
     return match ? (match.split('/').pop() ?? match) : null;
   }
 
