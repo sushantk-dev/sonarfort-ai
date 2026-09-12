@@ -58,6 +58,21 @@ def _disable_ssl_verification() -> None:
     import requests
     import urllib3
 
+    # 0) Undo any `truststore` injection, if present (standalone package or
+    #    pip's vendored copy at pip._vendor.truststore — it replaces
+    #    ssl.SSLContext process-wide with a wrapper routed through the OS
+    #    certificate store). Harmless no-op if truststore was never injected.
+    #    Kept as a first line of defense; the real fix for the
+    #    check_hostname/verify_mode ordering crash is step (1b) below, which
+    #    works regardless of whether this step actually changes anything.
+    for _mod_name in ("truststore", "pip._vendor.truststore"):
+        try:
+            import importlib
+            _ts = importlib.import_module(_mod_name)
+            _ts.extract_from_ssl()
+        except Exception:
+            pass
+
     # 1) `requests` / anything built on requests.adapters.HTTPAdapter
     #    (incl. the GCS client's AuthorizedSession transport).
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -67,6 +82,84 @@ def _disable_ssl_verification() -> None:
         return _orig_cert_verify(self, conn, url, False, cert)
 
     requests.adapters.HTTPAdapter.cert_verify = _no_verify_cert_verify
+
+    # 1b) The actual fix for "Cannot set verify_mode to CERT_NONE when
+    #     check_hostname is enabled". Root cause, confirmed by reading
+    #     urllib3's own source and reproducing the crash directly:
+    #
+    #     urllib3.connection._ssl_wrap_socket_and_match_hostname() has two
+    #     paths depending on whether an HTTPSConnection already has an
+    #     explicit `ssl_context` set (self.ssl_context, e.g. one a library
+    #     like google-auth built and configured itself):
+    #       - ssl_context is None  → urllib3 builds one via
+    #         create_urllib3_context(), which already sets check_hostname
+    #         and verify_mode in the safe order. No crash here.
+    #       - ssl_context is given → urllib3 reuses it AS-IS and immediately
+    #         does `context.verify_mode = resolve_cert_reqs(cert_reqs)`
+    #         UNCONDITIONALLY, before it ever gets to the code further down
+    #         that would set check_hostname=False. If that pre-built context
+    #         still has its default check_hostname=True (true for any plain
+    #         `ssl.SSLContext()`), this line raises immediately.
+    #     Patching create_urllib3_context (attempted previously) does nothing
+    #     for this path, since that function is never called when a caller
+    #     supplies its own ssl_context.
+    #
+    #     Fix: wrap _ssl_wrap_socket_and_match_hostname itself and force
+    #     check_hostname=False on any incoming pre-built ssl_context before
+    #     handing off to the original function — so by the time it does its
+    #     unconditional verify_mode assignment, check_hostname is already off.
+    #     Verified directly against this urllib3 install: reproduces the
+    #     exact ValueError without this patch, and is fixed with it.
+    try:
+        import urllib3.connection as _u3_conn
+
+        _orig_wrap_and_match = _u3_conn._ssl_wrap_socket_and_match_hostname
+
+        def _patched_wrap_and_match(*args, **kwargs):
+            _ctx = kwargs.get("ssl_context")
+            if _ctx is not None:
+                try:
+                    _ctx.check_hostname = False
+                except Exception:
+                    pass
+            return _orig_wrap_and_match(*args, **kwargs)
+
+        _u3_conn._ssl_wrap_socket_and_match_hostname = _patched_wrap_and_match
+    except Exception:
+        pass
+
+    # 1c) Belt-and-suspenders: also make create_urllib3_context() itself
+    # defensive, for the `ssl_context is None` path and any other code that
+    # calls it directly rather than through _ssl_wrap_socket_and_match_hostname.
+    try:
+        import importlib
+        import urllib3.util.ssl_ as _u3_ssl
+
+        _orig_create_urllib3_context = _u3_ssl.create_urllib3_context
+
+        def _patched_create_urllib3_context(*args, **kwargs):
+            ctx = _orig_create_urllib3_context(*args, **kwargs)
+            try:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            except Exception:
+                pass
+            return ctx
+
+        _u3_ssl.create_urllib3_context = _patched_create_urllib3_context
+        # Some urllib3 versions import the name directly into these modules
+        # (`from .util.ssl_ import create_urllib3_context`), so patching the
+        # module it lives in doesn't change those already-bound references —
+        # patch each module's own copy of the name too.
+        for _mod_name in ("urllib3.connection", "urllib3.connectionpool"):
+            try:
+                _mod = importlib.import_module(_mod_name)
+                if hasattr(_mod, "create_urllib3_context"):
+                    _mod.create_urllib3_context = _patched_create_urllib3_context
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # 2) Bare `ssl`/`urllib`-based HTTPS clients that don't go through
     #    `requests` at all (defense in depth for any library that uses
