@@ -441,7 +441,6 @@ export class PipelineComponent {
   showInput = signal(false);
 
   // ── Delegate to service ───────────────────────────────────────────────────
-  running()  { return this.state.running(); }
   error()    { return this.state.error(); }
   selected() { return this.state.selected(); }
 

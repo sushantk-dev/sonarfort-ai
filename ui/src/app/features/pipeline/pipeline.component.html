@@ -19,11 +19,12 @@
         <span class="api-badge__dot"></span>
         {{ state.apiOnline() === false ? 'API offline' : state.apiOnline() === null ? 'Checking…' : 'API connected' }}
       </span>
-      <!-- Source-aware run button -->
+      <!-- Source-aware run button — no longer disabled while another Sonar
+           run is active: several Sonar runs can now be in flight at once,
+           same as Fortify. -->
       <button class="run-btn run-btn--sonar"
               *ngIf="activeSource() === 'sonar'"
-              (click)="showForm.set(!showForm()); showFortifyForm.set(false)"
-              [disabled]="running()">
+              (click)="showForm.set(!showForm()); showFortifyForm.set(false)">
         <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
           <path d="M1.5 1L9.5 5.5L1.5 10V1Z" fill="currentColor"/>
         </svg>
@@ -295,9 +296,9 @@
         Maven Build
         <span class="flag-toggle__state" *ngIf="runBuild()">ON</span>
       </label>
-      <button class="run-form__submit" (click)="startRun()" [disabled]="running()">
-        <span *ngIf="!running()">▶ Start</span>
-        <span *ngIf="running()" class="spinner"></span>
+      <button class="run-form__submit" (click)="startRun()" [disabled]="state.submitting() === 'start'">
+        <span *ngIf="state.submitting() !== 'start'">▶ Start</span>
+        <span *ngIf="state.submitting() === 'start'" class="spinner"></span>
       </button>
     </div>
     <span class="run-form__field-error run-form__field-error--issues" *ngIf="sonarIssuesMissingError()">
@@ -772,8 +773,10 @@
               </svg>
               {{ showInput() ? 'Hide Input' : 'View Input' }}
             </button>
+            <!-- Restart just opens the Sonar form prefilled — no longer
+                 blocked by running(): several Sonar runs can be in flight
+                 at once, so an existing run shouldn't stop starting another. -->
             <button class="action-btn action-btn--restart"
-                    [disabled]="running()"
                     (click)="restartRun(run.request!)">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <path d="M2 6A4 4 0 1 1 6 10" stroke="currentColor" stroke-width="1.4"
