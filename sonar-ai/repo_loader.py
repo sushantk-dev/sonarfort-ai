@@ -34,11 +34,12 @@ def clone_repo(
     run_id: str = "",
 ) -> git.Repo:
     """
-    Clone ``repo_url`` into ``clone_base_dir/<repo-name>[__<run_id>]`` and
+    Clone ``repo_url`` into ``clone_base_dir/<repo-name>[__<run_id_short>]`` and
     check out ``commit_sha``.
 
     run_id scoping (concurrency fix): when ``run_id`` is provided, the local
-    directory is suffixed with it (``<repo-name>__<run_id>``) instead of the
+    directory is suffixed with its first 8 hex characters
+    (``<repo-name>__<run_id_short>``) instead of the
     old shared ``<repo-name>`` path. Two runs against the SAME repo used to
     resolve to the identical working directory — if they ever executed at
     the same time (now possible: worker.py can run several jobs
@@ -68,7 +69,13 @@ def clone_repo(
     """
     auth_url = _inject_token(repo_url, github_token)
     repo_name = _repo_name_from_url(repo_url)
-    dir_name = f"{repo_name}__{run_id}" if run_id else repo_name
+    # Short suffix only (first 8 hex chars of the run_id) rather than the
+    # full UUID — Windows has a 260-char MAX_PATH ceiling, and every extra
+    # character here eats into the headroom for the repo's own (sometimes
+    # very deep) paths. 8 hex chars is still effectively collision-free for
+    # telling concurrent runs apart locally.
+    run_suffix = run_id[:8] if run_id else ""
+    dir_name = f"{repo_name}__{run_suffix}" if run_suffix else repo_name
     local_path = Path(clone_base_dir) / dir_name
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
