@@ -58,8 +58,13 @@ def deliver(state: AgentState) -> AgentState:
     )
 
     # ── Dry-run guard ────────────────────────────────────────────────────────
-    import os as _os
-    if _os.environ.get("SONAR_AI_DRY_RUN") == "1":
+    # Read the per-run flag from state (threaded through by graph.run_pipeline)
+    # instead of a process-wide os.environ flag. The old
+    # os.environ.get("SONAR_AI_DRY_RUN") == "1" check read a flag the worker
+    # set per-job and never reset — in a long-lived worker process handling
+    # several jobs (concurrently or one after another), one dry-run request
+    # could leak into a later real run and silently skip its commit/push/PR.
+    if state.get("dry_run", False):
         logger.info("[Deliver] DRY RUN — skipping commit, push, and PR creation")
         patch_preview = state.get("generator_output", {}).get("patch_hunks", "")[:500]
         logger.info(f"[Deliver] DRY RUN patch preview:\n{patch_preview}")
@@ -101,11 +106,20 @@ def deliver(state: AgentState) -> AgentState:
     )
 
     # ── Sonar rescan (Iteration 2) ────────────────────────────────────────────
+    # Per-run override, falling back to the settings default — see note above
+    # about state["dry_run"] for why this no longer reads a global toggle.
     sonar_rescan_ok: Optional[bool] = None
     sonar_rescan_message = ""
-    if settings.enable_sonar_rescan:
+    if state.get("enable_sonar_rescan", settings.enable_sonar_rescan):
         try:
             from sonar_rescan import rescan_issue
+            # NOTE: sonar_rescan.py wasn't in scope for this fix, so this
+            # still calls through with whatever token rescan_issue() reads
+            # internally (likely settings.sonar_token) rather than the
+            # per-run state["sonar_token"] override used elsewhere in this
+            # file. If rescan_issue() reads settings.sonar_token directly,
+            # it has the same cross-job-leak risk as github_token below —
+            # worth threading a sonar_token param through the same way.
             sonar_rescan_ok, sonar_rescan_message = rescan_issue(
                 issue_key=issue["key"],
                 component_key=issue["component"],
@@ -155,7 +169,7 @@ def deliver(state: AgentState) -> AgentState:
         return {**state, "escalation_path": path, "done": True, **_append_result(state, result)}
 
     # ── Store fix in RAG (Iteration 2) ────────────────────────────────────────
-    if settings.enable_rag:
+    if state.get("enable_rag", settings.enable_rag):
         try:
             from rag_store import store_fix
             store_fix(
@@ -379,7 +393,12 @@ def _find_existing_pr(state: AgentState) -> Optional[str]:
     if not fix_branch or not repo_url:
         return None
 
-    gh = Github(settings.github_token, base_url=settings.github_base_url, verify=False)
+    # Per-run token override (state) takes priority over the process-wide
+    # settings default — this used to always read settings.github_token,
+    # which the worker mutated in-place per job ("safe" only when it ran one
+    # job at a time). Under concurrent runs that would leak one run's token
+    # into another's PR calls.
+    gh = Github(state.get("github_token") or settings.github_token, base_url=settings.github_base_url, verify=False)
     repo_name = _repo_name_from_url(repo_url)
     gh_repo = gh.get_repo(repo_name)
 
@@ -416,7 +435,7 @@ def _open_pr(
     sonar_rescan_message: str = "",
 ) -> str:
     """Open a GitHub PR and return the PR URL."""
-    gh = Github(settings.github_token, base_url=settings.github_base_url, verify=False)
+    gh = Github(state.get("github_token") or settings.github_token, base_url=settings.github_base_url, verify=False)
 
     repo_url = state["repo_url"]
     repo_name = _repo_name_from_url(repo_url)

@@ -85,13 +85,15 @@ def validate(state: AgentState) -> AgentState:
     logger.info("[Validator] Diff applied successfully")
 
     # ── Step 3/4: Maven compile + test — opt-in per run ──────────────────────
-    # Off by default (settings.run_maven_build). A real `mvn compile`/`mvn test`
+    # Off by default (settings.run_maven_build, unless this run overrode it —
+    # see state["run_build"], threaded through by graph.run_pipeline instead
+    # of a process-wide settings mutation). A real `mvn compile`/`mvn test`
     # costs real CI minutes per issue, so it only runs when the caller explicitly
     # asked for it via PipelineRunRequest.run_build for this run. When skipped,
     # the diff-apply success above is the only validation performed and both
     # flags are reported as passed so downstream logic (retry/escalation) treats
     # it the same as a clean build.
-    if not settings.run_maven_build:
+    if not state.get("run_build", settings.run_maven_build):
         logger.info("[Validator] Maven build validation disabled for this run — skipping compile/test")
         result["compile_ok"] = True
         result["tests_ok"] = True

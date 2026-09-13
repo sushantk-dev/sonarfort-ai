@@ -17,12 +17,63 @@ Iteration 3 additions:
 Iteration 4 additions:
   - severities         : comma-separated severity filter passed from the UI
                          e.g. "BLOCKER,CRITICAL" — applied in node_ingest
+
+Iteration 5 additions (concurrency fixes):
+  - run_id             : unique id for this pipeline run. Used to scope the
+                         cloned repo's local working directory (see
+                         repo_loader.clone_repo) so two runs — including two
+                         concurrent runs against the SAME repo — never share
+                         a git working tree and stomp on each other's
+                         checkout/reset/branch state.
+  - dry_run            : per-run dry-run flag, now carried in-state instead
+                         of a process-wide `os.environ["SONAR_AI_DRY_RUN"]`
+                         flag. The old env-var approach leaked across jobs
+                         in the long-lived worker process — one dry-run
+                         request could silently flip a concurrent (or
+                         later) real run into dry-run mode, or vice versa.
+  - cancel_check       : optional zero-arg callable the worker supplies;
+                         returns True once the run has been marked
+                         cancelled in the backing store (GCS/Redis/etc).
+                         Checked at the top of every node (see graph.py's
+                         _check_cancelled) so a Stop click actually
+                         interrupts a running pipeline between steps
+                         instead of only being noticed before the graph
+                         starts. Never persisted anywhere — it's a runtime
+                         callable living only in the in-memory AgentState
+                         LangGraph passes between nodes for this one
+                         process.invoke() call.
+  - github_token       : per-run GitHub token override (PipelineRunRequest).
+  - sonar_token        : per-run Sonar token override (PipelineRunRequest).
+  - run_build          : per-run Maven build-validation opt-in.
+  - parallel_issues    : per-run "fan out issues via LangGraph Send" toggle.
+  - enable_rag         : per-run RAG-retrieval toggle.
+  - enable_sonar_rescan: per-run post-fix Sonar rescan toggle.
+                         These six all used to be applied by mutating the
+                         process-wide `settings` singleton and/or
+                         `os.environ` for "the duration of a job" — safe
+                         only when the worker ran one job at a time. Now
+                         that the worker can run several jobs concurrently
+                         on separate threads, every consumer (repo_loader,
+                         deliver.py, validator.py, agents.py) reads these
+                         from `state` first and only falls back to the
+                         `settings` singleton default when the run didn't
+                         override it, so concurrent runs can never see or
+                         clobber each other's credentials/flags.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from typing_extensions import TypedDict
+
+
+class PipelineCancelled(Exception):
+    """
+    Raised by graph._check_cancelled() when a node notices (via
+    state["cancel_check"]) that this run was marked cancelled in the backing
+    store. Caught by graph.run_pipeline() to unwind out of app.invoke()
+    cleanly instead of running the rest of the pipeline to completion.
+    """
 
 
 class SonarIssue(TypedDict):
@@ -125,6 +176,21 @@ class AgentState(TypedDict, total=False):
     # ── Severity filter (Iteration 4) ────────────────────────────────────────
     severities: str                 # Comma-separated e.g. "BLOCKER,CRITICAL,MAJOR"
                                     # Applied in node_ingest before any processing
+
+    # ── Per-run identity / overrides (Iteration 5 — concurrency fixes) ───────
+    run_id: str                     # Unique id for this run; scopes the repo
+                                    # clone dir so concurrent runs never collide
+    dry_run: bool                   # Skip commit/push/PR — read here, not from
+                                    # a process-wide os.environ flag
+    github_token: str               # Per-run override; falls back to settings
+    sonar_token: str                # Per-run override; falls back to settings
+    run_build: bool                 # Per-run Maven build-validation opt-in
+    parallel_issues: bool           # Per-run intra-run issue fan-out toggle
+    enable_rag: bool                # Per-run RAG-retrieval toggle
+    enable_sonar_rescan: bool       # Per-run post-fix Sonar rescan toggle
+    cancel_check: Any               # Optional zero-arg callable — True once
+                                    # this run has been cancelled. Runtime-only,
+                                    # never serialized. See _check_cancelled.
 
     # ── Parsed issues ─────────────────────────────────────────────────────────
     issues: list[SonarIssue]        # All parsed, filtered, sorted issues

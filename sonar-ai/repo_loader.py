@@ -31,14 +31,30 @@ def clone_repo(
     clone_base_dir: str,
     github_token: str,
     commit_sha: str,
+    run_id: str = "",
 ) -> git.Repo:
     """
-    Clone ``repo_url`` into ``clone_base_dir/<repo-name>`` and check out ``commit_sha``.
+    Clone ``repo_url`` into ``clone_base_dir/<repo-name>[__<run_id>]`` and
+    check out ``commit_sha``.
+
+    run_id scoping (concurrency fix): when ``run_id`` is provided, the local
+    directory is suffixed with it (``<repo-name>__<run_id>``) instead of the
+    old shared ``<repo-name>`` path. Two runs against the SAME repo used to
+    resolve to the identical working directory — if they ever executed at
+    the same time (now possible: worker.py can run several jobs
+    concurrently), one run's ``git reset --hard`` / branch checkout / commit
+    would blow away the other's in-progress file state mid-flight, which
+    looked exactly like that other run had been stopped or corrupted even
+    though nobody touched it directly. Scoping by run_id gives every run its
+    own working tree, so concurrent runs — including two on the same repo —
+    can never step on each other. ``run_id=""`` (e.g. ad-hoc CLI usage via
+    main.py, which only ever does one run per process) keeps the old shared
+    path and its "reuse the clone across issues" fast-path.
 
     Skip re-clone if the directory already exists — open the existing repo, refresh
     the auth URL, and only fetch from origin when the target commit is not yet local.
-    This makes sequential multi-issue runs fast: the first issue clones once, every
-    subsequent issue for the same repo reuses the local copy.
+    This makes sequential multi-issue runs (within ONE run_id) fast: the first
+    issue clones once, every subsequent issue for the same run reuses the local copy.
 
     Safety guarantees on reuse:
       - Stale / dirty working tree is hard-reset to HEAD before checkout, so a
@@ -52,7 +68,8 @@ def clone_repo(
     """
     auth_url = _inject_token(repo_url, github_token)
     repo_name = _repo_name_from_url(repo_url)
-    local_path = Path(clone_base_dir) / repo_name
+    dir_name = f"{repo_name}__{run_id}" if run_id else repo_name
+    local_path = Path(clone_base_dir) / dir_name
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
     if local_path.exists():

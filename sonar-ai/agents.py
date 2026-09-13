@@ -457,7 +457,7 @@ def retrieve_rag_context(state: AgentState) -> AgentState:
     Populates state['rag_context'].
     Silently no-ops (empty context) if RAG is disabled or unavailable.
     """
-    if not settings.enable_rag:
+    if not state.get("enable_rag", settings.enable_rag):
         empty: RAGContext = {"rule_key": "", "similar_fixes": [], "retrieved_count": 0}
         return {**state, "rag_context": empty}
 
@@ -528,7 +528,14 @@ def fetch_sonar_rule(state: AgentState) -> AgentState:
         "fix_summary": "",
     }
 
-    if not settings.sonar_token or not settings.sonar_host_url:
+    # Per-run sonar_token override — falls back to the settings default. See
+    # note in deliver.py: this used to always read the settings singleton,
+    # which the worker mutated per job (safe only when jobs ran one at a
+    # time, not once the worker runs several concurrently).
+    sonar_token    = state.get("sonar_token") or settings.sonar_token
+    sonar_host_url = settings.sonar_host_url
+
+    if not sonar_token or not sonar_host_url:
         logger.info(
             f"[RuleFetch] SONAR_TOKEN/HOST not configured — skipping rule fetch for {rule_key}"
         )
@@ -541,10 +548,10 @@ def fetch_sonar_rule(state: AgentState) -> AgentState:
         import html as _html
         import re as _re
 
-        base_url = settings.sonar_host_url.rstrip("/")
+        base_url = sonar_host_url.rstrip("/")
         resp = _req.get(
             f"{base_url}/api/rules/show",
-            auth=(settings.sonar_token, ""),
+            auth=(sonar_token, ""),
             params={"key": rule_key},
             timeout=15,
             verify=False,

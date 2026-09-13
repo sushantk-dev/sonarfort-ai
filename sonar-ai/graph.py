@@ -20,14 +20,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Literal, Annotated
+from typing import Literal, Annotated, Optional, Callable
 import operator
 
 from loguru import logger
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send
 
-from state import AgentState, SonarIssue, IssueResult
+from state import AgentState, SonarIssue, IssueResult, PipelineCancelled
 from config import settings, configure_langsmith
 from parser import parse_sonar_report, load_rule_kb
 from repo_loader import clone_repo, create_fix_branch, resolve_java_file, extract_method_context
@@ -36,10 +36,28 @@ from validator import validate
 from deliver import deliver
 
 
+# ── Cancellation ──────────────────────────────────────────────────────────────
+#
+# state["cancel_check"] is an optional zero-arg callable the worker supplies
+# (see worker.py) that returns True once this run has been marked cancelled
+# in the backing store. Every node checks it on entry via this helper, so a
+# Stop click actually interrupts a running pipeline between LangGraph steps
+# instead of only being noticed before app.invoke() is called (which used to
+# mean a Stop click had no effect until the *entire* multi-issue run finished
+# on its own).
+
+def _check_cancelled(state: AgentState, node_name: str) -> None:
+    cancel_check = state.get("cancel_check")
+    if cancel_check is not None and cancel_check():
+        logger.info(f"[{node_name}] Cancellation detected — stopping pipeline")
+        raise PipelineCancelled(node_name)
+
+
 # ── Node: ingest ──────────────────────────────────────────────────────────────
 
 def node_ingest(state: AgentState) -> AgentState:
     """Parse the Sonar report, load the Rule KB, set up the issue queue."""
+    _check_cancelled(state, "Ingest")
     logger.info("[Ingest] Parsing Sonar report...")
     issues = parse_sonar_report(state["sonar_report_path"])
     rule_kb = load_rule_kb()
@@ -97,14 +115,16 @@ def node_ingest(state: AgentState) -> AgentState:
 
 def node_load_repo(state: AgentState) -> AgentState:
     """Clone the repo, checkout commit SHA, resolve file path, extract method context."""
+    _check_cancelled(state, "LoadRepo")
     issue = state["current_issue"]
     logger.info(f"[LoadRepo] Loading repo for issue {issue['rule_key']}")
 
     repo = clone_repo(
         repo_url=state["repo_url"],
         clone_base_dir=settings.clone_dir,
-        github_token=settings.github_token,
+        github_token=state.get("github_token") or settings.github_token,
         commit_sha=state["commit_sha"],
+        run_id=state.get("run_id", ""),
     )
 
     repo_local_path = str(repo.working_dir)
@@ -149,6 +169,7 @@ def node_load_repo(state: AgentState) -> AgentState:
 
 def node_rag_retrieve(state: AgentState) -> AgentState:
     """Retrieve similar prior fixes from ChromaDB (Iteration 2)."""
+    _check_cancelled(state, "RAG")
     return retrieve_rag_context(state)
 
 
@@ -156,6 +177,7 @@ def node_rag_retrieve(state: AgentState) -> AgentState:
 
 def node_fetch_rule(state: AgentState) -> AgentState:
     """Fetch live rule details from SonarQube /api/rules/show (Iteration 3)."""
+    _check_cancelled(state, "RuleFetch")
     return fetch_sonar_rule(state)
 
 
@@ -163,6 +185,7 @@ def node_fetch_rule(state: AgentState) -> AgentState:
 
 def node_plan(state: AgentState) -> AgentState:
     """LLM·1 Planner — analyse issue and produce fix strategy."""
+    _check_cancelled(state, "Planner")
     return plan_fix(state)
 
 
@@ -175,6 +198,7 @@ def node_plan(state: AgentState) -> AgentState:
 
 def node_critique(state: AgentState) -> AgentState:
     """LLM·3 Critic — review the generated patch."""
+    _check_cancelled(state, "Critic")
     return critique_fix(state)
 
 
@@ -182,6 +206,7 @@ def node_critique(state: AgentState) -> AgentState:
 
 def node_validate(state: AgentState) -> AgentState:
     """Apply diff and run mvn compile + test."""
+    _check_cancelled(state, "Validate")
     return validate(state)
 
 
@@ -189,6 +214,7 @@ def node_validate(state: AgentState) -> AgentState:
 
 def node_deliver(state: AgentState) -> AgentState:
     """Commit, push, open PR or write escalation. Store fix in RAG."""
+    _check_cancelled(state, "Deliver")
     return deliver(state)
 
 
@@ -199,6 +225,7 @@ def node_advance_issue(state: AgentState) -> AgentState:
     Move the pointer to the next issue in the queue.
     Resets per-issue state fields and sets current_issue.
     """
+    _check_cancelled(state, "Pipeline")
     issues = state.get("issues", [])
     idx = state.get("current_issue_index", 0) + 1
 
@@ -262,6 +289,7 @@ def node_generate(state: AgentState) -> AgentState:
     Increments retry_count when the critic has previously rejected the patch,
     so generate_fix() sees the correct count and decays temperature accordingly.
     """
+    _check_cancelled(state, "Generator")
     critic_out = state.get("critic_output", {})
     # If the critic has run and rejected, this is a retry — increment before calling generate
     if critic_out and not critic_out.get("approved", True):
@@ -385,6 +413,7 @@ def node_fan_out(state: AgentState) -> list[Send]:
     Emit one Send per issue to run them in parallel via LangGraph's Send API.
     Caps concurrency via max_parallel_workers by batching if needed.
     """
+    _check_cancelled(state, "FanOut")
     issues = state.get("issues", [])
     base_state = {k: v for k, v in state.items() if k != "issues"}
 
@@ -474,9 +503,21 @@ def build_parallel_graph() -> StateGraph:
 
 # ── Public runner ─────────────────────────────────────────────────────────────
 
-def build_graph():
-    """Return the appropriate graph based on settings."""
-    if settings.parallel_issues:
+def build_graph(parallel_issues: Optional[bool] = None):
+    """
+    Return the appropriate graph based on the per-run override if given,
+    else the process-wide settings default.
+
+    Reading `settings.parallel_issues` unconditionally here used to mean the
+    per-run "parallel" checkbox (PipelineRunRequest.parallel) had NO effect
+    in the long-lived worker process — `settings` is a singleton built once
+    at import time, and the old worker mutated `os.environ["PARALLEL_ISSUES"]`
+    per job, which doesn't retroactively change an already-constructed
+    pydantic Settings object. Accepting the resolved value as a parameter
+    (see run_pipeline below) makes the per-run toggle actually take effect.
+    """
+    use_parallel = settings.parallel_issues if parallel_issues is None else parallel_issues
+    if use_parallel:
         logger.info("[Graph] Using PARALLEL fan-out graph")
         return build_parallel_graph()
     logger.info("[Graph] Using SEQUENTIAL multi-issue graph")
@@ -489,6 +530,15 @@ def run_pipeline(
     commit_sha: str,
     max_issues: int = 0,
     severities: str = "BLOCKER,CRITICAL,MAJOR,MINOR,INFO",   # ← NEW
+    run_id: str = "",
+    dry_run: Optional[bool] = None,
+    github_token: Optional[str] = None,
+    sonar_token: Optional[str] = None,
+    run_build: Optional[bool] = None,
+    parallel_issues: Optional[bool] = None,
+    enable_rag: Optional[bool] = None,
+    enable_sonar_rescan: Optional[bool] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> AgentState:
     """
     Run the full SonarAI pipeline for all issues in the report.
@@ -500,14 +550,30 @@ def run_pipeline(
         max_issues:        Cap on issues to process (0 = no limit)
         severities:        Comma-separated severities to fix,
                            e.g. "BLOCKER,CRITICAL" — defaults to all five
+        run_id:            Unique id for this run. Scopes the cloned repo's
+                           local working directory (see repo_loader.clone_repo)
+                           so concurrent runs — including two runs against the
+                           SAME repo — never share a git working tree.
+        dry_run, github_token, sonar_token, run_build, parallel_issues,
+        enable_rag, enable_sonar_rescan:
+                           Per-run overrides (PipelineRunRequest). None means
+                           "use the settings.* default" so CLI/main.py callers
+                           that still set env vars before import keep working.
+                           Carried in AgentState instead of a process-wide
+                           os.environ/settings mutation so concurrent runs in
+                           the same worker process can never see or clobber
+                           each other's values.
+        cancel_check:      Optional zero-arg callable returning True once this
+                           run has been marked cancelled. Checked at the top
+                           of every node — see _check_cancelled.
 
     Returns:
-        Final AgentState after the pipeline completes.
+        Final AgentState after the pipeline completes (or is cancelled).
     """
     # Bootstrap LangSmith tracing (Iteration 2)
     configure_langsmith()
 
-    app = build_graph()
+    app = build_graph(parallel_issues)
 
     initial_state: AgentState = {
         "sonar_report_path": sonar_report_path,
@@ -515,6 +581,15 @@ def run_pipeline(
         "commit_sha": commit_sha,
         "max_issues": max_issues or settings.max_issues,
         "severities": severities or "BLOCKER,CRITICAL,MAJOR,MINOR,INFO",   # ← NEW
+        "run_id": run_id,
+        "dry_run": bool(dry_run),
+        "github_token": github_token or settings.github_token,
+        "sonar_token": sonar_token or settings.sonar_token,
+        "run_build": settings.run_maven_build if run_build is None else run_build,
+        "parallel_issues": settings.parallel_issues if parallel_issues is None else parallel_issues,
+        "enable_rag": settings.enable_rag if enable_rag is None else enable_rag,
+        "enable_sonar_rescan": settings.enable_sonar_rescan if enable_sonar_rescan is None else enable_sonar_rescan,
+        "cancel_check": cancel_check,
         "pipeline_results": [],
         "errors": [],
     }
@@ -525,13 +600,23 @@ def run_pipeline(
     logger.info(f"  repo       : {repo_url}")
     logger.info(f"  commit     : {commit_sha}")
     logger.info(f"  severities : {severities}")              # ← NEW
-    logger.info(f"  parallel   : {settings.parallel_issues}")
-    logger.info(f"  rag        : {settings.enable_rag}")
-    logger.info(f"  rescan     : {settings.enable_sonar_rescan}")
+    logger.info(f"  run_id     : {run_id}")
+    logger.info(f"  dry_run    : {initial_state['dry_run']}")
+    logger.info(f"  parallel   : {initial_state['parallel_issues']}")
+    logger.info(f"  rag        : {initial_state['enable_rag']}")
+    logger.info(f"  rescan     : {initial_state['enable_sonar_rescan']}")
     logger.info("=" * 60)
 
     try:
         final_state = app.invoke(initial_state)
+    except PipelineCancelled:
+        logger.warning("[Pipeline] Cancelled mid-run — stopping between steps")
+        final_state = {
+            **initial_state,
+            "errors": initial_state.get("errors", []) + ["Pipeline cancelled by user"],
+            "pipeline_results": initial_state.get("pipeline_results", []),
+            "done": True,
+        }
     except KeyboardInterrupt:
         logger.warning("[Pipeline] Interrupted by user (KeyboardInterrupt)")
         final_state = {
