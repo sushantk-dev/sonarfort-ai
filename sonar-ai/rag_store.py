@@ -216,6 +216,27 @@ def _get_collection():
         import chromadb
         from config import settings
         persist_dir = settings.chroma_persist_dir
+
+        # Guard: chroma_persist_dir must be a real local filesystem path.
+        # A common misconfiguration is pasting the GCS location here
+        # (e.g. "gs://bucket/prefix") — that belongs in the separate
+        # chroma_gcs_bucket / chroma_gcs_prefix settings instead; ChromaDB
+        # itself only ever reads/writes local disk (SQLite + HNSW segment
+        # files), never GCS directly (see _sync_from_gcs/_sync_to_gcs for
+        # the actual GCS sync layer). Without this check, a URI-scheme
+        # value here fails deep inside Path(...).mkdir() with a cryptic
+        # OS-level error (e.g. WinError 123 on Windows, since "gs:" looks
+        # like an invalid drive prefix) that gives no hint what's wrong.
+        if "://" in persist_dir:
+            raise ValueError(
+                f"chroma_persist_dir is set to a URI ({persist_dir!r}), but it "
+                "must be a local filesystem path — ChromaDB only reads/writes "
+                "local disk. If you meant to enable GCS-backed persistence, "
+                "set chroma_gcs_bucket (bucket name only, no 'gs://') and "
+                "chroma_gcs_prefix instead, and leave chroma_persist_dir as a "
+                "real local path (or unset it to use the default temp dir)."
+            )
+
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
         _sync_from_gcs(persist_dir)  # restore prior state from GCS, if configured
         _chroma_client = chromadb.PersistentClient(path=persist_dir)
