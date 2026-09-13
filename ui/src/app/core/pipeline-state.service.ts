@@ -187,11 +187,10 @@ export class PipelineStateService {
 
   get allRuns()  { return this.runs(); }
 
-  /** Drives the header "Stop Run" button — Sonar only. Fortify runs each get
-   *  their own per-card Stop button (canCancelRun below) since several can be
-   *  in flight at once (this browser's own runs, plus teammates' runs visible
-   *  via the shared all-users list) — one global button can't scope to "just
-   *  this one" the way a per-card button can. */
+  /** True while the single active Sonar run is in flight. No header button
+   *  reads this anymore — every run (Sonar or Fortify) is stopped from its
+   *  own per-card/detail-pane Stop button instead (see canCancelRun and
+   *  canStopRun below). Kept as the Sonar-side check canStopRun delegates to. */
   get canCancel(){
     return this.running() && !!this._activeRunId && !this._fortifyPolls.has(this._activeRunId);
   }
@@ -205,11 +204,11 @@ export class PipelineStateService {
     return run.source === 'fortify' && (run.status === 'running' || run.status === 'queued');
   }
 
-  /** Drives the per-card Stop button in the run LIST (as opposed to the header
-   *  button or the detail-pane button above). Unifies both sources: any
-   *  Fortify run still in flight (canCancelRun), or the single currently-active
-   *  Sonar run (there's only ever one, so matching on status+source is enough —
-   *  no need to compare against the private _activeRunId here). */
+  /** Drives the per-card Stop button in the run LIST (as opposed to the
+   *  detail-pane button above). Unifies both sources: any Fortify run still
+   *  in flight (canCancelRun), or the single currently-active Sonar run
+   *  (there's only ever one, so matching on status+source is enough — no
+   *  need to compare against the private _activeRunId here). */
   canStopRun(run: UiRun): boolean {
     if (this.canCancelRun(run)) return true;
     return run.source !== 'fortify' && run.status === 'running' && this.canCancel;
@@ -1359,12 +1358,11 @@ export class PipelineStateService {
    * Cancel one run.
    *
    * pipelineId omitted → defaults to the active Sonar run (this._activeRunId).
-   * That's the only backward-compatible default: the header "Stop Run" button
-   * (canCancel getter, above) now only ever shows for the Sonar run — every
-   * Fortify run gets its own per-card Stop button instead, since several can
-   * be in flight at once (this browser's own runs, plus teammates' runs
-   * surfaced by the shared all-users list) and a single global button can't
-   * scope to "just this one".
+   * That's the only backward-compatible default — every run (Sonar or
+   * Fortify) is otherwise stopped from its own per-card/detail-pane Stop
+   * button, since several Fortify runs can be in flight at once (this
+   * browser's own runs, plus teammates' runs surfaced by the shared
+   * all-users list) and a single global button can't scope to "just this one".
    *
    * Previously this always cancelled *every* tracked Fortify run — it read
    * `Array.from(this._fortifyPolls.keys())` and cancelled all of them, so

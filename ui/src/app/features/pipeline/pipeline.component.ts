@@ -446,7 +446,6 @@ export class PipelineComponent {
   selected() { return this.state.selected(); }
 
   get allRuns()  { return this.state.allRuns; }
-  get canCancel(){ return this.state.canCancel; }
   get loadingRuns() { return this.state.loadingRuns(); }
 
   /** Runs filtered to the active source tab — Sonar or Fortify */
@@ -688,7 +687,6 @@ export class PipelineComponent {
     }
   }
 
-  cancelRun() { this.state.cancelRun(); }
   deleteRun(id: string) { this.state.deleteRun(id); }
 
   /** Per-card Stop button in the run list — works for any Fortify run in
