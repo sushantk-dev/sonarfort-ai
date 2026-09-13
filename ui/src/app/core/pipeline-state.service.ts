@@ -205,6 +205,16 @@ export class PipelineStateService {
     return run.source === 'fortify' && (run.status === 'running' || run.status === 'queued');
   }
 
+  /** Drives the per-card Stop button in the run LIST (as opposed to the header
+   *  button or the detail-pane button above). Unifies both sources: any
+   *  Fortify run still in flight (canCancelRun), or the single currently-active
+   *  Sonar run (there's only ever one, so matching on status+source is enough —
+   *  no need to compare against the private _activeRunId here). */
+  canStopRun(run: UiRun): boolean {
+    if (this.canCancelRun(run)) return true;
+    return run.source !== 'fortify' && run.status === 'running' && this.canCancel;
+  }
+
   constructor() {
     this._rehydrate();
   }

@@ -678,6 +678,19 @@
                 class="badge {{ $any(run.outcome) | outcomeClass }}">
             {{ $any(run.outcome) | outcomeLabel }}
           </span>
+          <!-- Stop this job — shown per-card for any run still in flight
+               (Fortify running/queued, or the active Sonar run), so a run
+               can be cancelled straight from the list without opening the
+               detail pane. -->
+          <button *ngIf="canStopRun(run)"
+                  class="run-card__stop"
+                  title="Stop this run"
+                  (click)="stopRun(run.id, $event)">
+            <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+              <rect x="2" y="2" width="7" height="7" rx="1" fill="currentColor"/>
+            </svg>
+            Stop
+          </button>
           <button *ngIf="run.status !== 'running'"
                   class="run-card__del"
                   title="Remove"

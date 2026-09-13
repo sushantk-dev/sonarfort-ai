@@ -691,6 +691,14 @@ export class PipelineComponent {
   cancelRun() { this.state.cancelRun(); }
   deleteRun(id: string) { this.state.deleteRun(id); }
 
+  /** Per-card Stop button in the run list — works for any Fortify run in
+   *  flight or the currently-active Sonar run, matching state.canStopRun(). */
+  canStopRun(run: UiRun) { return this.state.canStopRun(run); }
+  stopRun(id: string, event: Event) {
+    event.stopPropagation();
+    this.state.cancelRun(id);
+  }
+
   // ── Escalation report download ────────────────────────────────────────────
   downloadEscalation(filename: string, event: Event) {
     event.stopPropagation();
