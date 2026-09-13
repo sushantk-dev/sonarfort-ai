@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -150,11 +151,21 @@ def clone_repo(
 def create_fix_branch(repo: git.Repo, rule_key: str, issue_key: str) -> str:
     """
     Create and checkout a new fix branch.  Returns the branch name.
-    Branch name format: fix/sonar-{rule_short}-{issue_key[:8]}
+    Branch name format: fix/sonar-{rule_short}-{short_uuid}
+
+    short_uuid is a fresh random UUID (8 hex chars) rather than a slice of
+    the Sonar issue_key — issue_key can be a long opaque hash that doesn't
+    read cleanly in a branch name, and reusing it also meant re-running the
+    same issue always produced the identical branch name (relying on the
+    "already exists" checkout-instead-of-create fallback below). A random
+    suffix keeps branch names short and readable while guaranteeing a fresh
+    branch per attempt; issue_key is accepted for logging/signature
+    compatibility but no longer feeds the name.
     """
     # Sanitise rule key: "java:S2259" → "S2259"
     rule_short = rule_key.split(":")[-1] if ":" in rule_key else rule_key
-    branch_name = f"fix/sonar-{rule_short}-{issue_key[:8]}"
+    short_uuid = uuid.uuid4().hex[:8]
+    branch_name = f"fix/sonar-{rule_short}-{short_uuid}"
 
     try:
         repo.git.checkout("-b", branch_name)
