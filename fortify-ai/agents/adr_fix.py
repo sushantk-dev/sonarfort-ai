@@ -335,10 +335,11 @@ def invoke_adr(
     required_jdk: Optional[str] = None,
     push: bool = False,
     jira_ticket_id: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> tuple[bool, str, str]:
     """
     Run adr_fortify.py --commit <commit_id> [--push] --target-versions <json>
-    [--jira-ticket <jira_ticket_id>].
+    [--jira-ticket <jira_ticket_id>] [--base-branch <base_branch>].
 
     target_versions: {
         "group_id:artifact_id": {
@@ -364,6 +365,15 @@ def invoke_adr(
         prefixed '<jira_ticket_id> : msg' (no uid there — commit message
         stays clean). None/empty (default) preserves the existing auto-generated naming —
         no behaviour change for callers that don't pass this.
+
+    base_branch: optional parent branch to create the fix branch FROM, e.g.
+        "develop" or "release/2.0". Forwarded to adr_fortify.py as
+        --base-branch, which checks it out (and pulls it) before cutting the
+        new feature branch, and records it as ADR_BRANCH_INFO's base_branch
+        so pr_agent.py opens the PR against that same branch. None/empty
+        (default) preserves adr_fortify.py's own auto-detection (origin/HEAD,
+        falling back to "main"/"master") — no behaviour change for callers
+        that don't pass this.
 
     push: forwarded to adr_fortify.py as --push. adr_fortify.py's --commit
         mode never runs a Maven build itself (that block is disabled — see
@@ -417,6 +427,8 @@ def invoke_adr(
         cmd += ["--required-jdk", str(required_jdk)]
     if jira_ticket_id:
         cmd += ["--jira-ticket", str(jira_ticket_id)]
+    if base_branch:
+        cmd += ["--base-branch", str(base_branch)]
 
     logger.debug(f"[ADR Fix] Running: {' '.join(cmd)}")
 
@@ -529,6 +541,7 @@ def run_adr_fix(
     required_jdk: Optional[str] = None,
     push: bool = False,
     jira_ticket_id: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
@@ -559,6 +572,12 @@ def run_adr_fix(
         to invoke_adr() — see its docstring. When set, it takes priority over
         the auto-generated branch_name for both the branch name and the
         commit subject; when omitted (default), behaviour is unchanged.
+
+    base_branch: optional parent branch to create the fix branch from and
+        (via pr_agent.py reading the returned AdrResult.base_branch) open the
+        PR against, forwarded to invoke_adr() — see its docstring. When
+        omitted (default), adr_fortify.py auto-detects the repo's default
+        branch and behaviour is unchanged.
     """
     parsed = group["parsed"]
     artifact_id = parsed["artifact_id"]
@@ -588,13 +607,17 @@ def run_adr_fix(
     }
 
     logger.info(f"[ADR Fix] Applying {artifact_id} {current_version} → {candidate}")
-    logger.info(f"[ADR Fix] Branch: {branch_name}" + (f" (JIRA ticket: {jira_ticket_id})" if jira_ticket_id else ""))
+    logger.info(
+        f"[ADR Fix] Branch: {branch_name}"
+        + (f" (JIRA ticket: {jira_ticket_id})" if jira_ticket_id else "")
+        + (f" (parent branch: {base_branch})" if base_branch else "")
+    )
     logger.info(f"[ADR Fix] Target key: '{coord_key}' (bare fallback: '{coord_key_bare}')")
 
     success, stdout, stderr = invoke_adr(
         adr_path, project_path, branch_name, target_versions=target_versions,
         cancel_check=cancel_check, required_jdk=required_jdk, push=push,
-        jira_ticket_id=jira_ticket_id,
+        jira_ticket_id=jira_ticket_id, base_branch=base_branch,
     )
 
     if success:
@@ -692,6 +715,7 @@ def adr_fix_node(
     project_path: str,
     jira_prefix: str = "FORTIFY",
     jira_ticket_id: Optional[str] = None,
+    base_branch: Optional[str] = None,
 ) -> AgentState:
     """
     LangGraph node: adr_fix. Commit-only — does NOT build or push. Always
@@ -706,6 +730,9 @@ def adr_fix_node(
             state["jira_ticket_id"]     optional fallback for the jira_ticket_id
                                          param — used only if the caller didn't
                                          pass jira_ticket_id explicitly.
+            state["base_branch"]        optional fallback for the base_branch
+                                         param — used only if the caller didn't
+                                         pass base_branch explicitly.
     Writes: state["_adr_results"]       list of AdrResult dicts, one per group
                                          (success here means "committed", not
                                          "build passed")
@@ -733,6 +760,7 @@ def adr_fix_node(
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
     required_jdk = state.get("required_jdk")  # type: ignore[attr-defined] — set by context_node
     jira_ticket_id = jira_ticket_id or state.get("jira_ticket_id")  # type: ignore[attr-defined]
+    base_branch = base_branch or state.get("base_branch")  # type: ignore[attr-defined]
 
     for group in groups:
         if cancel_check is not None and cancel_check():
@@ -741,6 +769,7 @@ def adr_fix_node(
             group, adr_path, project_path, jira_prefix,
             release_id=release_id, cancel_check=cancel_check,
             required_jdk=required_jdk, jira_ticket_id=jira_ticket_id,
+            base_branch=base_branch,
         )
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],
