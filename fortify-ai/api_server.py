@@ -426,6 +426,16 @@ class ConfigOverrides(BaseModel):
     )
     reviewers: Optional[str] = None
     adr_output_dir: Optional[str] = None
+    base_branch: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional parent branch to create the fix branch from and open the PR "
+            "against, e.g. 'develop' or 'release/2.0'. Overrides BASE_BRANCH. Leave "
+            "unset to auto-detect the repo's default branch (origin/HEAD, falling "
+            "back to 'main'/'master') — the PR agent then targets whatever branch "
+            "ADR actually used, so the two always match."
+        ),
+    )
 
 
 # ── Full pipeline ─────────────────────────────────────────────────────────────
@@ -733,6 +743,14 @@ class AdrFixRequest(BaseModel):
         ),
     )
     release_id: int = Field(default=0, description="Fortify release ID — used in branch name (feature/fortify-fix-{releaseId}-{randId})")
+    base_branch: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional parent branch to create the fix branch from, e.g. 'develop' "
+            "or 'release/2.0'. Defaults to cfg.base_branch, and if that's also "
+            "unset, ADR auto-detects the repo's default branch."
+        ),
+    )
 
 
 class BuildValidationRequest(BaseModel):
@@ -760,6 +778,14 @@ class PrAgentRequest(BaseModel):
     github_token: str = Field(..., description="GitHub personal access token")
     github_repo: str = Field(..., description="GitHub repo in owner/repo format")
     reviewers: list[str] = Field(default_factory=list)
+    base_branch: Optional[str] = Field(
+        default=None,
+        description=(
+            "Branch to open the PR against. Defaults to the base_branch recorded "
+            "on each adr_result (the branch it was actually created from), or the "
+            "repo's default branch if that's missing."
+        ),
+    )
 
 
 class FortifyWritebackRequest(BaseModel):
@@ -1354,6 +1380,7 @@ def _run_full_pipeline(
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,
+                        base_branch=cfg.base_branch or None,
                         # Push right after commit when the build stage is being skipped
                         # (nothing else will push this branch); otherwise leave it local
                         # so build-validation can push-on-success / roll back on failure.
@@ -1534,6 +1561,7 @@ def _run_full_pipeline(
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,
+                        base_branch=cfg.base_branch or None,
                         push=False,
                     )
                     if not retry_adr_result.get("success"):
@@ -1588,6 +1616,7 @@ def _run_full_pipeline(
                 github_token=cfg.github_token,
                 github_repo=cfg.github_repo,
                 reviewers=cfg.get_reviewers(),
+                base_branch=cfg.base_branch or None,
             )
             _stage_done("pr-agent", t, {"prs_created": len(pr_results)})
         else:
@@ -3437,6 +3466,7 @@ def stage_adr_fix(req: AdrFixRequest):
                 jira_prefix=req.jira_prefix,
                 jira_ticket_id=req.jira_ticket_id,
                 release_id=req.release_id,
+                base_branch=req.base_branch,
             )
             results.append({
                 "artifact_id": artifact_id,
@@ -3619,6 +3649,7 @@ def stage_pr_agent(req: PrAgentRequest):
             github_token=req.github_token,
             github_repo=req.github_repo,
             reviewers=req.reviewers,
+            base_branch=req.base_branch,
         )
         return ok({"pr_results": pr_results}, time.time() - t0)
     except Exception as exc:
@@ -3849,6 +3880,7 @@ def _run_until(
                         release_id=release_id,
                         cancel_check=cancel_check,
                         required_jdk=required_jdk,
+                        base_branch=cfg.base_branch or None,
                         push=not run_build,
                     ),
                 })
@@ -3929,6 +3961,7 @@ def _run_until(
             github_token=cfg.github_token,
             github_repo=cfg.github_repo,
             reviewers=cfg.get_reviewers(),
+            base_branch=cfg.base_branch or None,
         )
     result["pr_results"] = pr_results
     _s_done("pr-agent", t, {"prs_created": len(pr_results)})

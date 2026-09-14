@@ -493,6 +493,19 @@
         <span class="run-form__hint">Branch: feature/&lt;id&gt; · Commit: "&lt;id&gt; : msg"</span>
       </div>
 
+      <!-- Parent Branch — optional, shared across all modes. Blank = ADR
+           auto-detects the repo's default branch (origin/HEAD, falling back
+           to main/master) to both cut the fix branch FROM and open the PR
+           AGAINST. Filled in = both target this branch instead. -->
+      <div class="run-form__field">
+        <label class="run-form__label--nowrap">Parent Branch <span class="label-opt">optional</span></label>
+        <input class="run-form__input"
+               [value]="fortifyBaseBranch()"
+               (input)="fortifyBaseBranch.set($any($event.target).value)"
+               placeholder="e.g. develop (default: auto-detected)">
+        <span class="run-form__hint">Branch created from &amp; PR opened against</span>
+      </div>
+
     </div>
 
     <!-- Per-run credentials — separate GitHub token / Fortify username & password

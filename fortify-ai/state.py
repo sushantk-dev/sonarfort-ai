@@ -80,7 +80,11 @@ class AdrResult(TypedDict):
     """
     success: bool
     branch_name: Optional[str]
-    base_branch: Optional[str]        # resolved by ADR (e.g. "main") — needed to roll back on build failure
+    base_branch: Optional[str]        # branch the feature branch was actually created from — either
+                                       # AgentState.base_branch verbatim (caller override) or ADR's
+                                       # auto-detected default branch (e.g. "main"). Needed to roll
+                                       # back on build failure, and read by pr_agent.py so the PR
+                                       # targets the same branch the fix branch was cut from.
     commit_hash: Optional[str]
     pdf_path: Optional[str]
     build_time_seconds: Optional[int]  # always None from adr_fix; see BuildValidationResult
@@ -121,6 +125,14 @@ class AgentState(TypedDict):
                                             # ticket in the same run don't collide on one branch) and
                                             # the commit subject is prefixed "<jira_ticket_id> : <msg>"
                                             # (no uid there), in place of the Fortify-generated ID.
+    base_branch: Optional[str]             # optional parent branch to create the feature branch
+                                            # FROM and to open the PR AGAINST (e.g. "develop",
+                                            # "release/2.0"). When not set, adr_fortify.py
+                                            # auto-detects the repo's default branch (origin/HEAD,
+                                            # falling back to "main"/"master"), and pr_agent.py
+                                            # targets whatever branch adr_fix actually cut the fix
+                                            # branch from (see AdrResult.base_branch below) so the
+                                            # two always stay in sync even when this is overridden.
 
     # ── Fortify finding fields ────────────────────────────────────────────────
     dependency: Optional[DependencyInfo]    # parsed from primaryLocation

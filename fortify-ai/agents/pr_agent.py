@@ -294,9 +294,17 @@ def create_pull_request(
     github_token: str,
     github_repo: str,
     reviewers: list[str],
+    base_branch: Optional[str] = None,
 ) -> PrResult:
     """
     Open a GitHub PR for one fixed dependency group.
+
+    base_branch: optional caller override for the PR's target ("base") branch,
+    e.g. "develop" or "release/2.0". When omitted, this falls back to
+    adr_result["base_branch"] — the branch ADR actually created the fix
+    branch from — so the PR always targets where the branch was cut from,
+    even when that was itself a non-default branch. Only if neither is
+    available does this fall back to the repo's configured default branch.
 
     Returns PrResult with pr_url, pr_number, is_draft.
     """
@@ -360,10 +368,20 @@ def create_pull_request(
         return PrResult(pr_url="", pr_number=0, is_draft=False)
 
     # ── Determine base branch ─────────────────────────────────────────────────
-    try:
-        base_branch = repo.default_branch
-    except Exception:
-        base_branch = "main"
+    # Priority: (1) an explicit caller override — (2) the branch ADR actually
+    # created the fix branch from, recorded on adr_result — (3) the repo's
+    # configured default branch. Preferring (2) over (3) is what keeps the PR
+    # target consistent with the branch's real parent: if a custom parent
+    # branch was used to CREATE the branch (see adr_fortify.py --base-branch),
+    # the PR must be raised against that same branch, not silently against
+    # whatever the repo's default happens to be.
+    if not base_branch:
+        base_branch = adr_result.get("base_branch") or None
+    if not base_branch:
+        try:
+            base_branch = repo.default_branch
+        except Exception:
+            base_branch = "main"
 
     # ── Create PR ─────────────────────────────────────────────────────────────
     # GitHub requires head in "owner:branch" format when the branch was pushed
@@ -453,10 +471,14 @@ def create_prs_for_all_groups(
     github_token: str,
     github_repo: str,
     reviewers: list[str],
+    base_branch: Optional[str] = None,
 ) -> list[PrResult]:
     """
     Open a PR for every group that has a successful ADR result.
     adr_results is the list from adr_fix_node: [{"artifact_id", "primary_location", "result": AdrResult}].
+
+    base_branch: optional override applied to every PR opened in this call
+    (see create_pull_request's docstring for the fallback order when omitted).
     """
     # Build a lookup from primary_location → adr_result. Keying on bare
     # artifact_id would collapse two groups that share an artifact_id at
@@ -489,6 +511,7 @@ def create_prs_for_all_groups(
             github_token=github_token,
             github_repo=github_repo,
             reviewers=reviewers,
+            base_branch=base_branch,
         )
         pr_results.append(result)
 
@@ -502,6 +525,7 @@ def pr_agent_node(
     github_token: str,
     github_repo: str,
     reviewers: list[str],
+    base_branch: Optional[str] = None,
 ) -> AgentState:
     """
     LangGraph node: pr_agent.
@@ -520,6 +544,9 @@ def pr_agent_node(
     )
     adr_results: list[dict] = state.get("_adr_results", [])  # type: ignore[attr-defined]
     release_id: int = state.get("release_id", 0)
+    # Fall back to the state-level base_branch (the same override, if any,
+    # that adr_fix used to create the branch) when the caller didn't pass one.
+    base_branch = base_branch or state.get("base_branch")
 
     if not groups or not adr_results:
         logger.warning("[PR] No groups or ADR results in state — skipping")
@@ -535,6 +562,7 @@ def pr_agent_node(
         github_token=github_token,
         github_repo=github_repo,
         reviewers=reviewers,
+        base_branch=base_branch,
     )
 
     successful = [r for r in pr_results if r.get("pr_url")]

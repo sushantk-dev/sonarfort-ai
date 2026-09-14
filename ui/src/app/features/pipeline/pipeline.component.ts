@@ -200,6 +200,15 @@ export class PipelineComponent {
   // "<jira_ticket_id> : <msg>" instead.
   fortifyJiraTicketId = signal('');
 
+  // ── Parent branch override — optional, applies to any Fortify mode ───────
+  // When left blank, adr_fortify.py auto-detects the repo's default branch
+  // (origin/HEAD, falling back to main/master) to both create the fix
+  // branch FROM and — via pr_agent.py reading AdrResult.base_branch — open
+  // the PR AGAINST. When filled in (via config.base_branch →
+  // ConfigOverrides.base_branch), both of those target this branch instead,
+  // e.g. "develop" or "release/2.0".
+  fortifyBaseBranch = signal('');
+
   // ── Fortify form validation ─────────────────────────────────────────────────
   // Every visible field is mandatory for its mode (GitHub Repo always; Release ID
   // for Live; Report Path for Offline; App Name for App Name). Errors only render
@@ -594,6 +603,12 @@ export class PipelineComponent {
       ...(this.fortifyJiraTicketId().trim()
         ? { jira_ticket_id: this.fortifyJiraTicketId().trim() }
         : {}),
+      // Optional — omitted entirely when blank so the backend auto-detects
+      // the repo's default branch instead of sending an empty string that
+      // would override nothing anyway.
+      ...(this.fortifyBaseBranch().trim()
+        ? { base_branch: this.fortifyBaseBranch().trim() }
+        : {}),
     };
 
     // The guard above already ensured Max Upgrades is within whichever range
@@ -677,6 +692,7 @@ export class PipelineComponent {
     this.fortifyUsername.set('');
     this.fortifyPassword.set('');       // already cleared above, but reset again for clarity
     this.fortifyJiraTicketId.set('');
+    this.fortifyBaseBranch.set('');
     this.fortifyFormSubmitted.set(false);
     this.buildEstimateResult.set(null);
     this.buildEstimateLoading.set(false);

@@ -201,6 +201,16 @@ class FortifyAIConfig(BaseSettings):
             "e.g. alice,bob,charlie"
         ),
     )
+    base_branch: str = Field(
+        default="",
+        description=(
+            "Parent branch to create each fix branch from and to open PRs against, "
+            "e.g. 'develop' or 'release/2.0'. Empty (default) means auto-detect: ADR "
+            "resolves the repo's default branch (origin/HEAD, falling back to "
+            "'main'/'master') when creating the branch, and the PR agent then opens "
+            "against whatever branch ADR actually used, so the two always match."
+        ),
+    )
 
     # ── Optional ADR output path ─────────────────────────────────────────────
     adr_output_dir: str = Field(
