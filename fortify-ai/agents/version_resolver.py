@@ -35,6 +35,7 @@ Console output (done-when):
 
 from __future__ import annotations
 
+import re
 from packaging.version import Version, InvalidVersion
 from typing import Optional
 
@@ -45,27 +46,81 @@ from state import AgentState, VersionCandidates
 
 
 # ── Version comparison helpers ────────────────────────────────────────────────
+#
+# Fortify/Sonatype return Maven-style version strings (e.g. "4.2.18.Final",
+# "5.3.31.RELEASE", "12.0.15.jre8"). packaging.version.Version implements
+# PEP 440, which rejects these qualifiers outright (InvalidVersion), so a
+# naive `Version(v)` call silently loses real, valid safe-version data — the
+# dep then gets wrongly escalated as "no safe version" even though Fortify
+# supplied one. We normalize known Maven qualifiers before parsing, and fall
+# back to a lenient numeric-tuple comparison for anything PEP 440 still
+# can't handle, so a value is never dropped just because of its suffix.
+
+# Common Maven "release" qualifiers that carry no version-ordering meaning
+# on their own — safe to strip so the numeric core can be parsed.
+_MAVEN_QUALIFIER_RE = re.compile(
+    r"[.-](?:Final|RELEASE|GA|SEC\d*|SP\d*)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_maven_version(v: str) -> str:
+    """Strip trailing Maven release qualifiers (.Final, .RELEASE, .GA, ...)."""
+    return _MAVEN_QUALIFIER_RE.sub("", v)
+
+
+def _numeric_tuple(v: str) -> tuple[int, ...]:
+    """Fallback comparable key: pull out leading digit groups, e.g.
+    '12.0.15.jre8' -> (12, 0, 15, 8)."""
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
 
 def _parse_version(v: Optional[str]) -> Optional[Version]:
-    """Return a packaging.Version or None if unparseable / None."""
+    """Return a packaging.Version or None if unparseable / None.
+
+    Tries the raw string first, then a Maven-qualifier-stripped version,
+    before giving up. Only returns None for genuinely empty/unusable input.
+    """
     if not v:
         return None
     try:
         return Version(v)
     except InvalidVersion:
+        pass
+    try:
+        return Version(_normalize_maven_version(v))
+    except InvalidVersion:
         return None
 
 
 def _higher_version(a: Optional[str], b: Optional[str]) -> Optional[str]:
-    """Return whichever version string is higher; None if both are None."""
-    va, vb = _parse_version(a), _parse_version(b)
-    if va is None and vb is None:
+    """Return whichever version string is higher; None if both are None.
+
+    Prefers comparing via packaging.Version (after Maven-qualifier
+    normalization). If one or both strings still can't be parsed as a
+    Version (e.g. an unusual qualifier), falls back to comparing numeric
+    tuples extracted from the raw strings, rather than treating an
+    unparseable-but-present value as absent.
+    """
+    if a is None and b is None:
         return None
-    if va is None:
+    if a is None:
         return b
-    if vb is None:
+    if b is None:
         return a
-    return a if va >= vb else b
+
+    va, vb = _parse_version(a), _parse_version(b)
+    if va is not None and vb is not None:
+        return a if va >= vb else b
+
+    # At least one side didn't parse even after normalization — fall back
+    # to a lenient numeric comparison instead of silently discarding data.
+    ta, tb = _numeric_tuple(a), _numeric_tuple(b)
+    if not ta and not tb:
+        # Neither string has any digits to compare — keep whichever came
+        # first rather than losing both.
+        return a
+    return a if ta >= tb else b
 
 
 def _build_candidates(next_safe: Optional[str], greatest_safe: Optional[str]) -> list[str]:
