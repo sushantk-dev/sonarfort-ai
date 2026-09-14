@@ -444,13 +444,33 @@ def _upgrade_version(content: str, dep: dict, new_version: str) -> str:
     return re.sub(pattern, rf"\g<1>{new_version}\g<2>", content, flags=flags)
 
 
+def _coord_from_msg(msg: str) -> str:
+    """
+    Extract the leading 'groupId:artifactId' coordinate from a fix/skip
+    message string, for callers that need to map a printed message back to
+    its _target_map / _target_status key.
+
+    Messages from apply_fixes() start directly with the coordinate
+    ("log4j:log4j-core  1.2.17 -> 2.17.1"), but messages from
+    apply_transitive_fixes() are prefixed with a bracketed tag and extra
+    spacing ("[ADDED to depMgmt]   log4j:log4j-core  1.2.17 -> 2.17.1").
+    Naively splitting on the first run of 2+ spaces lands inside that tag
+    instead of on the coordinate, so strip any leading "[...]" tag first.
+    """
+    text = re.sub(r'^\[[^\]]*\]\s*', '', msg.strip())
+    return text.split("  ")[0].strip()
+
+
 def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
     """
     For each unique vulnerable transitive dependency that has a known safe version,
     injects or updates a <dependencyManagement> entry in the root pom.xml content.
     This pins the transitive version project-wide across all modules.
 
-    Returns (updated_content, injected_list, already_ok_list, no_safe_list).
+    Returns (updated_content, injected_list, already_ok_list, no_safe_list, manual_list).
+    manual_list holds entries apply_transitive_fixes *attempted* to fix but
+    could not (e.g. the DM entry's version couldn't be located/replaced) —
+    these must NOT be treated as successful fixes by callers.
     """
     # Deduplicate by (gid, aid) across all modules — pick highest safe version
     trans_map = {}
@@ -474,11 +494,12 @@ def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
     })
 
     if not trans_map:
-        return root_content, [], [], no_safe
+        return root_content, [], [], no_safe, []
 
     content   = root_content
     injected  = []
     already_ok = []
+    manual     = []   # attempted but NOT applied — must not be reported as fixed
 
     def _dep_xml(gid, aid, ver, indent="            "):
         return (f"{indent}<dependency>\n"
@@ -492,20 +513,27 @@ def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
         cur   = info["ver"]
         label = f"{gid}:{aid}  {cur} -> {safe}"
 
-        # Is this dep already present anywhere inside <dependencyManagement>?
+        # Is this dep already present inside <dependencyManagement>? Scope the
+        # search to the DM block's own content — searching `content` directly
+        # with DOTALL would happily match a groupId/artifactId that only
+        # appears *after* </dependencyManagement> (e.g. the pom's own
+        # <dependencies> section), wrongly reporting an existing DM entry and
+        # then failing to update it (silently dropping the fix as [MANUAL]).
+        dm_block_m = re.search(r'<dependencyManagement>(.*?)</dependencyManagement>', content, re.DOTALL)
+        dm_block = dm_block_m.group(1) if dm_block_m else ""
+
         in_dm = bool(re.search(
-            rf'<dependencyManagement>.*?<groupId>\s*{re.escape(gid)}\s*</groupId>\s*'
+            rf'<groupId>\s*{re.escape(gid)}\s*</groupId>\s*'
             rf'<artifactId>\s*{re.escape(aid)}\s*</artifactId>',
-            content, re.DOTALL))
+            dm_block))
 
         if in_dm:
             # Extract the exact version string currently in the DM entry (may be ${prop} or literal)
             dm_ver_m = re.search(
-                rf'<dependencyManagement>.*?'
                 rf'<groupId>\s*{re.escape(gid)}\s*</groupId>\s*'
                 rf'<artifactId>\s*{re.escape(aid)}\s*</artifactId>.*?'
                 rf'<version>([^<]+)</version>',
-                content, re.DOTALL)
+                dm_block, re.DOTALL)
             dm_ver_raw = dm_ver_m.group(1).strip() if dm_ver_m else cur
 
             # Detect if the DM entry uses a property reference e.g. ${log4j.version}
@@ -530,7 +558,7 @@ def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
                     injected.append(
                         f"[UPDATED property ${{{prop_in_dm}}}] {label}")
                 else:
-                    injected.append(f"[MANUAL] {label}  (update ${{{prop_in_dm}}} manually)")
+                    manual.append(f"[MANUAL] {label}  (update ${{{prop_in_dm}}} manually)")
             else:
                 # Literal version in DM — check if already safe
                 if dm_ver_raw == safe:
@@ -543,7 +571,7 @@ def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
                     content = new
                     injected.append(f"[UPDATED in depMgmt] {label}")
                 else:
-                    injected.append(f"[MANUAL] {label}  (update manually in dependencyManagement)")
+                    manual.append(f"[MANUAL] {label}  (update manually in dependencyManagement)")
         else:
             new_dep = _dep_xml(gid, aid, safe)
 
@@ -565,7 +593,7 @@ def apply_transitive_fixes(root_content: str, all_findings: list) -> tuple:
                 content = re.sub(r'(</project>)', dm_block + r'\1', content)
                 injected.append(f"[ADDED new depMgmt]  {label}")
 
-    return content, injected, already_ok, no_safe
+    return content, injected, already_ok, no_safe, manual
 
 
 def apply_fixes(content: str, findings: list) -> tuple:
@@ -2077,24 +2105,34 @@ def main():
             t0 = time.time()
             # Exclude skipped artifacts from transitive fixes too
             trans_findings = [f for f in all_findings if f["dep"]["artifactId"] not in skip_set]
-            new_root, t_injected, t_already_ok, t_no_safe = apply_transitive_fixes(
+            new_root, t_injected, t_already_ok, t_no_safe, t_manual = apply_transitive_fixes(
                 root_content, trans_findings)
             for msg in t_injected:
                 print(f"  {C.GREEN}[TRANS ]{C.RESET}  {msg}")
                 all_applied.append((root_pom_path, msg))
-                tk = _resolve_target_key(msg.split("  ")[0])
+                tk = _resolve_target_key(_coord_from_msg(msg))
                 if tk:
                     _upgrade_status(_target_status[tk], "transitive_pinned")
             for msg in t_already_ok:
                 print(f"  {C.GRAY}[OK    ]{C.RESET}  {msg}")
-                tk = _resolve_target_key(msg.split("  ")[0])
+                tk = _resolve_target_key(_coord_from_msg(msg))
                 if tk:
                     _upgrade_status(_target_status[tk], "already_safe")
             for msg in t_no_safe:
                 print(f"  {C.YELLOW}[MANUAL]{C.RESET}  {msg}")
-                tk = _resolve_target_key(msg.split("  ")[0])
+                tk = _resolve_target_key(_coord_from_msg(msg))
                 if tk:
                     _upgrade_status(_target_status[tk], "no_safe_version")
+            for msg in t_manual:
+                # Attempted but NOT applied (e.g. an existing DM entry's version
+                # literal couldn't be located/replaced) — report as skipped, not
+                # fixed, and reflect that in the machine-readable status so
+                # adr_fix.py's no-fix reasoning sees this dependency correctly.
+                print(f"  {C.YELLOW}[MANUAL]{C.RESET}  {msg}")
+                all_skipped.append((root_pom_path, msg))
+                tk = _resolve_target_key(_coord_from_msg(msg))
+                if tk:
+                    _upgrade_status(_target_status[tk], "manual_pattern")
             if new_root != root_content:
                 backup_root = f"{root_pom_path}.bak_{timestamp}"
                 if backup_root not in all_backups:
@@ -2223,7 +2261,7 @@ def main():
     # The same artifact may appear in multiple module poms but should count as 1 action.
     def _coord(msg: str) -> str:
         """Extract groupId:artifactId from a fix/skip message string."""
-        return msg.split("  ")[0].strip()
+        return _coord_from_msg(msg)
 
     total_applied = len({_coord(msg) for _, msg in all_applied})
     total_skipped = len({_coord(msg) for _, msg in all_skipped})
