@@ -267,13 +267,22 @@ def fetch_token(
     )
 
     t0 = time.time()
-    resp = requests.post(
-        url,
-        data=payload,                          # form-encoded, NOT JSON
-        headers={"Accept": "application/json"},
-        timeout=_REQUEST_TIMEOUT,
-	verify=False,
-    )
+    try:
+        resp = requests.post(
+            url,
+            data=payload,                          # form-encoded, NOT JSON
+            headers={"Accept": "application/json"},
+            timeout=_REQUEST_TIMEOUT,
+            verify=False,
+        )
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        # Local import avoids a circular import (fortify_client imports this module lazily)
+        from fortify_client import FortifyAPITimeoutError
+        logger.error(
+            f"[FortifyAuth] Fortify OAuth endpoint did not respond -- POST {url} "
+            f"(timeout={_REQUEST_TIMEOUT}s): {type(exc).__name__}: {exc}"
+        )
+        raise FortifyAPITimeoutError("POST", url, _REQUEST_TIMEOUT, exc) from exc
 
     elapsed = round(time.time() - t0, 2)
 

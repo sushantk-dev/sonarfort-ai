@@ -56,15 +56,24 @@ class FortifyAPITimeoutError(Exception):
     only adds clarity, it doesn't change failure behavior.
     """
 
-    def __init__(self, method: str, url: str, timeout: tuple, original_exc: Exception):
+    # Short, user-facing message. Technical details (method, URL, timeouts,
+    # original exception) are kept as attributes and written to the logs,
+    # so str(exc) stays clean when it is surfaced to the UI / API response.
+    USER_MESSAGE = "Fortify API did not respond. Please try again after some time."
+
+    def __init__(self, method: str, url: str, timeout, original_exc: Exception):
         self.method = method
         self.url = url
         self.timeout = timeout
         self.original_exc = original_exc
-        connect_t, read_t = timeout
-        super().__init__(
-            f"Fortify API did not respond in time — {method} {url} "
-            f"(connect timeout={connect_t}s, read timeout={read_t}s): {original_exc}"
+        super().__init__(self.USER_MESSAGE)
+
+    @property
+    def details(self) -> str:
+        """Full technical description, for logs/debugging only."""
+        return (
+            f"{self.method} {self.url} (timeout={self.timeout}): "
+            f"{type(self.original_exc).__name__}: {self.original_exc}"
         )
 
 
@@ -216,7 +225,8 @@ class FortifyClient:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             logger.error(
                 f"[FortifyClient] Timed out waiting for Fortify — GET {url} "
-                f"(budget: connect={self._CONNECT_TIMEOUT}s, read={self._READ_TIMEOUT}s)"
+                f"(budget: connect={self._CONNECT_TIMEOUT}s, read={self._READ_TIMEOUT}s): "
+                f"{type(exc).__name__}: {exc}"
             )
             raise FortifyAPITimeoutError("GET", url, self._REQUEST_TIMEOUT, exc) from exc
         resp.raise_for_status()
@@ -286,7 +296,8 @@ class FortifyClient:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             logger.error(
                 f"[FortifyClient] Timed out waiting for Fortify — POST {url} "
-                f"(budget: connect={self._CONNECT_TIMEOUT}s, read={self._READ_TIMEOUT}s)"
+                f"(budget: connect={self._CONNECT_TIMEOUT}s, read={self._READ_TIMEOUT}s): "
+                f"{type(exc).__name__}: {exc}"
             )
             raise FortifyAPITimeoutError("POST", url, self._REQUEST_TIMEOUT, exc) from exc
         resp.raise_for_status()
