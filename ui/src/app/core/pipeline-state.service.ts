@@ -182,10 +182,42 @@ export class PipelineStateService {
   // only clears once BOTH have reported back at least once.
   private _sonarListLoaded   = false;
   private _fortifyListLoaded = false;
+
+  // Runs that were already in `error` when this page loaded — hidden from the
+  // list for the rest of the session. In-memory only, so it's rebuilt on every
+  // reload. Hidden, NOT deleted: Fortify runs live in the shared all-users job
+  // store, and deleteRun() would remove them for every teammate (and kill Resume).
+  private _hiddenErroredIds = new Set<string>();
+  private _erroredPurgedThisLoad = false;
+
+  /** Still errored AND was errored at load time — once a run leaves `error`
+   *  (e.g. a teammate resumes it) it shows up again. */
+  private _isHiddenError(r: UiRun): boolean {
+    return r.status === 'error' && this._hiddenErroredIds.has(r.id);
+  }
+
   private _maybeFinishInitialLoad() {
     if (this._sonarListLoaded && this._fortifyListLoaded) {
+      this._purgeErroredOnLoad();
       this.loadingRuns.set(false);
     }
+  }
+
+  /** Runs once per page load, after both run lists have arrived. */
+  private _purgeErroredOnLoad() {
+    if (this._erroredPurgedThisLoad) return;
+    this._erroredPurgedThisLoad = true;
+
+    const current = this.runs();
+    current.filter(r => r.status === 'error').forEach(r => {
+      this._hiddenErroredIds.add(r.id);
+      this._removePersisted(r.id);   // nothing left to re-attach to after reload
+    });
+    if (this._hiddenErroredIds.size === 0) return;
+
+    const visible = current.filter(r => !this._isHiddenError(r));
+    this.runs.set(visible);
+    this.selected.set(this._reselect(visible));
   }
 
   get allRuns()  { return this.runs(); }
@@ -367,7 +399,10 @@ export class PipelineStateService {
       fortifyRuns = current.filter(r => r.source === 'fortify');
     }
 
+    // Runs that were already errored at page load stay hidden across every
+    // refresh/poll — otherwise the next 20s all-users tick would bring them back.
     const merged = [...sonarRuns, ...fortifyRuns]
+      .filter(r => !this._isHiddenError(r))
       .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
     this.runs.set(merged);
     this.selected.set(this._reselect(merged));
@@ -408,6 +443,12 @@ export class PipelineStateService {
       .then(resp => {
         const job = resp?.data ?? resp;
         const isTerminal = job.status === 'completed' || job.status === 'failed';
+
+        // Already hidden as errored-at-load — don't re-inject it into the list.
+        if (job.status === 'failed' && this._hiddenErroredIds.has(p.pipeline_id)) {
+          this._removePersisted(p.pipeline_id);
+          return;
+        }
 
         if (isTerminal) {
           this._injectFortifyCard(p.pipeline_id, p.mode, p.body, 'done');
