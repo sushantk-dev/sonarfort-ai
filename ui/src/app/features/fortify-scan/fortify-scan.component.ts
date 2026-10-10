@@ -115,7 +115,9 @@ export class FortifyScanComponent {
 
   // ── Session run history + per-run job cache ───────────────────────────────
   runs   = signal<ScanRun[]>([]);
-  jobs   = signal<Record<string, FortifyScanJob>>({});
+  // Partial: a run is added to runs() before its first status poll returns,
+  // so jobs()[run.id] can genuinely be undefined.
+  jobs   = signal<Partial<Record<string, FortifyScanJob>>>({});
   selectedId = signal<string | null>(null);
 
   private _pollTimers = new Map<string, ReturnType<typeof setTimeout>>();

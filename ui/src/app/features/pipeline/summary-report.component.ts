@@ -256,7 +256,7 @@ const TOKEN_STAGE_LABELS: Record<string, string> = {
                 {{ issue.file_path }}<span *ngIf="issue.line">:{{ issue.line }}</span>
               </div>
             </div>
-            <span class="sev-badge sev-badge--{{ issue.severity?.toLowerCase() }}" *ngIf="issue.severity">
+            <span class="sev-badge sev-badge--{{ issue.severity.toLowerCase() }}" *ngIf="issue.severity">
               {{ issue.severity }}
             </span>
           </div>
