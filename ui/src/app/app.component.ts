@@ -1,108 +1,15 @@
 // src/app/app.component.ts
-import { Component } from '@angular/core';
-import { RouterOutlet, RouterLink, RouterLinkActive } from '@angular/router';
+import { Component, inject } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { filter } from 'rxjs/operators';
+import { NavigationEnd, Router, RouterOutlet, RouterLink, RouterLinkActive } from '@angular/router';
+import { PipelineStateService } from './core/pipeline-state.service';
 
 @Component({
   selector: 'app-root',
   standalone: true,
   imports: [RouterOutlet, RouterLink, RouterLinkActive],
-  template: `
-    <div class="shell">
-      <!-- ── Sidebar ────────────────────────────────────────── -->
-      <aside class="sidebar">
-        <div class="sidebar__brand">
-          <div class="brand-mark">
-            <svg width="16" height="16" viewBox="0 0 26 26" fill="none">
-              <path d="M13 3L22 7.5V13C22 18.5 13 22.5 13 22.5C13 22.5 4 18.5 4 13V7.5L13 3Z"
-                    fill="white" fill-opacity="0.18"
-                    stroke="white" stroke-width="1.5" stroke-linejoin="round"/>
-              <circle cx="9.5" cy="13" r="2.5" stroke="white" stroke-width="1.4"/>
-              <path d="M12 13H14.5" stroke="white" stroke-width="1.4" stroke-linecap="round"/>
-              <circle cx="16.5" cy="13" r="2" stroke="white" stroke-width="1.4"/>
-            </svg>
-          </div>
-          <span class="brand-name">SonarFort <span class="brand-ai">AI</span></span>
-        </div>
-
-        <nav class="sidebar__nav">
-          <a routerLink="/dashboard" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <rect x="1" y="1" width="5.5" height="5.5" rx="1.5" fill="currentColor" opacity=".85"/>
-              <rect x="8.5" y="1" width="5.5" height="5.5" rx="1.5" fill="currentColor" opacity=".4"/>
-              <rect x="1" y="8.5" width="5.5" height="5.5" rx="1.5" fill="currentColor" opacity=".4"/>
-              <rect x="8.5" y="8.5" width="5.5" height="5.5" rx="1.5" fill="currentColor" opacity=".6"/>
-            </svg>
-            Dashboard
-          </a>
-
-          <a routerLink="/pipeline" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <circle cx="7.5" cy="7.5" r="2" stroke="currentColor" stroke-width="1.4"/>
-              <path d="M1.5 7.5H5.5M9.5 7.5H13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-              <path d="M3.5 3.5H5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".5"/>
-              <path d="M3.5 11.5H5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".5"/>
-            </svg>
-            Pipeline
-          </a>
-
-          <a routerLink="/activity" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <path d="M1.5 8.5L4.5 8.5L6 12L8 2.5L9.5 8.5L13.5 8.5" stroke="currentColor" stroke-width="1.4"
-                    stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-            </svg>
-            Activity
-          </a>
-
-          <a routerLink="/issues" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <rect x="1.5" y="3" width="12" height="1.4" rx=".7" fill="currentColor"/>
-              <rect x="1.5" y="7" width="12" height="1.4" rx=".7" fill="currentColor" opacity=".65"/>
-              <rect x="1.5" y="11" width="8"  height="1.4" rx=".7" fill="currentColor" opacity=".4"/>
-            </svg>
-            Issues
-          </a>
-
-          <a routerLink="/escalations" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <path d="M7.5 1.5L13 12.5H2L7.5 1.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-              <path d="M7.5 5.5V8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-              <circle cx="7.5" cy="10.5" r=".7" fill="currentColor"/>
-            </svg>
-            Escalations
-          </a>
-
-          <a routerLink="/fortify-scan" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <path d="M7.5 1.5L13 4.5V8.5C13 12 7.5 14 7.5 14C7.5 14 2 12 2 8.5V4.5L7.5 1.5Z"
-                    stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-              <path d="M5 7.5L7 9.5L10.5 5.5" stroke="currentColor" stroke-width="1.3"
-                    stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            Fortify Scan
-          </a>
-
-          <a routerLink="/settings" routerLinkActive="is-active" class="nav-link">
-            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-              <circle cx="7.5" cy="7.5" r="2.2" stroke="currentColor" stroke-width="1.3"/>
-              <path d="M7.5 1.5V3M7.5 12V13.5M13.5 7.5H12M3 7.5H1.5M11.7 3.3L10.6 4.4M4.4 10.6L3.3 11.7M11.7 11.7L10.6 10.6M4.4 4.4L3.3 3.3"
-                    stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-            </svg>
-            Settings
-          </a>
-        </nav>
-
-        <div class="sidebar__footer">
-          <span class="idle-dot"></span>
-          <span class="idle-label">Idle</span>
-        </div>
-      </aside>
-
-      <!-- ── Main ──────────────────────────────────────────── -->
-      <main class="main">
-        <router-outlet/>
-      </main>
-    </div>
-  `,
+  templateUrl: './app.component.html',
   styles: [`
     .shell {
       display: flex;
@@ -215,4 +122,25 @@ import { RouterOutlet, RouterLink, RouterLinkActive } from '@angular/router';
     }
   `],
 })
-export class AppComponent {}
+export class AppComponent {
+  private router   = inject(Router);
+  private pipeline = inject(PipelineStateService);
+
+  constructor() {
+    // Pipeline jobs live in a singleton service that outlives route changes,
+    // so without this the Pipeline/Activity pages would show whatever was
+    // fetched last. Re-pull the run list from the servers every time either
+    // page is entered (or its nav link is clicked again). The very first
+    // navigation is skipped — the service's own startup load covers it.
+    let first = true;
+    this.router.events
+      .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd), takeUntilDestroyed())
+      .subscribe(e => {
+        if (first) { first = false; return; }
+        const path = e.urlAfterRedirects.split('?')[0];
+        if (path === '/pipeline' || path === '/activity') {
+          this.pipeline.refreshRuns({ silent: true });
+        }
+      });
+  }
+}

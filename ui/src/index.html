@@ -5,6 +5,12 @@
   <title>SonarFortAI</title>
   <base href="/">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Never serve a cached copy of the app shell — the hashed JS/CSS bundles
+       it points to change on every build. (Real HTTP headers from the web
+       server are stronger; e.g. nginx: Cache-Control no-store on index.html.) -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <link rel="icon" type="image/x-icon" href="./assets/logo.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
