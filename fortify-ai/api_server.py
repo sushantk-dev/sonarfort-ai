@@ -344,6 +344,63 @@ def _cancel_check_for(pipeline_id: str | None) -> "Callable[[], bool]":
         return bool(pipeline_id and _store.is_cancel_requested(pipeline_id))
     return _check
 
+
+# ── Stage heartbeat ───────────────────────────────────────────────────────────
+# The orphan sweep (_run_orphan_sweep) fails any 'running' job whose
+# last_progress_at hasn't moved for ORPHAN_SWEEP_TIMEOUT_SECONDS. Long
+# per-dependency stages (adr-fix, build-validation) used to write progress
+# only at stage start/end, so a healthy run with many upgrades could go
+# silent for longer than that window and get swept as "presumed orphaned".
+# These helpers keep last_progress_at moving while real work is happening.
+# A pod that actually dies (OOM kill, eviction) stops beating, so the sweep
+# still catches it exactly as before.
+_HEARTBEAT_INTERVAL_SECONDS = float(os.environ.get("STAGE_HEARTBEAT_SECONDS", 60))
+
+
+def _heartbeat_for(pipeline_id: str | None) -> "Callable[[], None]":
+    """
+    Build a zero-arg, self-throttling heartbeat callback bound to
+    *pipeline_id*. Safe to call as often as you like (e.g. from adr_fix's
+    0.5 s subprocess poll loop) — it only touches the job store once every
+    STAGE_HEARTBEAT_SECONDS (default 60). Never raises: a transient job-store
+    error must not fail the pipeline stage it's reporting on. No-op when
+    pipeline_id is None (ad-hoc/non-job invocations).
+    """
+    last = [0.0]
+    lock = Lock()
+
+    def _beat() -> None:
+        if not pipeline_id:
+            return
+        now = time.time()
+        with lock:
+            if now - last[0] < _HEARTBEAT_INTERVAL_SECONDS:
+                return
+            last[0] = now
+        try:
+            _store.touch(pipeline_id)
+        except Exception as exc:
+            print(f"[Heartbeat] touch failed for {pipeline_id}: {exc}")
+    return _beat
+
+
+def _report_stage_progress(pipeline_id: str | None, stage: str, done: int,
+                           total: int, artifact_id: str | None = None) -> None:
+    """
+    Record per-dependency progress on a running stage (e.g. "7/20") so the
+    UI can show where a long stage is, and bump last_progress_at as a side
+    effect (update_stage always does). Never raises — progress reporting is
+    best-effort and must not fail the stage.
+    """
+    if not pipeline_id:
+        return
+    try:
+        _update_stage(pipeline_id, stage,
+                      progress={"done": done, "total": total,
+                                "current_artifact": artifact_id})
+    except Exception as exc:
+        print(f"[Heartbeat] progress update failed for {pipeline_id}/{stage}: {exc}")
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -1146,7 +1203,7 @@ def _run_full_pipeline(
             # even though the stage is genuinely running again right now.
             _update_stage(pipeline_id, name, status="running", started_at=_now(),
                           finished_at=None, elapsed_seconds=None,
-                          error=None, output_summary=None)
+                          error=None, output_summary=None, progress=None)
         return t
 
     def _stage_done(name: str, t: float, summary: dict | None = None) -> None:
@@ -1377,6 +1434,9 @@ def _run_full_pipeline(
     # build subprocess) instead of only at the stage boundaries _check_cancelled
     # checks — see PipelineCancelledError in state.py for why.
     cancel_check = _cancel_check_for(pipeline_id)
+    # Throttled heartbeat threaded into adr-fix's subprocess poll loop so a
+    # single long ADR run still refreshes last_progress_at (see _heartbeat_for).
+    heartbeat = _heartbeat_for(pipeline_id)
 
     # Stage 5 — ai reasoning
     if _already_done("ai-reasoning"):
@@ -1477,9 +1537,12 @@ def _run_full_pipeline(
         t = _stage_start("adr-fix")
         adr_results: list[dict] = []
         try:
-            for group in reasoned:
+            for _i, group in enumerate(reasoned):
                 _check_cancelled(pipeline_id)  # stop before committing the next group
                 artifact_id = group["parsed"]["artifact_id"]
+                # Heartbeat: per-dependency progress keeps last_progress_at
+                # moving so the orphan sweep doesn't kill a long, healthy run.
+                _report_stage_progress(pipeline_id, "adr-fix", _i, len(reasoned), artifact_id)
                 # primary_location (groupId:artifactId@version) — the real
                 # unique key. artifact_id alone collides when the same dep
                 # appears at different versions in different modules; every
@@ -1517,6 +1580,7 @@ def _run_full_pipeline(
                         jira_ticket_id=cfg.jira_ticket_id,
                         release_id=release_id,
                         cancel_check=cancel_check,
+                        heartbeat=heartbeat,
                         required_jdk=required_jdk,
                         base_branch=cfg.base_branch or None,
                         # Push right after commit when the build stage is being skipped
@@ -1536,6 +1600,7 @@ def _run_full_pipeline(
             _stage_fail("adr-fix", t, "Cancelled by user")
             raise
         _adr_ok = sum(1 for r in adr_results if r.get("result", {}).get("success"))
+        _report_stage_progress(pipeline_id, "adr-fix", len(reasoned), len(reasoned))
         _stage_done("adr-fix", t, {"committed": _adr_ok, "total": len(adr_results)})
         _checkpoint("build-validation", adr_results=adr_results)
 
@@ -1578,9 +1643,10 @@ def _run_full_pipeline(
 
         merged_results: list[dict] = []
         try:
-            for entry in adr_results:
+            for _i, entry in enumerate(adr_results):
                 _check_cancelled(pipeline_id)  # stop before pushing the next branch
                 artifact_id = entry["artifact_id"]
+                _report_stage_progress(pipeline_id, "build-validation", _i, len(adr_results), artifact_id)
                 primary_location = entry["primary_location"]
                 adr_result = entry["result"]
                 if not adr_result.get("success"):
@@ -1608,6 +1674,9 @@ def _run_full_pipeline(
                 while (not bv_result.get("success")) and group is not None and retries_used < max_retries:
                     _check_cancelled(pipeline_id)
                     retries_used += 1
+                    # Each retry is another commit + full Maven build — beat so
+                    # several retries on one dependency don't exceed the sweep window.
+                    heartbeat()
                     print(f"[AiCodeFix] {artifact_id}: build failed "
                           f"(attempt {retries_used}/{max_retries}) — running failure analysis")
 
@@ -1698,6 +1767,7 @@ def _run_full_pipeline(
                         jira_ticket_id=cfg.jira_ticket_id,
                         release_id=release_id,
                         cancel_check=cancel_check,
+                        heartbeat=heartbeat,
                         required_jdk=required_jdk,
                         base_branch=cfg.base_branch or None,
                         push=False,
@@ -3885,7 +3955,7 @@ def _run_until(
         if pipeline_id:
             _update_stage(pipeline_id, name, status="running", started_at=_now(),
                           finished_at=None, elapsed_seconds=None,
-                          error=None, output_summary=None)
+                          error=None, output_summary=None, progress=None)
         return t
 
     def _s_done(name: str, t: float, summary: dict | None = None) -> None:
@@ -4003,6 +4073,7 @@ def _run_until(
 
     # Stage 4 — ai reasoning
     cancel_check = _cancel_check_for(pipeline_id)
+    heartbeat = _heartbeat_for(pipeline_id)  # see _heartbeat_for
 
     _check_cancelled(pipeline_id)
     t = _s_start("ai-reasoning")
@@ -4031,9 +4102,10 @@ def _run_until(
     t = _s_start("adr-fix")
     adr_results: list[dict] = []
     try:
-        for group in reasoned:
+        for _i, group in enumerate(reasoned):
             _check_cancelled(pipeline_id)  # stop before committing the next group
             artifact_id = group["parsed"]["artifact_id"]
+            _report_stage_progress(pipeline_id, "adr-fix", _i, len(reasoned), artifact_id)
             # See the full-pipeline adr-fix stage above for why this travels
             # alongside artifact_id: it's the actual unique join key.
             primary_location = group["primary_location"]
@@ -4058,6 +4130,7 @@ def _run_until(
                         jira_ticket_id=cfg.jira_ticket_id,
                         release_id=release_id,
                         cancel_check=cancel_check,
+                        heartbeat=heartbeat,
                         required_jdk=required_jdk,
                         base_branch=cfg.base_branch or None,
                         push=not run_build,
@@ -4088,9 +4161,10 @@ def _run_until(
         java_home = _resolve_java_home(cfg.java_home, required_jdk or "")
         merged_results: list[dict] = []
         try:
-            for entry in adr_results:
+            for _i, entry in enumerate(adr_results):
                 _check_cancelled(pipeline_id)  # stop before pushing the next branch
                 artifact_id = entry["artifact_id"]
+                _report_stage_progress(pipeline_id, "build-validation", _i, len(adr_results), artifact_id)
                 primary_location = entry.get("primary_location")
                 adr_result = entry["result"]
                 if not adr_result.get("success"):

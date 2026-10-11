@@ -647,6 +647,7 @@ export class PipelineStateService {
       const summary = s.output_summary;
       let detail = s.error ?? '';
       if (!detail && summary) detail = this._summariseStageOutput(key, summary);
+      if (!detail && apiStatus === 'running') detail = this._formatStageProgress(s.progress);
 
       return { label: FORTIFY_STAGE_LABELS[key], status: uiStatus as any, detail, ms };
     });
@@ -718,6 +719,19 @@ export class PipelineStateService {
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+  /** Live per-dependency progress for a running stage (adr-fix /
+   *  build-validation), written by api_server._report_stage_progress as
+   *  { done, total, current_artifact }. Shows the 1-based dependency being
+   *  worked on, e.g. "Dependency 7/20 · spring-core". '' when absent, so
+   *  older backends render exactly as before. */
+  private _formatStageProgress(p: any): string {
+    if (!p || typeof p.total !== 'number' || p.total <= 0) return '';
+    const current = Math.min((p.done ?? 0) + 1, p.total);
+    return p.current_artifact
+      ? `Dependency ${current}/${p.total} · ${p.current_artifact}`
+      : `Dependency ${current}/${p.total}`;
+  }
+
   private _summariseStageOutput(stage: string, summary: any): string {
     if (!summary) return '';
     switch (stage) {
@@ -972,6 +986,7 @@ export class PipelineStateService {
       const summary = s.output_summary;
       let detail = s.error ?? '';
       if (!detail && summary) detail = this._summariseStageOutput(key, summary);
+      if (!detail && apiStatus === 'running') detail = this._formatStageProgress(s.progress);
       return { label: FORTIFY_STAGE_LABELS[key], status: uiStatus as any, detail, ms };
     });
 

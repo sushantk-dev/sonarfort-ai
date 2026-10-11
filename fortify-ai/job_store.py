@@ -168,6 +168,20 @@ class JobStore(ABC):
     def update_stage(self, pipeline_id: str, stage: str, **fields) -> None:
         """Merge fields into a specific stage sub-dict."""
 
+    def touch(self, pipeline_id: str) -> None:
+        """
+        Heartbeat: bump ``last_progress_at`` without changing anything else,
+        so the orphan-job sweep (find_stale_running) keeps treating a long
+        but healthy stage as alive. Called (throttled) from long-running
+        stages via api_server._heartbeat_for.
+
+        Deliberately concrete, not abstract: ``update_job`` with no fields
+        already does exactly this in every implementation (it always stamps
+        last_progress_at), so existing subclasses/test doubles get it for
+        free. Override only if a cheaper write path exists.
+        """
+        self.update_job(pipeline_id)
+
     @abstractmethod
     def finish_job(
         self,

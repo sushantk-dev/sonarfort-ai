@@ -336,6 +336,7 @@ def invoke_adr(
     push: bool = False,
     jira_ticket_id: Optional[str] = None,
     base_branch: Optional[str] = None,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, str, str]:
     """
     Run adr_fortify.py --commit <commit_id> [--push] --target-versions <json>
@@ -402,6 +403,14 @@ def invoke_adr(
         cancelled ADR run as "state unknown — verify manually", not as a
         clean rollback.
 
+    heartbeat: optional zero-arg callable invoked from the same poll loop as
+        cancel_check (every ``_CANCEL_POLL_SECONDS``) for as long as the ADR
+        subprocess is running. Expected to throttle itself (see
+        api_server._heartbeat_for) — it keeps the job's last_progress_at
+        fresh so the orphan sweep doesn't mistake a long ADR run for a dead
+        pod. Exceptions from it are swallowed: a failed heartbeat must never
+        fail the fix. None (default) = no heartbeat, behaviour unchanged.
+
     Returns (success: bool, stdout: str, stderr: str).
     success=True means exit code 0 — pom.xml edited + committed locally, and,
     if push=True, pushed to origin too (adr_fortify.py exits non-zero if the
@@ -465,6 +474,11 @@ def invoke_adr(
             if cancel_check is not None and cancel_check():
                 cancelled = True
                 break
+            if heartbeat is not None:
+                try:
+                    heartbeat()
+                except Exception as hb_exc:   # never let a heartbeat failure kill the fix
+                    logger.debug(f"[ADR Fix] heartbeat failed (ignored): {hb_exc}")
             try:
                 raw = line_queue.get(timeout=_CANCEL_POLL_SECONDS)
             except queue.Empty:
@@ -542,6 +556,7 @@ def run_adr_fix(
     push: bool = False,
     jira_ticket_id: Optional[str] = None,
     base_branch: Optional[str] = None,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> AdrResult:
     """
     Apply the version fix for one dependency group via ADR.
@@ -562,6 +577,8 @@ def run_adr_fix(
     push: forwarded to invoke_adr() — see its docstring. Pass True when Run
         Maven Build is OFF (nothing else will push this branch), False when
         it's ON (build_validation_node pushes after a successful build).
+
+    heartbeat: optional, forwarded to invoke_adr() — see its docstring.
 
     cancel_check: forwarded to invoke_adr() — see its docstring. If the job is
         cancelled while this group's build is running, PipelineCancelledError
@@ -618,6 +635,7 @@ def run_adr_fix(
         adr_path, project_path, branch_name, target_versions=target_versions,
         cancel_check=cancel_check, required_jdk=required_jdk, push=push,
         jira_ticket_id=jira_ticket_id, base_branch=base_branch,
+        heartbeat=heartbeat,
     )
 
     if success:
@@ -727,6 +745,8 @@ def adr_fix_node(
                                          invoke_adr()'s docstring. Not required;
                                          without it this node behaves as before
                                          (cancel has no effect mid-commit).
+            state["_heartbeat"]         optional zero-arg callable — see
+                                         invoke_adr()'s docstring. Not required.
             state["jira_ticket_id"]     optional fallback for the jira_ticket_id
                                          param — used only if the caller didn't
                                          pass jira_ticket_id explicitly.
@@ -758,6 +778,7 @@ def adr_fix_node(
     adr_results: list[dict] = []
     release_id: int = state.get("release_id", 0)  # type: ignore[attr-defined]
     cancel_check = state.get("_cancel_check")  # type: ignore[attr-defined]
+    heartbeat = state.get("_heartbeat")  # type: ignore[attr-defined] — optional, see invoke_adr()
     required_jdk = state.get("required_jdk")  # type: ignore[attr-defined] — set by context_node
     jira_ticket_id = jira_ticket_id or state.get("jira_ticket_id")  # type: ignore[attr-defined]
     base_branch = base_branch or state.get("base_branch")  # type: ignore[attr-defined]
@@ -769,7 +790,7 @@ def adr_fix_node(
             group, adr_path, project_path, jira_prefix,
             release_id=release_id, cancel_check=cancel_check,
             required_jdk=required_jdk, jira_ticket_id=jira_ticket_id,
-            base_branch=base_branch,
+            base_branch=base_branch, heartbeat=heartbeat,
         )
         adr_results.append({
             "artifact_id": group["parsed"]["artifact_id"],
