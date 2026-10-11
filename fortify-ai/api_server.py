@@ -704,6 +704,14 @@ class TriageRequest(BaseModel):
         ge=0,
         description="Max dependencies to upgrade (0 = unlimited, highest severity first)",
     )
+    github_token: Optional[str] = Field(
+        default=None,
+        description="Optional. With github_repo, deps that already have an open or "
+                    "merged FortifyAI PR are skipped before the max_upgrades cap.",
+    )
+    github_repo: Optional[str] = Field(
+        default=None, description="Optional. GitHub repo in owner/repo format.",
+    )
 
 
 class VersionResolverRequest(BaseModel):
@@ -1021,6 +1029,32 @@ def _clone_repo_if_needed(
     return cfg, clone_dir
 
 
+# ── Skip deps that already have a PR ──────────────────────────────────────────
+# On by default. Set FORTIFYAI_SKIP_EXISTING_PRS=false to go back to the old
+# behaviour (every run re-picks the top-N deps by severity, even ones that
+# already have an open or merged FortifyAI PR).
+_SKIP_EXISTING_PRS = os.getenv("FORTIFYAI_SKIP_EXISTING_PRS", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+
+def _lookup_existing_prs(github_token: Optional[str], github_repo: Optional[str]) -> dict:
+    """
+    Ask GitHub which deps already have an open or merged FortifyAI PR
+    (pr_agent.find_deps_with_existing_prs). Non-fatal: if GitHub is
+    unreachable or credentials are missing, returns {} and triage simply
+    doesn't filter — a GitHub hiccup must never block a pipeline run.
+    """
+    if not _SKIP_EXISTING_PRS or not github_token or not github_repo:
+        return {}
+    try:
+        from agents.pr_agent import find_deps_with_existing_prs
+        return find_deps_with_existing_prs(github_token, github_repo)
+    except Exception as exc:
+        print(f"[Triage] Existing-PR lookup failed — continuing without it: {exc}")
+        return {}
+
+
 def _run_full_pipeline(
     cfg: FortifyAIConfig,
     client,
@@ -1063,7 +1097,9 @@ def _run_full_pipeline(
         token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
 
     from pathlib import Path
-    from agents.triage import group_by_dependency, apply_max_upgrades
+    from agents.triage import (
+        group_by_dependency, apply_max_upgrades, exclude_in_flight, summarize_in_flight,
+    )
     from agents.version_resolver import resolve_all_groups
     from agents.context import locate_all_groups, detect_required_jdk
     from agents.api_diff import run_api_diff_all_groups
@@ -1154,25 +1190,42 @@ def _run_full_pipeline(
     if _already_done("triage"):
         groups = acc["groups"]
         triage_skipped = acc.get("triage_skipped", 0)
+        already_has_pr = acc.get("already_has_pr", [])
     else:
         _check_cancelled(pipeline_id)
         t = _stage_start("triage")
         groups, triage_skipped = group_by_dependency(raw_vulns)
+        # Drop deps that already have an open/merged PR BEFORE capping, so
+        # max_upgrades picks the next set instead of the same top N again.
+        groups, in_flight = exclude_in_flight(
+            groups, _lookup_existing_prs(cfg.github_token, cfg.github_repo),
+        )
+        already_has_pr = summarize_in_flight(in_flight)
         groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
         if not groups:
             _stage_done("triage", t, {
                 "total_groups": 0, "groups_count": 0,
                 "total_skipped": triage_skipped,
+                "already_has_pr": len(already_has_pr),
             })
             for s in ["version-resolver", "context", "api-diff",
                       "ai-reasoning", "adr-fix", "build-validation", "pr-agent", "fortify-writeback"]:
                 _stage_skip(s)
-            return {"status": "skipped", "reason": "No actionable findings"}
+            return {
+                "status": "skipped",
+                "reason": (
+                    "All actionable dependencies already have an open or merged PR"
+                    if already_has_pr else "No actionable findings"
+                ),
+                "already_has_pr": already_has_pr,
+            }
         _stage_done("triage", t, {
             "total_groups": len(groups), "groups_count": len(groups),
             "total_skipped": triage_skipped,
+            "already_has_pr": len(already_has_pr),
         })
-        _checkpoint("version-resolver", groups=groups, triage_skipped=triage_skipped)
+        _checkpoint("version-resolver", groups=groups, triage_skipped=triage_skipped,
+                    already_has_pr=already_has_pr)
 
     # Stage 2 — version resolver
     if _already_done("version-resolver"):
@@ -1648,6 +1701,7 @@ def _run_full_pipeline(
         "total_failed":      summary.get("total_failed",    0),
         "summary":      summary,
         "dry_run":      dry_run,
+        "already_has_pr": already_has_pr,
     }
 
 @app.on_event("startup")
@@ -3315,12 +3369,18 @@ def stage_triage(req: TriageRequest):
     """
     t0 = time.time()
     try:
-        from agents.triage import group_by_dependency, apply_max_upgrades
+        from agents.triage import (
+            group_by_dependency, apply_max_upgrades, exclude_in_flight, summarize_in_flight,
+        )
         groups, skipped = group_by_dependency(req.raw_vulnerabilities)
+        groups, in_flight = exclude_in_flight(
+            groups, _lookup_existing_prs(req.github_token, req.github_repo),
+        )
         groups = apply_max_upgrades(groups, req.max_upgrades)
         return ok({
             "groups": groups, "count": len(groups),
             "total_groups": len(groups), "total_skipped": skipped,
+            "already_has_pr": summarize_in_flight(in_flight),
         }, time.time() - t0)
     except Exception as exc:
         return err(str(exc), exc)
@@ -3715,7 +3775,9 @@ def _run_until(
         token_tracker.start_run(pipeline_id)   # bind LLM token accounting to this run
 
     from pathlib import Path
-    from agents.triage import group_by_dependency, apply_max_upgrades
+    from agents.triage import (
+        group_by_dependency, apply_max_upgrades, exclude_in_flight, summarize_in_flight,
+    )
     from agents.version_resolver import resolve_all_groups
     from agents.context import locate_all_groups, detect_required_jdk
     from agents.api_diff import run_api_diff_all_groups
@@ -3762,12 +3824,20 @@ def _run_until(
     _check_cancelled(pipeline_id)
     t = _s_start("triage")
     groups, triage_skipped = group_by_dependency(raw_vulns)
+    # Drop deps that already have an open/merged PR BEFORE capping, so
+    # max_upgrades picks the next set instead of the same top N again.
+    groups, in_flight = exclude_in_flight(
+        groups, _lookup_existing_prs(cfg.github_token, cfg.github_repo),
+    )
+    already_has_pr = summarize_in_flight(in_flight)
     groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
     result["groups"] = groups
     result["groups_count"] = len(groups)
+    result["already_has_pr"] = already_has_pr
     _s_done("triage", t, {
         "total_groups": len(groups), "groups_count": len(groups),
         "total_skipped": triage_skipped,
+        "already_has_pr": len(already_has_pr),
     })
     if idx == 0 or not groups:
         for s in STAGE_ORDER[1:]:

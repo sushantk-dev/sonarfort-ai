@@ -13,6 +13,9 @@ PR spec:
   Reviewers: from config.reviewers (auto-assign on high-confidence only)
   Body:    Markdown table + Sonatype analysis + Validation section + References
   PDF:     Attached as a follow-up comment (GitHub API file upload)
+  Marker:  <!-- fortifyai-dep: groupId:artifactId@version --> at the top of the
+           body, so find_deps_with_existing_prs() can tell triage which deps
+           already have an open/merged PR and should be skipped next run.
 
 Console output (done-when):
   [PR] ✅ PR created: https://github.com/acme/backend/pull/482
@@ -28,6 +31,79 @@ from typing import Optional
 from loguru import logger
 
 from state import AgentState, PrResult
+
+# ── Dependency ↔ PR matching ──────────────────────────────────────────────────
+# Every PR body carries "<!-- fortifyai-dep: groupId:artifactId@version -->"
+# (see build_pr_body). Older PRs opened before the marker existed are matched
+# by their title instead:
+#   [FortifyAI] <ref>: Fix <cve> — <artifact_id> <current_version> → <candidate>
+_DEP_MARKER_PREFIX = "fortifyai-dep:"
+_DEP_MARKER_RE = re.compile(r"<!--\s*fortifyai-dep:\s*(\S+)\s*-->")
+_TITLE_RE = re.compile(r"^\[FortifyAI\] .*? — (\S+) (\S+) → \S+")
+
+# How many recently-updated closed PRs to scan for merged FortifyAI fixes.
+# Open PRs are always scanned in full; closed history is capped so a repo
+# with thousands of old PRs doesn't turn triage into a long crawl.
+_MAX_CLOSED_PRS_SCANNED = 300
+
+
+def find_deps_with_existing_prs(
+    github_token: str,
+    github_repo: str,
+    max_closed_scanned: int = _MAX_CLOSED_PRS_SCANNED,
+) -> dict[str, dict]:
+    """
+    Return the dependencies that already have a FortifyAI PR which is still
+    open, or which was merged — i.e. deps a new run should NOT pick again.
+
+    PRs closed WITHOUT merging are ignored on purpose: someone rejected that
+    fix, so the dependency is still vulnerable and should be retried.
+
+    Keys (both are added when available, so triage can match either way):
+      "groupId:artifactId@version"  — from the hidden body marker (exact)
+      "artifactId@version"          — from the PR title (fallback, older PRs)
+
+    Value: {"pr_url", "pr_number", "state": "open" | "merged"}
+
+    Raises on GitHub connection/auth errors — the caller decides whether a
+    failed lookup should block the run (api_server treats it as non-fatal).
+    """
+    from github import Github  # type: ignore
+
+    repo = Github(github_token).get_repo(github_repo)
+    found: dict[str, dict] = {}
+
+    def _record(pr, state: str) -> None:
+        info = {"pr_url": pr.html_url, "pr_number": pr.number, "state": state}
+        m = _DEP_MARKER_RE.search(pr.body or "")
+        if m:
+            found.setdefault(m.group(1), info)
+        t = _TITLE_RE.match(pr.title or "")
+        if t:
+            found.setdefault(f"{t.group(1)}@{t.group(2)}", info)
+
+    open_count = merged_count = 0
+    for pr in repo.get_pulls(state="open"):
+        if (pr.title or "").startswith("[FortifyAI]"):
+            _record(pr, "open")
+            open_count += 1
+
+    scanned = 0
+    for pr in repo.get_pulls(state="closed", sort="updated", direction="desc"):
+        scanned += 1
+        if scanned > max_closed_scanned:
+            break
+        if pr.merged_at and (pr.title or "").startswith("[FortifyAI]"):
+            _record(pr, "merged")
+            merged_count += 1
+
+    logger.info(
+        f"[PR] Existing FortifyAI PRs in {github_repo}: "
+        f"{open_count} open, {merged_count} merged "
+        f"(scanned last {min(scanned, max_closed_scanned)} closed PRs)"
+    )
+    return found
+
 
 # ── PR body builder ───────────────────────────────────────────────────────────
 
@@ -86,7 +162,13 @@ def build_pr_body(
     cve_str    = ", ".join(f"`{c}`" for c in cves) or "(none)"
     build_cell = f"✅ PASSED ({build_time}s)" if build_time else "✅ PASSED"
 
+    # Hidden, machine-readable marker — lets find_deps_with_existing_prs()
+    # match this PR back to its exact dependency (groupId:artifactId@version)
+    # on later runs, without relying on the human-readable title.
+    dep_key = group.get("primary_location") or f"{group_id}:{artifact_id}@{current_ver}"
+
     body = f"""\
+<!-- {_DEP_MARKER_PREFIX} {dep_key} -->
 ## FortifyAI Automated Security Fix
 
 | Field        | Detail |

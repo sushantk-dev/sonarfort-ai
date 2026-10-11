@@ -11,6 +11,8 @@ Filter rules (applied in order):
   - category != "Open Source"    → skip
   - auditorStatus != "Fixable OSS" → skip
   - closedStatus == true         → skip
+  - already has an open or merged FortifyAI PR → skip (exclude_in_flight,
+    applied before the max_upgrades cap so each run takes the NEXT set)
 
 Output (per unique dep kept):
   {
@@ -154,6 +156,67 @@ def group_by_dependency(vulns: list[dict]) -> tuple[list[dict[str, Any]], int]:
     return groups, skipped_count
 
 
+def exclude_in_flight(
+    groups: list[dict[str, Any]],
+    existing_prs: dict[str, dict] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Drop dependencies that already have an open or merged FortifyAI PR.
+
+    Run this BEFORE apply_max_upgrades() so the cap fills up with the next
+    dependencies in severity order instead of re-picking the same top N.
+
+    existing_prs: output of pr_agent.find_deps_with_existing_prs(). Matched on
+        the exact "groupId:artifactId@version" first (PR body marker), then on
+        "artifactId@version" (PR title — for PRs opened before the marker).
+
+    Returns (remaining_groups, in_flight_groups). Each in-flight group gets an
+    "existing_pr" dict ({pr_url, pr_number, state}) attached for reporting.
+    """
+    if not groups or not existing_prs:
+        return groups, []
+
+    remaining: list[dict[str, Any]] = []
+    in_flight: list[dict[str, Any]] = []
+
+    for g in groups:
+        parsed = g.get("parsed", {})
+        exact_key = g.get("primary_location", "")
+        title_key = f"{parsed.get('artifact_id', '')}@{parsed.get('current_version', '')}"
+        hit = existing_prs.get(exact_key) or existing_prs.get(title_key)
+        if hit:
+            g["existing_pr"] = hit
+            in_flight.append(g)
+            logger.info(
+                f"[Triage] ⏭️  {parsed.get('artifact_id', exact_key):<22} "
+                f"{parsed.get('current_version', ''):<12} already has "
+                f"{hit.get('state', 'open')} PR #{hit.get('pr_number')} — skipping"
+            )
+        else:
+            remaining.append(g)
+
+    if in_flight:
+        logger.info(
+            f"[Triage] {len(in_flight)} dep(s) already have a PR — "
+            f"{len(remaining)} left for this run"
+        )
+    return remaining, in_flight
+
+
+def summarize_in_flight(in_flight: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compact, JSON-friendly view of exclude_in_flight()'s skipped groups."""
+    return [
+        {
+            "artifact_id":      g.get("parsed", {}).get("artifact_id"),
+            "current_version":  g.get("parsed", {}).get("current_version"),
+            "primary_location": g.get("primary_location"),
+            "severity":         g.get("severity"),
+            **(g.get("existing_pr") or {}),
+        }
+        for g in in_flight
+    ]
+
+
 def apply_max_upgrades(groups: list[dict[str, Any]], max_upgrades: int) -> list[dict[str, Any]]:
     """
     Cap the number of dependencies forwarded for remediation.
@@ -231,6 +294,27 @@ def triage_node(state: AgentState) -> AgentState:
         })
         return state
 
+    # Skip deps that already have an open/merged PR (caller pre-fetches these
+    # into state["_existing_prs"] via pr_agent.find_deps_with_existing_prs —
+    # this node has no GitHub credentials of its own). Done before the cap so
+    # the cap picks the NEXT set rather than the same top N again.
+    existing_prs = state.get("_existing_prs")  # type: ignore[attr-defined]
+    groups, in_flight = exclude_in_flight(groups, existing_prs)
+
+    if not groups:
+        logger.warning("[Triage] Every remaining dep already has a PR — nothing new to remediate")
+        state["status"] = "skipped"
+        state["skip_reason"] = "All actionable dependencies already have an open or merged PR"
+        state["audit_trail"].append({
+            "node": "triage",
+            "status": "skipped",
+            "reason": state["skip_reason"],
+            "input_count": len(raw),
+            "skipped_count": skipped_count,
+            "already_has_pr": summarize_in_flight(in_flight),
+        })
+        return state
+
     # Apply optional cap — sorts by severity regardless of whether a limit is set
     max_upgrades: int = state.get("max_upgrades", 0)  # type: ignore[assignment]
     groups = apply_max_upgrades(groups, max_upgrades)
@@ -245,6 +329,7 @@ def triage_node(state: AgentState) -> AgentState:
         "skipped_count": skipped_count,
         "max_upgrades": max_upgrades or "unlimited",
         "deps": [g["parsed"]["artifact_id"] for g in groups],
+        "already_has_pr": summarize_in_flight(in_flight),
     })
 
     logger.info(
