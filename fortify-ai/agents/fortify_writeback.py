@@ -614,6 +614,7 @@ def fortify_writeback_node(
     LangGraph node: fortify_writeback (now an escalation report writer).
 
     Reads:  state["_reasoned_groups"]
+            state["_no_safe_version_groups"]  (escalation reports only)
             state["_adr_results"]
             state["_all_pr_results"]
             state["escalation_reason"]
@@ -625,11 +626,17 @@ def fortify_writeback_node(
             state["_escalation_files"] → list of written report paths
             state["audit_trail"]
     """
-    groups: list[dict] = (
+    groups: list[dict] = list(
         state.get("_reasoned_groups")  # type: ignore[attr-defined]
         or state.get("_diff_groups")   # type: ignore[attr-defined]
         or []
     )
+    # Deps the version resolver set aside because Fortify has no safe version
+    # for them. They skipped the fix stages (so they don't take a
+    # max_upgrades slot) but still need an escalation report — they have no
+    # ADR result, so run_all_reports() routes them to escalation using their
+    # own escalate_reason.
+    groups += state.get("_no_safe_version_groups", [])  # type: ignore[attr-defined]
     adr_results: list[dict] = state.get("_adr_results", [])    # type: ignore[attr-defined]
     pr_results:  list[dict] = state.get("_all_pr_results", []) # type: ignore[attr-defined]
     escalation_reason       = state.get("escalation_reason")

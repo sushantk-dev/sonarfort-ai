@@ -14,6 +14,11 @@ Filter rules (applied in order):
   - already has an open or merged FortifyAI PR → skip (exclude_in_flight,
     applied before the max_upgrades cap so each run takes the NEXT set)
 
+The max_upgrades cap itself is applied by the version resolver
+(version_resolver.resolve_until_fixable), not here: triage only sorts the
+backlog by severity, so deps with no safe version can be skipped without
+using up a slot.
+
 Output (per unique dep kept):
   {
     "primary_location": "org.springframework:spring-context@5.3.31",
@@ -315,9 +320,11 @@ def triage_node(state: AgentState) -> AgentState:
         })
         return state
 
-    # Apply optional cap — sorts by severity regardless of whether a limit is set
+    # Sort by severity only — do NOT cap here. The max_upgrades cap is applied
+    # by version_resolver_node (resolve_until_fixable), so deps with no safe
+    # version don't use up a slot; the next dep in the backlog is tried instead.
     max_upgrades: int = state.get("max_upgrades", 0)  # type: ignore[assignment]
-    groups = apply_max_upgrades(groups, max_upgrades)
+    groups = apply_max_upgrades(groups, 0)
 
     # Store grouped results back into state for downstream nodes
     state["_triaged_groups"] = groups  # type: ignore[typeddict-unknown-key]
@@ -333,6 +340,7 @@ def triage_node(state: AgentState) -> AgentState:
     })
 
     logger.info(
-        f"[Triage] ✅ {len(groups)} unique dep(s) queued for remediation"
+        f"[Triage] ✅ {len(groups)} unique dep(s) in the backlog — version "
+        f"resolver will pick up to {max_upgrades or 'all'} with a safe version"
     )
     return state

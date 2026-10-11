@@ -894,6 +894,29 @@ def _escalation_reason(group: dict) -> str:
     )
 
 
+def _no_safe_adr_entries(groups: list[dict]) -> list[dict]:
+    """
+    Failed AdrResult entries for deps the version resolver set aside because
+    no safe version exists. They never reach adr-fix, but fortify-writeback
+    and the UI join groups to adr_results by primary_location — giving them
+    an entry (success=False, error_reason=escalate_reason) makes them render
+    and report as escalated, the same as when they used to flow through.
+    """
+    from state import AdrResult
+    return [
+        {
+            "artifact_id":      g["parsed"]["artifact_id"],
+            "primary_location": g["primary_location"],
+            "result": AdrResult(
+                success=False, branch_name=None, base_branch=None,
+                commit_hash=None, build_time_seconds=None, pdf_path=None,
+                error_reason=_escalation_reason(g),
+            ),
+        }
+        for g in groups
+    ]
+
+
 def _should_persist_token(overrides: ConfigOverrides) -> bool:
     """
     Decide whether a freshly-fetched Fortify OAuth token may be written to
@@ -1100,7 +1123,7 @@ def _run_full_pipeline(
     from agents.triage import (
         group_by_dependency, apply_max_upgrades, exclude_in_flight, summarize_in_flight,
     )
-    from agents.version_resolver import resolve_all_groups
+    from agents.version_resolver import resolve_until_fixable, summarize_groups
     from agents.context import locate_all_groups, detect_required_jdk
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
@@ -1186,6 +1209,8 @@ def _run_full_pipeline(
     if _MAVEN_WARMUP_ENABLED and not _already_done("build-validation"):
         maven_warmup_thread = start_maven_warmup(str(project_path))
 
+    effective_max_upgrades = max_upgrades or cfg.max_upgrades or 0
+
     # Stage 1 — triage
     if _already_done("triage"):
         groups = acc["groups"]
@@ -1201,7 +1226,10 @@ def _run_full_pipeline(
             groups, _lookup_existing_prs(cfg.github_token, cfg.github_repo),
         )
         already_has_pr = summarize_in_flight(in_flight)
-        groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
+        # Sort by severity only — the max_upgrades cap is applied by the
+        # version resolver below, so deps with no safe version don't use up
+        # a slot (see version_resolver.resolve_until_fixable).
+        groups = apply_max_upgrades(groups, 0)
         if not groups:
             _stage_done("triage", t, {
                 "total_groups": 0, "groups_count": 0,
@@ -1223,19 +1251,76 @@ def _run_full_pipeline(
             "total_groups": len(groups), "groups_count": len(groups),
             "total_skipped": triage_skipped,
             "already_has_pr": len(already_has_pr),
+            "max_upgrades": effective_max_upgrades or "unlimited",
         })
         _checkpoint("version-resolver", groups=groups, triage_skipped=triage_skipped,
                     already_has_pr=already_has_pr)
 
-    # Stage 2 — version resolver
+    # Stage 2 — version resolver. Walks the severity-sorted backlog until
+    # max_upgrades deps WITH a safe version are found. Deps with no safe
+    # version are set aside (no_safe_groups): they skip every fix stage but
+    # are still passed to fortify-writeback so they get an escalation report.
     if _already_done("version-resolver"):
         resolved = acc["resolved"]
+        no_safe_groups = acc.get("no_safe_groups", [])
+        lookup_failed = acc.get("lookup_failed", [])
     else:
         _check_cancelled(pipeline_id)
         t = _stage_start("version-resolver")
-        resolved = resolve_all_groups(client, release_id, groups)
-        _stage_done("version-resolver", t, {"groups_count": len(resolved)})
-        _checkpoint("context", resolved=resolved)
+        split = resolve_until_fixable(client, release_id, groups, effective_max_upgrades)
+        resolved       = split["fixable"]
+        no_safe_groups = split["no_safe"]
+        lookup_failed  = summarize_groups(split["lookup_failed"])
+        _stage_done("version-resolver", t, {
+            "groups_count":    len(resolved),
+            "no_safe_version": len(no_safe_groups),
+            "lookup_failed":   len(lookup_failed),
+            "deferred":        len(split["deferred"]),
+        })
+        _checkpoint("context", resolved=resolved, no_safe_groups=no_safe_groups,
+                    lookup_failed=lookup_failed)
+
+    # Nothing fixable in the whole backlog — skip the fix stages, but still
+    # write escalation reports for the deps that have no safe version.
+    if not resolved:
+        for s in ["context", "api-diff", "ai-reasoning", "adr-fix",
+                  "build-validation", "pr-agent"]:
+            _stage_skip(s)
+        no_safe_adr = _no_safe_adr_entries(no_safe_groups)
+        if no_safe_groups and not dry_run:
+            t = _stage_start("fortify-writeback")
+            summary = run_all_reports(
+                groups=no_safe_groups, adr_results=no_safe_adr,
+                pr_results=[], output_dir=cfg.adr_output_dir,
+                pipeline_id=pipeline_id,
+            )
+            _stage_done("fortify-writeback", t, summary)
+        else:
+            _stage_skip("fortify-writeback")
+            summary = {"dry_run": dry_run, "groups": len(no_safe_groups)}
+        return {
+            "status":       "escalated" if no_safe_groups else "skipped",
+            "reason":       (
+                "No dependency in the backlog has a safe version available"
+                if no_safe_groups else
+                "Fortify recommendations lookup failed for every dependency checked — "
+                "nothing escalated; retry once Fortify is reachable"
+                if lookup_failed else "No actionable findings"
+            ),
+            "release_id":   release_id,
+            "groups_count": len(no_safe_groups),
+            "groups":       no_safe_groups,
+            "adr_results":  no_safe_adr,
+            "pr_results":   [],
+            "total_fixed":       summary.get("total_fixed",     0),
+            "total_escalated":   summary.get("total_escalated", 0),
+            "total_failed":      summary.get("total_failed",    0),
+            "summary":      summary,
+            "dry_run":      dry_run,
+            "already_has_pr":  already_has_pr,
+            "no_safe_version": summarize_groups(no_safe_groups),
+            "lookup_failed":   lookup_failed,
+        }
 
     # Stage 3 — context
     if _already_done("context"):
@@ -1677,25 +1762,33 @@ def _run_full_pipeline(
         _checkpoint("fortify-writeback", pr_results=pr_results)
 
     # Stage 8 — writeback + summary (idempotent — deterministic filenames keyed by pipeline_id)
+    # no_safe_groups are added back here (with a failed AdrResult carrying
+    # their escalate_reason) so they get escalation reports and show up as
+    # escalated in the run result / UI, exactly like before — they just
+    # didn't go through the fix stages or use up a max_upgrades slot.
+    report_groups = reasoned + no_safe_groups
+    report_adr    = adr_results + _no_safe_adr_entries(no_safe_groups)
     _check_cancelled(pipeline_id)
     if not dry_run:
         t = _stage_start("fortify-writeback")
         summary = run_all_reports(
-            groups=reasoned, adr_results=adr_results,
+            groups=report_groups, adr_results=report_adr,
             pr_results=pr_results, output_dir=cfg.adr_output_dir,
             pipeline_id=pipeline_id,
         )
         _stage_done("fortify-writeback", t, summary)
     else:
         _stage_skip("fortify-writeback")
-        summary = {"dry_run": True, "groups": len(reasoned)}
+        summary = {"dry_run": True, "groups": len(report_groups)}
 
     return {
         "release_id":   release_id,
-        "groups_count": len(reasoned),
-        "groups":       reasoned,
-        "adr_results":  adr_results,
+        "groups_count": len(report_groups),
+        "groups":       report_groups,
+        "adr_results":  report_adr,
         "pr_results":   pr_results,
+        "no_safe_version": summarize_groups(no_safe_groups),
+        "lookup_failed":   lookup_failed,
         "total_fixed":       summary.get("total_fixed",     0),
         "total_escalated":   summary.get("total_escalated", 0),
         "total_failed":      summary.get("total_failed",    0),
@@ -3778,7 +3871,7 @@ def _run_until(
     from agents.triage import (
         group_by_dependency, apply_max_upgrades, exclude_in_flight, summarize_in_flight,
     )
-    from agents.version_resolver import resolve_all_groups
+    from agents.version_resolver import resolve_until_fixable, summarize_groups
     from agents.context import locate_all_groups, detect_required_jdk
     from agents.api_diff import run_api_diff_all_groups
     from agents.ai_reasoning import reason_all_groups
@@ -3830,7 +3923,10 @@ def _run_until(
         groups, _lookup_existing_prs(cfg.github_token, cfg.github_repo),
     )
     already_has_pr = summarize_in_flight(in_flight)
-    groups = apply_max_upgrades(groups, max_upgrades or cfg.max_upgrades)
+    # Sort only — the cap is applied by the version resolver below so deps
+    # with no safe version don't use up a max_upgrades slot.
+    effective_max_upgrades = max_upgrades or cfg.max_upgrades or 0
+    groups = apply_max_upgrades(groups, 0)
     result["groups"] = groups
     result["groups_count"] = len(groups)
     result["already_has_pr"] = already_has_pr
@@ -3838,6 +3934,7 @@ def _run_until(
         "total_groups": len(groups), "groups_count": len(groups),
         "total_skipped": triage_skipped,
         "already_has_pr": len(already_has_pr),
+        "max_upgrades": effective_max_upgrades or "unlimited",
     })
     if idx == 0 or not groups:
         for s in STAGE_ORDER[1:]:
@@ -3847,10 +3944,22 @@ def _run_until(
     # Stage 1 — version resolver
     _check_cancelled(pipeline_id)
     t = _s_start("version-resolver")
-    resolved = resolve_all_groups(client, release_id, groups)
-    result["groups"] = resolved
-    _s_done("version-resolver", t, {"groups_count": len(resolved)})
-    if idx == 1:
+    split = resolve_until_fixable(client, release_id, groups, effective_max_upgrades)
+    resolved = split["fixable"]
+    no_safe_groups = split["no_safe"]
+    result["groups"] = resolved + no_safe_groups
+    result["groups_count"] = len(resolved)
+    # Partial runs have no fortify-writeback stage, so no escalation report
+    # is written here — the no-safe deps are listed in the result instead.
+    result["no_safe_version"] = summarize_groups(no_safe_groups)
+    result["lookup_failed"] = summarize_groups(split["lookup_failed"])
+    _s_done("version-resolver", t, {
+        "groups_count":    len(resolved),
+        "no_safe_version": len(no_safe_groups),
+        "lookup_failed":   len(split["lookup_failed"]),
+        "deferred":        len(split["deferred"]),
+    })
+    if idx == 1 or not resolved:
         for s in STAGE_ORDER[2:]:
             _s_skip(s)
         return result
