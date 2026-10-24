@@ -23,3 +23,6 @@ python-multipart>=0.0.9  # File upload support for /api/report/upload
 
 # ── Stateless GCP backend (api.py + worker.py) ────────────────────────────────
 google-cloud-storage>=2.16   # GCS: run state, job queue, issues, config, reports, escalations
+
+# ── SSO (sso_auth.py) ─────────────────────────────────────────────────────────
+pyjwt[crypto]>=2.8           # JWT validation via JWKS (RS256)

@@ -111,10 +111,23 @@ Execution Modes:
                                              severity_counts (vulnerability findings grouped
                                              by severity) and vulnerability_total.
 
+  AUTH (Scramble ID SSO — see sso_auth.py)
+    Every endpoint except /health, /docs and the public /auth/* endpoints
+    below requires 'Authorization: Bearer <SSO id_token>'. Set
+    SSO_ENABLED=false for local development without SSO.
+    GET  /auth/config              — SSO settings for the Angular app (public)
+    POST /auth/token               — exchange authorization code for tokens (public)
+    POST /auth/refresh             — refresh tokens (public)
+    GET  /me                       — current user + roles
+    POST /logout                   — end session
+    Admin role required: POST /api/config, POST /fortify/auth/token
+    Jobs record triggered_by / cancelled_by / resumed_by_user (SSO email).
+
   UTILITY
     GET  /health                   — liveness probe
     GET  /api/config               — read current config (env vars; tokens masked)
-    POST /api/config               — update process environment variables only
+    POST /api/config               — update process environment variables only (admin)
+    POST /fortify/auth/token       — fetch Fortify OAuth Bearer token (admin; was POST /auth/token)
     GET  /config/validate          — validate current config (from environment)
     GET  /releases                 — list releases for an app name
     POST /pipeline/estimate-build-time — project-size-aware Maven build time estimate
@@ -136,7 +149,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -149,6 +162,7 @@ from token_tracker import token_tracker
 from runtime_config import apply_overrides, persist_overrides, is_persisted
 from credential_vault import encrypt_resume_meta, decrypt_resume_meta
 from state import AgentState, PipelineCancelledError
+from sso_auth import init_sso, require_role, current_user
 
 # Temporarily disabled: the background 'mvn dependency:go-offline' warm-up
 # (maven_warmup.py) runs on its own thread with no synchronization against
@@ -412,6 +426,15 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ── SSO (Scramble ID) ─────────────────────────────────────────────────────────
+# Registers /auth/config, /auth/token, /auth/refresh, /me, /logout and the
+# auth middleware that requires a valid SSO Bearer token on every other route
+# (except /health and /docs). Called BEFORE CORSMiddleware is added: Starlette
+# middleware added later wraps earlier ones, so CORS stays outermost and 401
+# responses still carry CORS headers. Otherwise the browser reports a CORS
+# error instead of the 401, and the Angular interceptor never gets to refresh.
+init_sso(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4200", "http://localhost:4201"],
@@ -432,6 +455,11 @@ async def _sync_runtime_config(request, call_next):
     """
     apply_overrides()
     return await call_next(request)
+
+
+def _who(user: dict) -> str:
+    """SSO identity recorded on job records for audit."""
+    return user.get("email") or user.get("id") or "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1872,13 +1900,13 @@ async def startup_event():
     """Fetch a fresh Fortify Bearer token at boot and set it in the process environment."""
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(_EXECUTOR, auth_token)
+        result = await loop.run_in_executor(_EXECUTOR, fortify_auth_token)
         if isinstance(result, dict) and result.get("ok"):
             print("[Startup] Fortify token fetched and set in process environment")
         else:
             print(f"[Startup] Fortify token fetch skipped or failed: {result}")
     except Exception as exc:
-        # Non-fatal — server still starts; token can be fetched via POST /auth/token
+        # Non-fatal — server still starts; token can be fetched via POST /fortify/auth/token
         print(f"[Startup] Fortify token fetch error (non-fatal): {exc}")
 
     # Start the background orphan-job sweep (see _run_orphan_sweep / plan
@@ -2042,7 +2070,8 @@ def get_config():
     }
 
 
-@app.post("/api/config", tags=["Utility"])
+@app.post("/api/config", tags=["Utility"],
+          dependencies=[Depends(require_role("admin"))])
 def save_config(req: ConfigUpdateRequest):
     """
     Apply Settings-page fields as runtime config overrides.
@@ -2138,8 +2167,9 @@ def config_validate():
     return ok({"fields": checks, "missing": missing, "ready": len(missing) == 0})
 
 
-@app.post("/auth/token", tags=["Utility"])
-def auth_token(req: Optional[AuthTokenRequest] = None):
+@app.post("/fortify/auth/token", tags=["Utility"],
+          dependencies=[Depends(require_role("admin"))])
+def fortify_auth_token(req: Optional[AuthTokenRequest] = None):
     """
     Fetch a fresh Fortify Bearer token via OAuth2 password grant and
     optionally set it as `FORTIFY_API_TOKEN` in the process environment.
@@ -2348,7 +2378,7 @@ async def estimate_build_time(req: BuildTimeEstimateRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/pipeline/live", tags=["Full Pipeline"])
-async def pipeline_live(req: LivePipelineRequest):
+async def pipeline_live(req: LivePipelineRequest, user: dict = Depends(current_user)):
     """
     Run the **complete** FortifyAI pipeline against a live Fortify SSC release.
 
@@ -2360,6 +2390,7 @@ async def pipeline_live(req: LivePipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
+    _store.update_job(pid, triggered_by=_who(user))
 
     async def _run():
         t0 = time.time()
@@ -2422,7 +2453,7 @@ async def pipeline_live(req: LivePipelineRequest):
 
 
 @app.post("/pipeline/offline", tags=["Full Pipeline"])
-async def pipeline_offline(req: OfflinePipelineRequest):
+async def pipeline_offline(req: OfflinePipelineRequest, user: dict = Depends(current_user)):
     """
     Run the **complete** pipeline from a saved Fortify JSON report (no SSC credentials needed).
 
@@ -2434,6 +2465,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
+    _store.update_job(pid, triggered_by=_who(user))
 
     async def _run():
         t0 = time.time()
@@ -2490,7 +2522,7 @@ async def pipeline_offline(req: OfflinePipelineRequest):
 
 
 @app.post("/pipeline/app-name", tags=["Full Pipeline"])
-async def pipeline_app_name(req: AppNamePipelineRequest):
+async def pipeline_app_name(req: AppNamePipelineRequest, user: dict = Depends(current_user)):
     """
     Run the **complete** pipeline by resolving an application name → `app_id` → latest `release_id`.
 
@@ -2513,6 +2545,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
+    _store.update_job(pid, triggered_by=_who(user))
 
     async def _run():
         t0 = time.time()
@@ -2576,7 +2609,7 @@ async def pipeline_app_name(req: AppNamePipelineRequest):
 
 
 @app.post("/pipeline/app-id", tags=["Full Pipeline"])
-async def pipeline_app_id(req: AppIdPipelineRequest):
+async def pipeline_app_id(req: AppIdPipelineRequest, user: dict = Depends(current_user)):
     """
     Run the **complete** pipeline using a known Fortify `applicationId`.
 
@@ -2591,6 +2624,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
+    _store.update_job(pid, triggered_by=_who(user))
 
     async def _run():
         t0 = time.time()
@@ -2648,7 +2682,7 @@ async def pipeline_app_id(req: AppIdPipelineRequest):
 
 
 @app.post("/pipeline/dry-run", tags=["Full Pipeline"])
-async def pipeline_dry_run(req: DryRunRequest):
+async def pipeline_dry_run(req: DryRunRequest, user: dict = Depends(current_user)):
     """
     Run the full analysis pipeline **without** side effects.
 
@@ -2662,6 +2696,7 @@ async def pipeline_dry_run(req: DryRunRequest):
     """
     job = _new_job()
     pid = job["pipeline_id"]
+    _store.update_job(pid, triggered_by=_who(user))
 
     async def _run():
         t0 = time.time()
@@ -2731,7 +2766,7 @@ async def pipeline_dry_run(req: DryRunRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/fortify/scan", tags=["Fortify Scan"])
-async def run_fortify_scan(req: FortifyScanRequest):
+async def run_fortify_scan(req: FortifyScanRequest, user: dict = Depends(current_user)):
     """
     Package **repo_name** with ScanCentral and submit a new SAST scan
     against Fortify on Demand, targeting **release_id** (or the latest
@@ -2757,6 +2792,7 @@ async def run_fortify_scan(req: FortifyScanRequest):
     """
     job = _new_job(stages=["resolve", "clone", "package", "session", "setup", "submit"])
     pid = job["pipeline_id"]
+    _store.update_job(pid, triggered_by=_who(user))
 
     async def _run():
         t0 = time.time()
@@ -3099,7 +3135,7 @@ def pipeline_stage_status(pipeline_id: str, stage_name: str):
 
 
 @app.post("/pipeline/cancel/{pipeline_id}", tags=["Pipeline Status"])
-def cancel_pipeline(pipeline_id: str):
+def cancel_pipeline(pipeline_id: str, user: dict = Depends(current_user)):
     """
     Request cancellation of a running pipeline job.
 
@@ -3128,6 +3164,7 @@ def cancel_pipeline(pipeline_id: str):
         })
 
     _store.request_cancel(pipeline_id)
+    _store.update_job(pipeline_id, cancelled_by=_who(user))
     return ok({
         "pipeline_id": pipeline_id,
         "message": "Cancellation requested — the run will stop at the next stage boundary",
@@ -3441,7 +3478,7 @@ def _auto_resume_startup_scan(limit: int = 200) -> list[str]:
 
 
 @app.post("/pipeline/resume/{pipeline_id}", tags=["Pipeline Status"])
-async def resume_pipeline(pipeline_id: str):
+async def resume_pipeline(pipeline_id: str, user: dict = Depends(current_user)):
     """
     Resume an interrupted, failed, or cancelled pipeline run from its last
     checkpointed stage instead of restarting from triage.
@@ -3494,6 +3531,7 @@ async def resume_pipeline(pipeline_id: str):
         )
 
     _start_resume(pipeline_id, resume_meta, checkpoint, auto=False)
+    _store.update_job(pipeline_id, resumed_by_user=_who(user))
     return ok({
         "pipeline_id": pipeline_id,
         "status": "queued",
@@ -4226,9 +4264,10 @@ def _make_partial_endpoint(stop_after: StageLabel):
     stop_idx = STAGE_ORDER.index(stop_after)
     active_stages = STAGE_ORDER[: stop_idx + 1]
 
-    async def handler(req: PartialPipelineRequest):
+    async def handler(req: PartialPipelineRequest, user: dict = Depends(current_user)):
         job = _new_job(stages=active_stages)
         pid = job["pipeline_id"]
+        _store.update_job(pid, triggered_by=_who(user))
 
         async def _run():
             t0 = time.time()

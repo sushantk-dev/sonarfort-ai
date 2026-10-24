@@ -23,6 +23,18 @@ starts the worker — there is nothing else to deploy or run.
 Required env vars (K8s ConfigMap / Secret):
   GCS_BUCKET  — GCS bucket name
   GCP_PROJECT — GCP project ID
+  EFX_SSO_ISSUER, EFX_SSO_CLIENT_ID, EFX_SSO_CLIENT_SECRET,
+  EFX_SSO_REDIRECT_URI, EFX_SSO_JWKS_URL, EFX_SSO_TOKEN_URL
+              — SSO (see sso_auth.py). Optional: EFX_SSO_AUTH_URL,
+                EFX_SSO_LOGOUT_URL, EFX_SSO_GROUPS_CLAIM.
+  SSO_ENABLED=false — local dev only: skips token checks, runs as dev admin.
+
+Auth (sso_auth.py):
+  Every route except /api/health, /auth/config, /auth/token, /auth/refresh,
+  /docs and /openapi.json needs `Authorization: Bearer <access_token>`.
+  Read routes      → any app role (user / admin / dataGovernance)
+  Run/upload/fetch → user or admin
+  Config + deletes → admin only
 
 Run (API + in-process worker together):
     uvicorn api:app --host 0.0.0.0 --port 8080
@@ -52,7 +64,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from google.cloud import storage as _gcs_lib
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
@@ -61,6 +73,8 @@ import config as _config  # noqa: F401 — import for its side effect: applies t
                            # global TLS-verification patch (see config.py) before
                            # any GCS/HTTP/git client below ever makes a real request.
 import worker as _worker  # in-process pipeline worker — started on startup below
+import sso_auth
+from sso_auth import current_user, init_sso, require_role
 
 app = FastAPI(title="SonarAI API", version="2.1.0")
 
@@ -70,6 +84,19 @@ app = FastAPI(title="SonarAI API", version="2.1.0")
 
 _worker_stop_event = threading.Event()
 _worker_thread: threading.Thread | None = None
+
+# ── SSO ───────────────────────────────────────────────────────────────────────
+# init_sso MUST run before CORSMiddleware is added. Starlette makes the
+# last-added middleware the outermost one, so adding CORS second means it
+# wraps the auth middleware — 401/403 responses then still carry CORS
+# headers and the browser shows the real error instead of a CORS failure.
+sso_auth.PUBLIC_PATHS.add("/api/health")   # K8s liveness/readiness probes
+init_sso(app)
+
+# Role guards — an admin may not also be in APP_USERS, so list roles explicitly.
+ANY_ROLE   = Depends(require_role("user", "admin", "dataGovernance"))
+OPERATOR   = Depends(require_role("user", "admin"))
+ADMIN_ONLY = Depends(require_role("admin"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -324,7 +351,7 @@ def health() -> dict:
 
 # ── Report upload ─────────────────────────────────────────────────────────────
 
-@app.post("/api/report/upload")
+@app.post("/api/report/upload", dependencies=[OPERATOR])
 async def upload_report(file: UploadFile = File(...)) -> dict:
     if not file.filename or not file.filename.endswith(".json"):
         raise HTTPException(400, "Only .json files are accepted")
@@ -357,13 +384,13 @@ async def upload_report(file: UploadFile = File(...)) -> dict:
 
 # ── Issues CRUD ───────────────────────────────────────────────────────────────
 
-@app.get("/api/issues")
+@app.get("/api/issues", dependencies=[ANY_ROLE])
 def get_issues() -> dict:
     issues = _get_issues()   # reads from GCS
     return {"issues": issues, "total": len(issues)}
 
 
-@app.delete("/api/issues/{key}")
+@app.delete("/api/issues/{key}", dependencies=[ADMIN_ONLY])
 def delete_issue(key: str) -> dict:
     """Remove an issue from state/issues.json and patch the GCS report blob."""
     issues = _get_issues()
@@ -394,7 +421,7 @@ def delete_issue(key: str) -> dict:
 
 # ── Live SonarQube fetch ──────────────────────────────────────────────────────
 
-@app.get("/api/sonar/rule/{rule_key:path}")
+@app.get("/api/sonar/rule/{rule_key:path}", dependencies=[ANY_ROLE])
 def get_sonar_rule(rule_key: str) -> dict:
     """
     Proxy a GET /api/rules/show call to SonarQube for a single rule key.
@@ -482,7 +509,7 @@ def get_sonar_rule(rule_key: str) -> dict:
     }
 
 
-@app.post("/api/sonar/fetch")
+@app.post("/api/sonar/fetch", dependencies=[OPERATOR])
 def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
     """
     Proxy a live SonarQube /api/issues/search call using the configured
@@ -583,7 +610,7 @@ def fetch_sonar_issues(req: SonarFetchRequest) -> dict:
     }
 
 
-@app.get("/api/sonar/report")
+@app.get("/api/sonar/report", dependencies=[ANY_ROLE])
 def get_structured_report() -> dict:
     """
     Return a structured summary of the currently loaded issues,
@@ -635,7 +662,8 @@ def get_structured_report() -> dict:
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/pipeline/run")
-def start_run(req: PipelineRunRequest) -> dict:
+def start_run(req: PipelineRunRequest,
+              user: dict = Depends(require_role("user", "admin"))) -> dict:
     if not _gcs_exists(_GCS_REPORT):
         raise HTTPException(400, "No sonar report uploaded yet.")
 
@@ -662,6 +690,7 @@ def start_run(req: PipelineRunRequest) -> dict:
         "error":      None,
         "request":    req_public,
         "created_at": time.time(),
+        "requested_by": user.get("email") or user["id"],
     })
 
     # Enqueue job — worker pod polls jobs/pending/ and claims it
@@ -682,11 +711,12 @@ def start_run(req: PipelineRunRequest) -> dict:
     except Exception as exc:
         logger.warning(f"[API] Run pruning failed: {exc}")
 
-    logger.info(f"[API] Enqueued pipeline job run_id={run_id} sev={req.severities}")
+    logger.info(f"[API] Enqueued pipeline job run_id={run_id} sev={req.severities} "
+                f"by={user.get('email') or user['id']}")
     return {"run_id": run_id, "status": "queued"}
 
 
-@app.get("/api/pipeline/status/{run_id}")
+@app.get("/api/pipeline/status/{run_id}", dependencies=[ANY_ROLE])
 def get_run_status(run_id: str) -> dict:
     run = _get_run(run_id)
     if run is None:
@@ -696,7 +726,8 @@ def get_run_status(run_id: str) -> dict:
 
 
 @app.post("/api/pipeline/cancel/{run_id}")
-def cancel_run(run_id: str) -> dict:
+def cancel_run(run_id: str,
+               user: dict = Depends(require_role("user", "admin"))) -> dict:
     """
     Mark the run as cancelled in GCS. The worker pod checks the run status
     between pipeline steps and exits cleanly when it sees 'cancelled'.
@@ -726,12 +757,13 @@ def cancel_run(run_id: str) -> dict:
         "status": "cancelled",
         "error":  "Cancelled by user",
         "steps":  steps,
+        "cancelled_by": user.get("email") or user["id"],
     })
     logger.info(f"[API] Marked run {run_id} as cancelled in GCS")
     return {"message": f"Run {run_id} cancelled", "run_id": run_id}
 
 
-@app.get("/api/pipeline/runs")
+@app.get("/api/pipeline/runs", dependencies=[ANY_ROLE])
 def list_runs() -> dict:
     """
     Return full run data for every run so the Angular UI can rehydrate its
@@ -752,7 +784,7 @@ def list_runs() -> dict:
     return {"runs": runs_out}
 
 
-@app.delete("/api/pipeline/runs/{run_id}")
+@app.delete("/api/pipeline/runs/{run_id}", dependencies=[ADMIN_ONLY])
 def delete_run(run_id: str) -> dict:
     """
     Remove a finished run from GCS so it won't reappear after the UI reloads.
@@ -776,7 +808,7 @@ def delete_run(run_id: str) -> dict:
 
 # ── Escalations ───────────────────────────────────────────────────────────────
 
-@app.get("/api/escalations")
+@app.get("/api/escalations", dependencies=[ANY_ROLE])
 def list_escalations() -> dict:
     """List all escalation markdown files from GCS."""
     blobs = _gcs_list(_GCS_ESC_PFX)
@@ -819,7 +851,7 @@ def list_escalations() -> dict:
     return {"escalations": items, "total": len(items)}
 
 
-@app.get("/api/escalations/{filename}")
+@app.get("/api/escalations/{filename}", dependencies=[ANY_ROLE])
 def get_escalation(filename: str) -> dict:
     """Return the full markdown content of one escalation file from GCS."""
     if not filename.endswith(".md") or "/" in filename or ".." in filename:
@@ -835,7 +867,7 @@ def get_escalation(filename: str) -> dict:
     }
 
 
-@app.delete("/api/escalations/{filename}")
+@app.delete("/api/escalations/{filename}", dependencies=[ADMIN_ONLY])
 def delete_escalation(filename: str) -> dict:
     """Delete an escalation file from GCS."""
     if not filename.endswith(".md") or "/" in filename or ".." in filename:
@@ -852,7 +884,7 @@ def delete_escalation(filename: str) -> dict:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-@app.get("/api/config")
+@app.get("/api/config", dependencies=[ANY_ROLE])
 def get_config() -> dict:
     from config import settings as s
 
@@ -888,7 +920,7 @@ def get_config() -> dict:
     }
 
 
-@app.post("/api/reload")
+@app.post("/api/reload", dependencies=[ADMIN_ONLY])
 def reload_config() -> dict:
     """
     No-op in stateless mode: every request reads live config from GCS.
@@ -903,7 +935,7 @@ def reload_config() -> dict:
     }
 
 
-@app.post("/api/config")
+@app.post("/api/config", dependencies=[ADMIN_ONLY])
 def update_config(req: ConfigUpdateRequest) -> dict:
     """
     Persist settings changes to the GCS config blob (state/config.json) so
