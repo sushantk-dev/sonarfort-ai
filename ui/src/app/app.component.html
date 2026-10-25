@@ -1,3 +1,7 @@
+@if (bareLayout()) {
+  <!-- /login and /callback: full-screen, no sidebar -->
+  <router-outlet/>
+} @else {
 <div class="shell">
   <!-- ── Sidebar ────────────────────────────────────────── -->
   <aside class="sidebar">
@@ -72,15 +76,34 @@
         Fortify Scan
       </a>
 
-      <a routerLink="/settings" routerLinkActive="is-active" class="nav-link">
-        <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-          <circle cx="7.5" cy="7.5" r="2.2" stroke="currentColor" stroke-width="1.3"/>
-          <path d="M7.5 1.5V3M7.5 12V13.5M13.5 7.5H12M3 7.5H1.5M11.7 3.3L10.6 4.4M4.4 10.6L3.3 11.7M11.7 11.7L10.6 10.6M4.4 4.4L3.3 3.3"
-                stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-        </svg>
-        Settings
-      </a>
+      @if (isAdmin()) {
+        <a routerLink="/settings" routerLinkActive="is-active" class="nav-link">
+          <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+            <circle cx="7.5" cy="7.5" r="2.2" stroke="currentColor" stroke-width="1.3"/>
+            <path d="M7.5 1.5V3M7.5 12V13.5M13.5 7.5H12M3 7.5H1.5M11.7 3.3L10.6 4.4M4.4 10.6L3.3 11.7M11.7 11.7L10.6 10.6M4.4 4.4L3.3 3.3"
+                  stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+          </svg>
+          Settings
+        </a>
+      }
     </nav>
+
+    <!-- ── Signed-in user ── -->
+    @if (auth.user(); as user) {
+      <div class="sidebar__user">
+        <div class="user-avatar">{{ initials() }}</div>
+        <div class="user-info">
+          <span class="user-name">{{ displayName() }}</span>
+          @if (user.email) { <span class="user-email" [title]="user.email">{{ user.email }}</span> }
+        </div>
+        <button class="logout-btn" type="button" (click)="logout()" title="Sign out" aria-label="Sign out">
+          <svg width="14" height="14" viewBox="0 0 15 15" fill="none">
+            <path d="M6 2H3.5A1.5 1.5 0 002 3.5v8A1.5 1.5 0 003.5 13H6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+            <path d="M10 10.5L13 7.5L10 4.5M13 7.5H6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+    }
 
     <div class="sidebar__footer">
       <span class="idle-dot"></span>
@@ -93,3 +116,4 @@
     <router-outlet/>
   </main>
 </div>
+}
