@@ -6,9 +6,7 @@ import { Injectable, computed, inject, signal } from '@angular/core';
 import { HttpClient, HttpContext, HttpContextToken, HttpErrorResponse } from '@angular/common/http';
 import { Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
-
-/** Backend that hosts /auth/* (nginx proxies /fortify/ → FortifyAI :8001). */
-export const AUTH_API = '/fortify';
+import { ApiConfigService } from '../api-config.service';
 
 /** Marks requests the interceptor must not try to refresh-and-retry (avoids loops). */
 export const SKIP_REFRESH = new HttpContextToken<boolean>(() => false);
@@ -54,6 +52,14 @@ const MAX_REFRESH_ATTEMPTS = 10;
 export class AuthService {
   private http = inject(HttpClient);
   private router = inject(Router);
+  private apiCfg = inject(ApiConfigService);
+
+  /** FortifyAI backend hosting /auth/*, /me and /logout. Same base URL the
+   *  rest of the app uses: http://localhost:8001 under ng serve, and
+   *  <host>/fortify when deployed (nginx strips the prefix). */
+  private get api(): string {
+    return this.apiCfg.fortifyBaseUrl();
+  }
 
   private config: SsoConfig | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -80,7 +86,7 @@ export class AuthService {
   // ── Configuration loading ───────────────────────────────────────────────────
   async loadConfig(): Promise<SsoConfig> {
     if (!this.config) {
-      this.config = await firstValueFrom(this.http.get<SsoConfig>(`${AUTH_API}/auth/config`));
+      this.config = await firstValueFrom(this.http.get<SsoConfig>(`${this.api}/auth/config`));
     }
     return this.config;
   }
@@ -119,7 +125,7 @@ export class AuthService {
     sessionStorage.removeItem(S.state);
 
     const tokens = await firstValueFrom(
-      this.http.post<TokenResponse>(`${AUTH_API}/auth/token`, { code, code_verifier: verifier }),
+      this.http.post<TokenResponse>(`${this.api}/auth/token`, { code, code_verifier: verifier }),
     );
     this.storeTokens(tokens);
     await this.loadUser();
@@ -131,7 +137,7 @@ export class AuthService {
 
   async loadUser(): Promise<AppUser> {
     const u = await firstValueFrom(
-      this.http.get<AppUser>(`${AUTH_API}/me`, { context: new HttpContext().set(SKIP_REFRESH, true) }),
+      this.http.get<AppUser>(`${this.api}/me`, { context: new HttpContext().set(SKIP_REFRESH, true) }),
     );
     this.user.set(u);
     return u;
@@ -178,7 +184,12 @@ export class AuthService {
   private async doRefresh(): Promise<boolean> {
     const refreshToken = localStorage.getItem(K.refresh);
     if (!refreshToken) {
-      await this.logout();
+      // Never signed in (or storage cleared): nothing to end at the SSO side,
+      // so just drop any stale tokens and go to the login page.
+      this.clearSession();
+      if (!this.router.url.startsWith('/login') && !this.router.url.startsWith('/callback')) {
+        await this.router.navigate(['/login']);
+      }
       return false;
     }
 
@@ -186,7 +197,7 @@ export class AuthService {
       this.refreshAttempts++;
       try {
         const tokens = await firstValueFrom(
-          this.http.post<TokenResponse>(`${AUTH_API}/auth/refresh`, { refresh_token: refreshToken }),
+          this.http.post<TokenResponse>(`${this.api}/auth/refresh`, { refresh_token: refreshToken }),
         );
         this.storeTokens(tokens);
         await this.loadUser();          // verify new token works
@@ -203,6 +214,15 @@ export class AuthService {
     return false;
   }
 
+  /** Removes tokens (keeps returnUrl) and resets in-memory auth state. */
+  private clearSession(): void {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    [K.token, K.oauthToken, K.refresh, K.expiresAt].forEach((k) => localStorage.removeItem(k));
+    this.token.set(null);
+    this.expiresAt.set(0);
+    this.user.set(null);
+  }
+
   // ── Logout ──────────────────────────────────────────────────────────────────
   async logout(): Promise<void> {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
@@ -215,14 +235,11 @@ export class AuthService {
     // Call backend /logout while the token is still available (best effort)
     if (this.token()) {
       await firstValueFrom(
-        this.http.post(`${AUTH_API}/logout`, {}, { context: new HttpContext().set(SKIP_REFRESH, true) }),
+        this.http.post(`${this.api}/logout`, {}, { context: new HttpContext().set(SKIP_REFRESH, true) }),
       ).catch(() => undefined);
     }
 
-    [K.token, K.oauthToken, K.refresh, K.expiresAt].forEach((k) => localStorage.removeItem(k));
-    this.token.set(null);
-    this.expiresAt.set(0);
-    this.user.set(null);
+    this.clearSession();
 
     const cfg = await this.loadConfig().catch(() => null);
     if (cfg?.logout_url) {
