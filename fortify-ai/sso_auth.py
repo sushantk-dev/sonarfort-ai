@@ -23,6 +23,11 @@ pip install "pyjwt[crypto]" requests
 Local development: set SSO_ENABLED=false to skip token checks. Every request
 then runs as a fixed dev user with all roles, and the EFX_SSO_* variables are
 not required. Never set this in a deployed environment.
+
+Login only, no role checks: set SSO_ENFORCE_ROLES=false. A valid SSO token is
+still required (no/invalid token -> 401), but require_role() lets every
+signed-in user through, so nobody gets 403. Use this until the SSO team adds a
+groups claim to the access token, then remove it (or set it to true).
 """
 
 import os
@@ -48,6 +53,8 @@ TOKEN_URL     = _env("EFX_SSO_TOKEN_URL")
 AUTH_URL      = os.environ.get("EFX_SSO_AUTH_URL", "")
 LOGOUT_URL    = os.environ.get("EFX_SSO_LOGOUT_URL", "")
 GROUPS_CLAIM  = os.environ.get("EFX_SSO_GROUPS_CLAIM", "groups")
+# false = authentication only; role checks are skipped (see module docstring)
+ENFORCE_ROLES = os.environ.get("SSO_ENFORCE_ROLES", "true").strip().lower() not in ("0", "false", "no", "off")
 
 PUBLIC_PATHS = {"/auth/config", "/auth/token", "/auth/refresh",
                 "/health", "/api/health",   # liveness probes (FortifyAI, SonarAI)
@@ -104,7 +111,7 @@ def current_user(request: Request) -> dict:
 
 def require_role(*roles: str):
     def checker(user: dict = Depends(current_user)) -> dict:
-        if not set(roles) & set(user["roles"]):
+        if ENFORCE_ROLES and not set(roles) & set(user["roles"]):
             raise HTTPException(403, "forbidden")
         return user
     return checker
@@ -170,6 +177,8 @@ def logout(user: dict = Depends(current_user)):
 def init_sso(app: FastAPI) -> None:
     if not SSO_ENABLED:
         print("[SSO] WARNING: SSO_ENABLED=false — all requests run as an unauthenticated dev admin")
+    elif not ENFORCE_ROLES:
+        print("[SSO] WARNING: SSO_ENFORCE_ROLES=false — login required, but role checks are OFF")
     app.include_router(router)
 
     @app.middleware("http")
