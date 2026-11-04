@@ -132,7 +132,10 @@ class RefreshIn(BaseModel):
 
 @router.get("/auth/config")
 def auth_config():
-    return {"authorization_url": AUTH_URL, "logout_url": LOGOUT_URL,
+    # sso_enabled / enforce_roles let the Angular app follow these switches:
+    # no login screen when SSO is off, and no role-based hiding when roles are off.
+    return {"sso_enabled": SSO_ENABLED, "enforce_roles": ENFORCE_ROLES,
+            "authorization_url": AUTH_URL, "logout_url": LOGOUT_URL,
             "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "issuer": ISSUER}
 
 

@@ -20,5 +20,6 @@ export const roleGuard =
     const router = inject(Router);
     const user = await auth.ensureUser();
     if (!user) return router.createUrlTree(['/login']);
-    return roles.some((r) => user.roles.includes(r)) ? true : router.createUrlTree(['/forbidden']);
+    // auth.roles() covers SSO_ENFORCE_ROLES=false (all roles granted).
+    return roles.some((r) => auth.roles().includes(r)) ? true : router.createUrlTree(['/forbidden']);
   };
