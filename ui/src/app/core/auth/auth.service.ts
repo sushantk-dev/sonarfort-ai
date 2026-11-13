@@ -12,6 +12,10 @@ import { ApiConfigService } from '../api-config.service';
 export const SKIP_REFRESH = new HttpContextToken<boolean>(() => false);
 
 interface SsoConfig {
+  /** false when the backend runs with SSO_ENABLED=false (local dev). */
+  sso_enabled?: boolean;
+  /** false when the backend runs with SSO_ENFORCE_ROLES=false. */
+  enforce_roles?: boolean;
   authorization_url: string;
   logout_url: string;
   client_id: string;
@@ -70,11 +74,35 @@ export class AuthService {
   private readonly expiresAt = signal<number>(Number(localStorage.getItem(K.expiresAt) ?? 0));
   readonly user = signal<AppUser | null>(null);
 
-  readonly isLoggedIn = computed(() => !!this.token() && this.expiresAt() > Date.now());
-  readonly roles = computed(() => this.user()?.roles ?? []);
+  /** True when the backend reports SSO_ENABLED=false: no login, no tokens. */
+  readonly ssoDisabled = signal(false);
+
+  readonly isLoggedIn = computed(() =>
+    this.ssoDisabled() || (!!this.token() && this.expiresAt() > Date.now()));
+  /** False when the backend skips role checks (SSO_ENFORCE_ROLES=false). */
+  readonly rolesEnforced = signal(true);
+
+  /** Every app role when the backend skips role checks, so the UI doesn't hide
+   *  pages (e.g. Settings) that the backend would allow anyway. */
+  readonly roles = computed(() =>
+    this.rolesEnforced() ? (this.user()?.roles ?? []) : ['admin', 'dataGovernance', 'user']);
 
   // ── Startup: restore session after page reload (call from APP_INITIALIZER) ──
   async init(): Promise<void> {
+    // The backend decides whether SSO is on (SSO_ENABLED). If it's off, skip
+    // login entirely and run as the backend's dev user.
+    try {
+      const cfg = await this.loadConfig();
+      this.rolesEnforced.set(cfg.enforce_roles !== false);
+      if (cfg.sso_enabled === false) {
+        this.ssoDisabled.set(true);
+        await this.loadUser().catch(() => undefined);
+        return;
+      }
+    } catch {
+      /* backend unreachable: fall through; pages will show their own errors */
+    }
+
     if (this.isLoggedIn()) {
       this.scheduleRefresh((this.expiresAt() - Date.now()) / 1000);
       await this.loadUser().catch(() => this.refresh());
@@ -93,6 +121,10 @@ export class AuthService {
 
   // ── Login flow (PKCE) ───────────────────────────────────────────────────────
   async login(): Promise<void> {
+    if (this.ssoDisabled()) {
+      await this.router.navigateByUrl('/');
+      return;
+    }
     const cfg = await this.loadConfig();
     const verifier = randomString(64);
     const state = randomString(32);
@@ -225,6 +257,7 @@ export class AuthService {
 
   // ── Logout ──────────────────────────────────────────────────────────────────
   async logout(): Promise<void> {
+    if (this.ssoDisabled()) return; // nothing to sign out of
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
 
     const current = this.router.url;
