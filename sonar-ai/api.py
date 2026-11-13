@@ -185,6 +185,35 @@ def _gcs_write_json(blob: str, data: Any) -> None:
     _gcs_upload(blob, json.dumps(data).encode("utf-8"), "application/json")
 
 
+# ── Run ownership ─────────────────────────────────────────────────────────────
+# Each user sees and controls only the runs they started (`requested_by`).
+# Admins can list everyone's runs with GET /api/pipeline/runs?all=true.
+# With SSO_ENABLED=false there is no real identity, so every run is visible.
+# Runs created before SSO have no `requested_by` and show only with ?all=true.
+
+def _who(user: dict) -> str:
+    return user.get("email") or user.get("id") or "unknown"
+
+
+def _is_admin(user: dict) -> bool:
+    return "admin" in (user.get("roles") or [])
+
+
+def _owns_run(run: dict, user: dict) -> bool:
+    if not sso_auth.SSO_ENABLED:
+        return True
+    owner = (run.get("requested_by") or "").strip().lower()
+    return bool(owner) and owner == _who(user).strip().lower()
+
+
+def _get_own_run(run_id: str, user: dict) -> dict:
+    """Return the run if the caller owns it; otherwise 404 (same as unknown)."""
+    run = _get_run(run_id)
+    if run is None or not _owns_run(run, user):
+        raise HTTPException(404, f"Run {run_id} not found")
+    return run
+
+
 # ── Run helpers (GCS-backed) ──────────────────────────────────────────────────
 
 def _get_run(run_id: str) -> dict | None:
@@ -690,7 +719,7 @@ def start_run(req: PipelineRunRequest,
         "error":      None,
         "request":    req_public,
         "created_at": time.time(),
-        "requested_by": user.get("email") or user["id"],
+        "requested_by": _who(user),
     })
 
     # Enqueue job — worker pod polls jobs/pending/ and claims it
@@ -717,10 +746,8 @@ def start_run(req: PipelineRunRequest,
 
 
 @app.get("/api/pipeline/status/{run_id}", dependencies=[ANY_ROLE])
-def get_run_status(run_id: str) -> dict:
-    run = _get_run(run_id)
-    if run is None:
-        raise HTTPException(404, f"Run {run_id} not found")
+def get_run_status(run_id: str, user: dict = Depends(current_user)) -> dict:
+    run = _get_own_run(run_id, user)
     # Worker writes step updates directly to GCS — no draining needed here
     return run
 
@@ -734,9 +761,7 @@ def cancel_run(run_id: str,
     If the job is still queued (worker hasn't claimed it yet), remove the
     pending job blob so it never starts.
     """
-    run = _get_run(run_id)
-    if run is None:
-        raise HTTPException(404, f"Run {run_id} not found")
+    run = _get_own_run(run_id, user)
 
     # Best-effort: remove still-pending job so the worker never picks it up
     try:
@@ -764,35 +789,42 @@ def cancel_run(run_id: str,
 
 
 @app.get("/api/pipeline/runs", dependencies=[ANY_ROLE])
-def list_runs() -> dict:
+def list_runs(all: bool = False, user: dict = Depends(current_user)) -> dict:
     """
-    Return full run data for every run so the Angular UI can rehydrate its
-    pipeline history after a page reload. Lists runs/ blobs — newest first.
+    Return the caller's own runs (newest first, up to 100) so the Angular UI
+    can rehydrate its pipeline history after a page reload. Admins can pass
+    ?all=true to list every user's runs.
     """
+    if all and not _is_admin(user):
+        raise HTTPException(403, "Only admins can list every user's runs")
+
     blobs = sorted(
         _gcs().bucket(_bucket()).list_blobs(prefix=_GCS_RUNS_PFX),
         key=lambda b: b.time_created or 0,
         reverse=True,
-    )[:100]
+    )
 
     runs_out: list[dict] = []
     for b in blobs:
+        if len(runs_out) >= 100:
+            break
         try:
-            runs_out.append(json.loads(b.download_as_bytes().decode("utf-8")))
+            run = json.loads(b.download_as_bytes().decode("utf-8"))
         except Exception as exc:
             logger.warning(f"[API] Could not read run blob {b.name}: {exc}")
+            continue
+        if all or _owns_run(run, user):
+            runs_out.append(run)
     return {"runs": runs_out}
 
 
 @app.delete("/api/pipeline/runs/{run_id}", dependencies=[ADMIN_ONLY])
-def delete_run(run_id: str) -> dict:
+def delete_run(run_id: str, user: dict = Depends(current_user)) -> dict:
     """
     Remove a finished run from GCS so it won't reappear after the UI reloads.
     Returns 409 if the run is still active.
     """
-    run = _get_run(run_id)
-    if run is None:
-        raise HTTPException(404, f"Run {run_id} not found")
+    run = _get_own_run(run_id, user)
     if run.get("status") == "running":
         raise HTTPException(409, f"Run {run_id} is still active — cancel it first")
 

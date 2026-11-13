@@ -122,6 +122,9 @@ Execution Modes:
     POST /logout                   — end session
     Admin role required: POST /api/config, POST /fortify/auth/token
     Jobs record triggered_by / cancelled_by / resumed_by_user (SSO email).
+    Run visibility: each user sees/controls only runs they started
+    (status, cancel, resume, delete, live token usage, scan status).
+    Admins can list everyone's runs with GET /pipeline/runs?all=true.
 
   UTILITY
     GET  /health                   — liveness probe
@@ -162,6 +165,7 @@ from token_tracker import token_tracker
 from runtime_config import apply_overrides, persist_overrides, is_persisted
 from credential_vault import encrypt_resume_meta, decrypt_resume_meta
 from state import AgentState, PipelineCancelledError
+import sso_auth
 from sso_auth import init_sso, require_role, current_user
 
 # Temporarily disabled: the background 'mvn dependency:go-offline' warm-up
@@ -460,6 +464,38 @@ async def _sync_runtime_config(request, call_next):
 def _who(user: dict) -> str:
     """SSO identity recorded on job records for audit."""
     return user.get("email") or user.get("id") or "unknown"
+
+
+# ── Run ownership ─────────────────────────────────────────────────────────────
+# Each user sees and controls only the pipeline runs they started (the job's
+# `triggered_by`). Admins can see everyone's runs with `?all=true` on
+# GET /pipeline/runs. With SSO_ENABLED=false there is no real identity, so
+# every run is visible. Runs created before this change have no
+# `triggered_by` and are therefore visible only via `?all=true`.
+
+# GET /pipeline/runs reads at most this many newest jobs before filtering by
+# owner, so pagination stays correct without scanning the whole store.
+_OWNER_SCAN_LIMIT = 1000
+
+
+def _is_admin(user: dict) -> bool:
+    return "admin" in (user.get("roles") or [])
+
+
+def _owns_job(job: dict, user: dict) -> bool:
+    if not sso_auth.SSO_ENABLED:
+        return True
+    owner = (job.get("triggered_by") or "").strip().lower()
+    return bool(owner) and owner == _who(user).strip().lower()
+
+
+def _get_own_job(pipeline_id: str, user: dict) -> dict:
+    """Return the job if the caller owns it; otherwise 404 (same as unknown,
+    so other users' run ids aren't revealed)."""
+    job = _store.get_job(pipeline_id)
+    if job is None or not _owns_job(job, user):
+        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+    return job
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2939,7 +2975,7 @@ async def run_fortify_scan(req: FortifyScanRequest, user: dict = Depends(current
 
 
 @app.get("/fortify/scan/status/{scan_id}", tags=["Fortify Scan"])
-def fortify_scan_status(scan_id: str):
+def fortify_scan_status(scan_id: str, user: dict = Depends(current_user)):
     """
     Same shape as GET /pipeline/status/{pipeline_id} — overall status plus
     the resolve/clone/package/session/setup/submit stage breakdown —
@@ -2947,7 +2983,7 @@ def fortify_scan_status(scan_id: str):
     completion — use POST /fortify/scan/poll for that.
     """
     job = _store.get_job(scan_id)
-    if job is None:
+    if job is None or not _owns_job(job, user):
         raise HTTPException(status_code=404, detail=f"scan_id '{scan_id}' not found")
     return ok(_sanitize_job_for_response(job))
 
@@ -3052,10 +3088,13 @@ def _sanitize_job_for_response(job: dict) -> dict:
 def list_pipeline_runs(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    all: bool = Query(default=False, description="Admins only: include every user's runs"),
+    user: dict = Depends(current_user),
 ):
     """
-    List Fortify pipeline jobs across **all users** — not just the caller's
-    own browser session.
+    List the caller's own Fortify pipeline jobs (those they started, by SSO
+    identity). Admins can pass `all=true` to list every user's jobs. With
+    SSO_ENABLED=false every job is listed.
 
     Jobs are persisted server-side (GCS-backed `JobStore`, shared across
     every pod), so this reflects the *global* state of every run currently
@@ -3070,12 +3109,20 @@ def list_pipeline_runs(
     payload and `checkpoint` — fetch `GET /pipeline/status/{pipeline_id}`
     for the full detail on any individual run.
     """
-    jobs = [_sanitize_job_for_response(j) for j in _store.list_jobs(limit=limit, offset=offset)]
+    if all and not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Only admins can list every user's runs")
+    if all or not sso_auth.SSO_ENABLED:
+        page = _store.list_jobs(limit=limit, offset=offset)
+    else:
+        mine = [j for j in _store.list_jobs(limit=_OWNER_SCAN_LIMIT, offset=0)
+                if _owns_job(j, user)]
+        page = mine[offset: offset + limit]
+    jobs = [_sanitize_job_for_response(j) for j in page]
     return ok({"jobs": jobs, "count": len(jobs)})
 
 
 @app.get("/pipeline/status/{pipeline_id}", tags=["Pipeline Status"])
-def pipeline_status(pipeline_id: str):
+def pipeline_status(pipeline_id: str, user: dict = Depends(current_user)):
     """
     Return the overall status of a pipeline job **and** the per-stage breakdown.
 
@@ -3102,14 +3149,12 @@ def pipeline_status(pipeline_id: str):
     - `output_summary` — lightweight excerpt (counts, verdicts), not full payload
     - `error` — set only when status is `failed`
     """
-    job = _store.get_job(pipeline_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+    job = _get_own_job(pipeline_id, user)
     return ok(_sanitize_job_for_response(job))
 
 
 @app.get("/pipeline/status/{pipeline_id}/{stage_name}", tags=["Pipeline Status"])
-def pipeline_stage_status(pipeline_id: str, stage_name: str):
+def pipeline_stage_status(pipeline_id: str, stage_name: str, user: dict = Depends(current_user)):
     """
     Return the status of a **single stage** within a pipeline run.
 
@@ -3120,9 +3165,7 @@ def pipeline_stage_status(pipeline_id: str, stage_name: str):
     Returns the same stage object as the full `/pipeline/status/{pipeline_id}` response
     but scoped to the requested stage only.
     """
-    job = _store.get_job(pipeline_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+    job = _get_own_job(pipeline_id, user)
     stage = job["stages"].get(stage_name)
     if stage is None:
         valid = ", ".join(job["stages"].keys())
@@ -3152,9 +3195,7 @@ def cancel_pipeline(pipeline_id: str, user: dict = Depends(current_user)):
     reached a terminal state (`completed` / `failed` / `cancelled`), this
     is a no-op that reports the existing status.
     """
-    job = _store.get_job(pipeline_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
+    job = _get_own_job(pipeline_id, user)
 
     if job.get("status") in ("completed", "failed", "cancelled"):
         return ok({
@@ -3202,7 +3243,7 @@ def tokens_usage_all():
 
 
 @app.get("/tokens/usage/{pipeline_id}", tags=["Tokens"])
-def tokens_usage_run(pipeline_id: str):
+def tokens_usage_run(pipeline_id: str, user: dict = Depends(current_user)):
     """
     Return **live** per-stage LLM token consumption for one pipeline run.
 
@@ -3211,11 +3252,14 @@ def tokens_usage_run(pipeline_id: str):
     result after completion. Returns zeros (not 404) for unknown or
     not-yet-started pipeline ids, and for runs executed on another pod.
     """
+    job = _store.get_job(pipeline_id)
+    if job is not None and not _owns_job(job, user):
+        raise HTTPException(status_code=404, detail=f"pipeline_id '{pipeline_id}' not found")
     return ok(token_tracker.summary(pipeline_id))
 
 
 @app.delete("/pipeline/runs/{pipeline_id}", tags=["Pipeline Status"])
-def delete_pipeline_run(pipeline_id: str):
+def delete_pipeline_run(pipeline_id: str, user: dict = Depends(current_user)):
     """
     Permanently remove a pipeline run (doc + result + checkpoint) from the
     job store.
@@ -3234,6 +3278,11 @@ def delete_pipeline_run(pipeline_id: str):
     time it tries to write status for a doc that's no longer there.
     """
     job = _store.get_job(pipeline_id)
+    if job is not None and not _owns_job(job, user):
+        # Someone else's run: report it as already gone (the endpoint is
+        # idempotent) without touching it or revealing that it exists.
+        return ok({"pipeline_id": pipeline_id, "deleted": False,
+                   "message": f"Run '{pipeline_id}' was already gone — nothing to delete"})
     if job is not None and job.get("status") in ("queued", "running"):
         _store.request_cancel(pipeline_id)
 
@@ -3522,6 +3571,7 @@ async def resume_pipeline(pipeline_id: str, user: dict = Depends(current_user)):
     job record rather than minting a new one) immediately; poll
     **GET /pipeline/status/{pipeline_id}** as usual.
     """
+    _get_own_job(pipeline_id, user)   # 404 unless the caller started this run
     job, resume_meta, checkpoint = _resume_precheck(pipeline_id)
 
     if job.get("status") in ("running", "completed"):
